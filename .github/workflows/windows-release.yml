@@ -42,58 +42,6 @@ jobs:
           Replace-Wrapper 'waifu2x-ncnn-vulkan-rs' $waifu2xRepo $waifu2xCommit
           Replace-Wrapper 'realcugan-ncnn-vulkan-rs' $realcuganRepo $realcuganCommit
 
-      - name: Install AVIF build dependencies
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          # rav1e enables its x86_64 assembly by default and therefore needs NASM.
-          choco install nasm -y --no-progress
-
-          # Chocolatey does not reliably refresh the current PowerShell process PATH.
-          $nasmCandidates = @(
-            (Get-Command nasm.exe -ErrorAction SilentlyContinue).Source,
-            'C:\Program Files\NASM\nasm.exe',
-            'C:\Program Files (x86)\NASM\nasm.exe'
-          ) | Where-Object { $_ -and (Test-Path $_) }
-          $nasmPath = $nasmCandidates | Select-Object -First 1
-          if (-not $nasmPath) {
-            $nasmPath = Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Filter 'nasm.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
-          }
-          if (-not $nasmPath) { throw 'NASM was installed but nasm.exe could not be located.' }
-          $nasmDir = Split-Path $nasmPath -Parent
-          $env:PATH = "$nasmDir;$env:PATH"
-          "PATH=$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          # dav1d-sys uses pkg-config to locate the AV1 decoder. vcpkg installs
-          # the release dav1d.pc under installed\x64-windows\lib\pkgconfig.
-          choco install pkgconfiglite -y --no-progress
-          vcpkg install dav1d:x64-windows --disable-metrics
-
-          $pkgConfigPath = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\lib\pkgconfig'
-          $dav1dPc = Join-Path $pkgConfigPath 'dav1d.pc'
-          if (-not (Test-Path $dav1dPc)) {
-            throw "dav1d.pc was not found at $dav1dPc"
-          }
-
-          # dav1d-sys documents PKG_CONFIG_PATH as the supported way to point
-          # system-deps at a vcpkg-installed dav1d library on Windows.
-          $existingPkgConfigPath = $env:PKG_CONFIG_PATH
-          if ($existingPkgConfigPath) {
-            $newPkgConfigPath = "$pkgConfigPath;$existingPkgConfigPath"
-          } else {
-            $newPkgConfigPath = $pkgConfigPath
-          }
-          $env:PKG_CONFIG_PATH = $newPkgConfigPath
-          "PKG_CONFIG_PATH=$newPkgConfigPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          Write-Host "NASM: $(nasm -v)"
-          Write-Host "pkg-config: $(pkg-config --version)"
-          Write-Host "PKG_CONFIG_PATH: $env:PKG_CONFIG_PATH"
-          Write-Host "dav1d pkg-config: $(pkg-config --modversion dav1d)"
-          Write-Host "dav1d flags: $(pkg-config --libs --cflags dav1d)"
-
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
@@ -202,16 +150,6 @@ jobs:
           New-Item -ItemType Directory -Path dist\models -Force | Out-Null
           Copy-Item target\release\kurp.exe dist\kurp.exe
           Copy-Item $env:NCNN_DLL dist\ncnn.dll
-
-          # dav1d-sys links against the vcpkg shared dav1d library. The build
-          # environment can find it through PKG_CONFIG_PATH, but end users need
-          # the runtime DLL beside kurp.exe (or on PATH).
-          $dav1dDll = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin\dav1d.dll'
-          if (-not (Test-Path $dav1dDll)) {
-            throw "dav1d.dll was not found at $dav1dDll"
-          }
-          Copy-Item $dav1dDll dist\dav1d.dll
-          Write-Host "Bundled dav1d.dll from $dav1dDll"
 
           Copy-Item README.md, LICENSE dist\
           git clone --depth 1 https://github.com/nihui/waifu2x-ncnn-vulkan.git "$env:RUNNER_TEMP\waifu2x-models"
