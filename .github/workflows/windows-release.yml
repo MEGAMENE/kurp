@@ -50,6 +50,22 @@ jobs:
           # rav1e enables its x86_64 assembly by default and therefore needs NASM.
           choco install nasm -y --no-progress
 
+          # Chocolatey does not reliably refresh the current PowerShell process PATH.
+          # Locate NASM explicitly and add its installation directory to this job's PATH.
+          $nasmCandidates = @(
+            (Get-Command nasm.exe -ErrorAction SilentlyContinue).Source,
+            'C:\Program Files\NASM\nasm.exe',
+            'C:\Program Files (x86)\NASM\nasm.exe'
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          $nasmPath = $nasmCandidates | Select-Object -First 1
+          if (-not $nasmPath) {
+            $nasmPath = Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Filter 'nasm.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+          }
+          if (-not $nasmPath) { throw 'NASM was installed but nasm.exe could not be located.' }
+          $nasmDir = Split-Path $nasmPath -Parent
+          $env:PATH = "$nasmDir;$env:PATH"
+          "PATH=$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           # image's AVIF decoder uses dav1d. On Windows, dav1d-sys discovers the
           # installed library through pkg-config. Use the prebuilt vcpkg package
           # rather than trying to build dav1d/meson/ninja from scratch in Cargo.
@@ -149,9 +165,6 @@ jobs:
           "ncnn_DIR=$ncnnDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CMAKE_PREFIX_PATH=$ncnnRoot;$env:CMAKE_PREFIX_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # CMake can resolve the imported ncnn target, but the Rust wrapper
-          # build scripts emit `-lncnn` to rustc. Make the MSVC linker search
-          # path explicit so the final kurp link can find ncnn.lib.
           $ncnnLib = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.lib' |
             Where-Object { $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))' } |
             Select-Object -First 1
