@@ -29,9 +29,8 @@ jobs:
 
           # The Snd-R wrappers currently checked into this fork require
           # GLSLANG_TARGET_DIR and manually include obsolete glslang target
-          # files. Papaj's wrappers expose the same Rust API but let CMake
-          # discover Vulkan/glslang normally, which is compatible with the
-          # current Vulkan SDK and Windows/MSVC toolchain.
+          # files. Papaj's wrappers expose the same Rust API but use normal
+          # find_package(glslang) discovery.
           $waifu2xRepo = 'https://github.com/papaj-na-wrotkach/waifu2x-ncnn-vulkan-rs.git'
           $waifu2xCommit = 'bfaae1b43c37e1f9909be0439d701f9268886b74'
           $realcuganRepo = 'https://github.com/papaj-na-wrotkach/realcugan-ncnn-vulkan-rs.git'
@@ -56,9 +55,46 @@ jobs:
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
           cache: true
-          # The replacement wrappers use normal CMake package discovery and
-          # do not require the legacy glslang target files.
           stripdown: false
+
+      - name: Configure glslang CMake package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Vulkan SDK 1.4.x provides glslang libraries/tools, but its Windows
+          # packaging does not provide the glslangConfig.cmake package expected
+          # by the Papaj wrappers. CMake's FindVulkan module already exposes
+          # Vulkan::glslang, so provide a tiny compatibility package that maps
+          # the wrapper's expected targets onto the SDK target.
+          $glslangDir = Join-Path $env:RUNNER_TEMP 'glslang-cmake'
+          Remove-Item $glslangDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $glslangDir -Force | Out-Null
+
+          @'
+          find_package(Vulkan REQUIRED)
+
+          if (NOT TARGET Vulkan::glslang)
+              message(FATAL_ERROR "Vulkan SDK/CMake did not expose Vulkan::glslang")
+          endif()
+
+          if (NOT TARGET glslang::glslang)
+              add_library(glslang::glslang INTERFACE IMPORTED)
+              set_property(TARGET glslang::glslang PROPERTY
+                  INTERFACE_LINK_LIBRARIES Vulkan::glslang)
+          endif()
+
+          if (NOT TARGET glslang::SPIRV)
+              add_library(glslang::SPIRV INTERFACE IMPORTED)
+              set_property(TARGET glslang::SPIRV PROPERTY
+                  INTERFACE_LINK_LIBRARIES Vulkan::glslang)
+          endif()
+          '@ | Set-Content -Path (Join-Path $glslangDir 'glslangConfig.cmake') -Encoding utf8
+
+          "glslang_DIR=$glslangDir" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "glslang_DIR=$glslangDir"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
