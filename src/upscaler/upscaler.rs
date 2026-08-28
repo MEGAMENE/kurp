@@ -7,6 +7,7 @@ use img_parts::{DynImage, ImageICC};
 use log::{info, warn};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 use waifu2x_ncnn_vulkan_rs::Waifu2x;
+use zenpixels::{AlphaMode, ChannelLayout, ChannelType, PixelDescriptor};
 use zenpixels_convert::PixelBufferConvertTypedExt;
 
 use crate::config::app_config::{AppConfig, Format};
@@ -31,7 +32,7 @@ pub trait Upscaler: Send {
             }
         }
 
-        let image = match image_format {
+        let (image, avif_icc) = match image_format {
             ImageFormat::Avif => match decode_avif(&input) {
                 Ok(image) => image,
                 Err(error) => {
@@ -42,7 +43,7 @@ pub trait Upscaler: Send {
             _ => {
                 let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
                 reader.set_format(image_format);
-                match reader.decode().or_else(|_| {
+                let image = match reader.decode().or_else(|_| {
                     image::io::Reader::new(Cursor::new(input.clone()))
                         .with_guessed_format()
                         .map_err(image::ImageError::IoError)
@@ -53,7 +54,8 @@ pub trait Upscaler: Send {
                         warn!("can't decode image: {error}");
                         return (input, image_format);
                     }
-                }
+                };
+                (image, None)
             }
         };
 
@@ -73,7 +75,7 @@ pub trait Upscaler: Send {
         }
 
         let output = Bytes::from(buf.into_inner());
-        (preserve_icc_profile(&input, output), format_to)
+        (preserve_icc_profile(&input, output, avif_icc), format_to)
     }
 
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
@@ -81,26 +83,58 @@ pub trait Upscaler: Send {
     fn get_config(&self) -> UpscalerConfig;
 }
 
-fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
+fn decode_avif(input: &Bytes) -> Result<(DynamicImage, Option<Vec<u8>>), String> {
     let decoded = zenavif::decode(input.as_ref())
         .map_err(|error| format!("{error:?}"))?;
-    let rgba = decoded.to_rgba8();
+
+    // AVIF pixels are not necessarily sRGB. The old to_rgba8() path performs
+    // a color-aware conversion to RGBA8/sRGB, after which attaching the source
+    // ICC profile makes the pixel values and the profile disagree. Keep the
+    // source transfer function and primaries while only changing the layout
+    // and depth needed by DynamicImage/RealCUGAN.
+    let source = decoded.descriptor();
+    let target = PixelDescriptor::new_full(
+        ChannelType::U8,
+        ChannelLayout::Rgba,
+        Some(AlphaMode::Straight),
+        source.transfer(),
+        source.primaries,
+    );
+
+    let rgba = decoded
+        .convert_to(target)
+        .map_err(|error| format!("{error:?}"))?;
     let width = rgba.width();
     let height = rgba.height();
     let pixels = rgba.copy_to_contiguous_bytes();
 
-    image::RgbaImage::from_raw(width, height, pixels)
+    let image = image::RgbaImage::from_raw(width, height, pixels)
         .map(DynamicImage::ImageRgba8)
-        .ok_or_else(|| "decoded AVIF has an invalid pixel buffer".to_string())
+        .ok_or_else(|| "decoded AVIF has an invalid pixel buffer".to_string())?;
+
+    // img-parts does not parse AVIF containers, so the generic ICC path cannot
+    // recover an AVIF ICC profile from the original bytes. zenavif extracts it
+    // into the PixelBuffer ColorContext, so carry it explicitly.
+    let icc = decoded
+        .color_context()
+        .and_then(|context| context.icc.as_ref())
+        .map(|profile| profile.as_ref().to_vec());
+
+    Ok((image, icc))
 }
 
-fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
-    let input_image = match DynImage::from_bytes(input.to_vec().into()) {
-        Ok(Some(image)) => image,
-        Ok(None) | Err(_) => return output,
+fn preserve_icc_profile(input: &Bytes, output: Bytes, extra_icc: Option<Vec<u8>>) -> Bytes {
+    let profile = if let Some(profile) = extra_icc {
+        Some(profile)
+    } else {
+        let input_image = match DynImage::from_bytes(input.to_vec().into()) {
+            Ok(Some(image)) => image,
+            Ok(None) | Err(_) => return output,
+        };
+        input_image.icc_profile().map(|profile| profile.to_vec())
     };
 
-    let profile = match input_image.icc_profile() {
+    let profile = match profile {
         Some(profile) => profile,
         None => return output,
     };
@@ -114,7 +148,7 @@ fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
         }
     };
 
-    output_image.set_icc_profile(Some(profile));
+    output_image.set_icc_profile(Some(profile.into()));
 
     let mut writer = Cursor::new(Vec::new());
     if let Err(error) = output_image.encoder().write_to(&mut writer) {
