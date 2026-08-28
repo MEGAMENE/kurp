@@ -25,6 +25,12 @@ jobs:
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
+          # The Rust wrappers currently require the legacy glslang CMake
+          # target files (OSDependentTargets.cmake, OGLCompilerTargets.cmake,
+          # glslangTargets.cmake and SPIRVTargets.cmake). Keep the SDK version
+          # compatible with that older CMake integration instead of using the
+          # newest SDK, which no longer installs those files.
+          vulkan_version: 1.3.290.0
           cache: true
           stripdown: false
 
@@ -126,6 +132,39 @@ jobs:
 
           Write-Host "NCNN_DLL = $($ncnnDll.FullName)"
           "NCNN_DLL=$($ncnnDll.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure legacy glslang path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $required = @(
+            'OSDependentTargets.cmake',
+            'OGLCompilerTargets.cmake',
+            'glslangTargets.cmake',
+            'SPIRVTargets.cmake'
+          )
+
+          $candidates = Get-ChildItem "$env:VULKAN_SDK" -Recurse -Filter 'glslangTargets.cmake'
+
+          $glslangDir = $candidates |
+            Where-Object {
+              $dir = $_.Directory.FullName
+              ($required | ForEach-Object { Test-Path (Join-Path $dir $_) }) -notcontains $false
+            } |
+            Select-Object -First 1 |
+            ForEach-Object { $_.Directory.FullName }
+
+          if (-not $glslangDir) {
+            Write-Host "Vulkan SDK: $env:VULKAN_SDK"
+            Write-Host 'glslangTargets.cmake candidates:'
+            $candidates | ForEach-Object { Write-Host " - $($_.FullName)" }
+            throw 'The pinned Vulkan SDK does not contain the legacy glslang CMake target set required by the Rust wrappers.'
+          }
+
+          Write-Host "GLSLANG_TARGET_DIR=$glslangDir"
+          "GLSLANG_TARGET_DIR=$glslangDir" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build kurp
