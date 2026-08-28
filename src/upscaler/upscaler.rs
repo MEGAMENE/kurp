@@ -7,6 +7,7 @@ use img_parts::{DynImage, ImageICC};
 use log::{info, warn};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 use waifu2x_ncnn_vulkan_rs::Waifu2x;
+use zenpixels_convert::PixelBufferConvertTypedExt;
 
 use crate::config::app_config::{AppConfig, Format};
 
@@ -30,24 +31,47 @@ pub trait Upscaler: Send {
             }
         }
 
-        let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
-        reader.set_format(image_format);
-        let image = reader.decode()
-            .or(image::io::Reader::new(Cursor::new(input.clone()))
-                .with_guessed_format().unwrap().decode()
-            ).unwrap();
+        let image = match image_format {
+            ImageFormat::Avif => match decode_avif(&input) {
+                Ok(image) => image,
+                Err(error) => {
+                    warn!("can't decode AVIF image: {error}");
+                    return (input, image_format);
+                }
+            },
+            _ => {
+                let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
+                reader.set_format(image_format);
+                match reader.decode().or_else(|_| {
+                    image::io::Reader::new(Cursor::new(input.clone()))
+                        .with_guessed_format()
+                        .map_err(image::ImageError::IoError)
+                        .and_then(|reader| reader.decode())
+                }) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        warn!("can't decode image: {error}");
+                        return (input, image_format);
+                    }
+                }
+            }
+        };
 
         let upscaled = self.upscale_image(image);
         let mut buf = Cursor::new(Vec::new());
 
         let format_to = match config.return_format {
-            Format::Png => { ImageFormat::Png }
-            Format::Jpeg => { ImageFormat::Jpeg }
-            Format::WebP => { ImageFormat::WebP }
-            Format::Original => { image_format }
+            Format::Png => ImageFormat::Png,
+            Format::Jpeg => ImageFormat::Jpeg,
+            Format::WebP => ImageFormat::WebP,
+            Format::Original => image_format,
         };
 
-        upscaled.write_to(&mut buf, format_to).expect("can't write image");
+        if let Err(error) = upscaled.write_to(&mut buf, format_to) {
+            warn!("can't write upscaled image: {error}");
+            return (input, image_format);
+        }
+
         let output = Bytes::from(buf.into_inner());
         (preserve_icc_profile(&input, output), format_to)
     }
@@ -55,6 +79,19 @@ pub trait Upscaler: Send {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
 
     fn get_config(&self) -> UpscalerConfig;
+}
+
+fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
+    let decoded = zenavif::decode(input.as_ref())
+        .map_err(|error| format!("{error:?}"))?;
+    let rgba = decoded.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let pixels = rgba.copy_to_contiguous_bytes();
+
+    image::RgbaImage::from_raw(width, height, pixels)
+        .map(DynamicImage::ImageRgba8)
+        .ok_or_else(|| "decoded AVIF has an invalid pixel buffer".to_string())
 }
 
 fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
