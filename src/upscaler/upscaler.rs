@@ -5,6 +5,7 @@ use bytes::Bytes;
 use image::{DynamicImage, ImageFormat};
 use img_parts::{DynImage, ImageICC};
 use log::{info, warn};
+use moxcms::{ColorProfile, Layout, TransformOptions};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 use waifu2x_ncnn_vulkan_rs::Waifu2x;
 use zenpixels::{AlphaMode, ChannelLayout, ChannelType, PixelDescriptor};
@@ -74,11 +75,9 @@ pub trait Upscaler: Send {
         }
 
         let output = Bytes::from(buf.into_inner());
-        // AVIF is decoded into a real sRGB pixel buffer before it reaches the
-        // neural network, so the resulting WebP/JPEG/PNG pixels are already
-        // sRGB. Do not attach the AVIF's original ICC profile to those pixels:
-        // doing so would describe the converted sRGB bytes as the source color
-        // space and produce a second, incorrect color transform in viewers.
+        // AVIF pixels are normalized to sRGB before they reach the neural
+        // network, so an AVIF ICC profile must not be copied onto the output.
+        // Other formats retain the existing ICC-preservation behavior.
         let output = if image_format == ImageFormat::Avif {
             output
         } else {
@@ -97,20 +96,60 @@ fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     let decoded = zenavif::decode(input.as_ref())
         .map_err(|error| format!("{error:?}"))?;
 
-    // AVIF carries color information in CICP and/or ICC metadata. The decoded
-    // PixelBuffer retains that information in its descriptor, so converting it
-    // to an explicit RGBA8 sRGB descriptor applies the transfer-function and
-    // primaries conversion instead of merely relabelling the source bytes.
-    // This is important because DynamicImage/RealCUGAN only receives raw RGBA8
-    // pixels and cannot carry the AVIF color descriptor through the GPU path.
-    let target = PixelDescriptor::RGBA8_SRGB;
+    // First normalize the decoded AVIF pixels to RGBA8 while keeping their
+    // source color semantics. This is only a layout/depth conversion; the
+    // actual color conversion is handled below.
+    let source = decoded.descriptor();
+    let source_rgba = PixelDescriptor::new_full(
+        ChannelType::U8,
+        ChannelLayout::Rgba,
+        Some(AlphaMode::Straight),
+        source.transfer(),
+        source.primaries,
+    );
+
     let rgba = decoded
-        .convert_to(target)
+        .convert_to(source_rgba)
         .map_err(|error| format!("{error:?}"))?;
 
     let width = rgba.width();
     let height = rgba.height();
-    let pixels = rgba.copy_to_contiguous_bytes();
+    let mut pixels = rgba.copy_to_contiguous_bytes();
+
+    // `convert_to(RGBA8_SRGB)` handles standard CICP-described spaces such as
+    // sRGB, Display P3 and BT.2020. It does not, however, perform a true ICC
+    // profile transform for an arbitrary embedded ICC profile. Chrome does
+    // color-manage those profiles, so use the same kind of source->sRGB ICC
+    // transform here when the AVIF actually contains one.
+    if let Some(icc) = decoded
+        .color_context()
+        .and_then(|context| context.icc.as_ref())
+    {
+        let source_profile = ColorProfile::new_from_slice(icc.as_ref())
+            .map_err(|error| format!("can't parse AVIF ICC profile: {error}"))?;
+        let destination_profile = ColorProfile::new_srgb();
+        let transform = source_profile
+            .create_transform_8bit(
+                Layout::Rgba,
+                &destination_profile,
+                Layout::Rgba,
+                TransformOptions::default(),
+            )
+            .map_err(|error| format!("can't create AVIF ICC transform: {error}"))?;
+
+        let mut converted = vec![0u8; pixels.len()];
+        transform
+            .transform(&pixels, &mut converted)
+            .map_err(|error| format!("can't transform AVIF colors to sRGB: {error}"))?;
+        pixels = converted;
+    } else {
+        // No ICC profile: use the AVIF's CICP/descriptor metadata to perform
+        // the normal named-profile conversion to sRGB.
+        let srgb = rgba
+            .convert_to(PixelDescriptor::RGBA8_SRGB)
+            .map_err(|error| format!("{error:?}"))?;
+        pixels = srgb.copy_to_contiguous_bytes();
+    }
 
     image::RgbaImage::from_raw(width, height, pixels)
         .map(DynamicImage::ImageRgba8)
