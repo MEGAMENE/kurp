@@ -26,7 +26,6 @@ jobs:
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
           cache: true
-          stripdown: true
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -66,11 +65,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $glslangDir = Join-Path $env:VULKAN_SDK 'Lib\cmake\glslang'
-          if (-not (Test-Path (Join-Path $glslangDir 'glslangTargets.cmake'))) {
-            throw "Could not find glslangTargets.cmake at $glslangDir"
+          $glslangTargets = Get-ChildItem "$env:VULKAN_SDK" -Recurse -Filter 'glslangTargets.cmake' |
+            Select-Object -First 1
+          if (-not $glslangTargets) {
+            throw "Could not find glslangTargets.cmake below $env:VULKAN_SDK"
           }
-          "GLSLANG_TARGET_DIR=$glslangDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GLSLANG_TARGET_DIR=$($glslangTargets.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build kurp
         shell: pwsh
