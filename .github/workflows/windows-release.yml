@@ -122,7 +122,20 @@ jobs:
           "ncnn_DIR=$ncnnDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CMAKE_PREFIX_PATH=$ncnnRoot;$env:CMAKE_PREFIX_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          $ncnnDll = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.dll' | Select-Object -First 1
+          # CMake can resolve the imported ncnn target, but the Rust wrapper
+          # build scripts emit `-lncnn` to rustc. Make the MSVC linker search
+          # path explicit so the final kurp link can find ncnn.lib.
+          $ncnnLib = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.lib' |
+            Where-Object { $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))' } |
+            Select-Object -First 1
+          if (-not $ncnnLib) { throw 'Could not find ncnn.lib in the selected x64 NCNN package.' }
+          Write-Host "NCNN_LIB = $($ncnnLib.FullName)"
+          "NCNN_LIB_DIR=$($ncnnLib.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB=$($ncnnLib.Directory.FullName);$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $ncnnDll = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.dll' |
+            Where-Object { $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))' } |
+            Select-Object -First 1
           if (-not $ncnnDll) { throw 'Could not find ncnn.dll in the selected x64 NCNN package.' }
           "NCNN_DLL=$($ncnnDll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
