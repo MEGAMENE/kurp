@@ -47,11 +47,10 @@ jobs:
             -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' `
             -Headers $headers
 
-          # The generic Windows package contains x86/x64/ARM/ARM64 builds.
-          # Select the x64 CMake package from it instead of assuming the first
-          # ncnnConfig.cmake belongs to the runner architecture.
+          # windows-2022 is an x64 MSVC runner. Use the matching VS2022
+          # shared package; it provides ncnn.dll and the CMake package.
           $ncnnAsset = $release.assets |
-            Where-Object { $_.name -match '^ncnn-\d+-windows\.zip$' } |
+            Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } |
             Select-Object -First 1
 
           if (-not $ncnnAsset) {
@@ -59,7 +58,7 @@ jobs:
             $release.assets |
               Where-Object { $_.name -match '(?i)windows' } |
               ForEach-Object { Write-Host " - $($_.name)" }
-            throw 'Could not find the versioned NCNN Windows package.'
+            throw 'Could not find the NCNN Windows VS2022 shared package.'
           }
 
           Write-Host "NCNN release: $($release.tag_name)"
@@ -67,6 +66,8 @@ jobs:
 
           $zipPath = Join-Path $env:RUNNER_TEMP 'ncnn-windows.zip'
           $ncnnPath = Join-Path $env:RUNNER_TEMP 'ncnn'
+
+          Remove-Item $ncnnPath -Recurse -Force -ErrorAction SilentlyContinue
 
           Invoke-WebRequest `
             -Uri $ncnnAsset.browser_download_url `
@@ -87,17 +88,17 @@ jobs:
           Write-Host 'NCNN config files found:'
           $configs | ForEach-Object { Write-Host " - $($_.FullName)" }
 
-          # The generic package contains separate architecture roots. Prefer an
-          # explicitly x64/x86_64 path and reject ARM/ARM64 paths.
+          # The package contains architecture-specific roots. The runner is
+          # x64, so select only a config beneath x64/x86_64 and never arm/arm64.
           $ncnnConfig = $configs |
             Where-Object {
               $_.FullName -match '(?i)(^|[\\/])(x64|x86_64)([\\/]|$)' -and
-              $_.FullName -notmatch '(?i)(arm64|aarch64|\\arm[\\/])'
+              $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))'
             } |
             Select-Object -First 1
 
           if (-not $ncnnConfig) {
-            throw 'Could not find an x64 ncnnConfig.cmake in the downloaded NCNN package.'
+            throw 'Could not find an x64 ncnnConfig.cmake in the downloaded VS2022 package.'
           }
 
           $ncnnRoot = $ncnnConfig.Directory.Parent.Parent.Parent.FullName
