@@ -202,6 +202,17 @@ jobs:
           New-Item -ItemType Directory -Path dist\models -Force | Out-Null
           Copy-Item target\release\kurp.exe dist\kurp.exe
           Copy-Item $env:NCNN_DLL dist\ncnn.dll
+
+          # dav1d-sys links against the vcpkg shared dav1d library. The build
+          # environment can find it through PKG_CONFIG_PATH, but end users need
+          # the runtime DLL beside kurp.exe (or on PATH).
+          $dav1dDll = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin\dav1d.dll'
+          if (-not (Test-Path $dav1dDll)) {
+            throw "dav1d.dll was not found at $dav1dDll"
+          }
+          Copy-Item $dav1dDll dist\dav1d.dll
+          Write-Host "Bundled dav1d.dll from $dav1dDll"
+
           Copy-Item README.md, LICENSE dist\
           git clone --depth 1 https://github.com/nihui/waifu2x-ncnn-vulkan.git "$env:RUNNER_TEMP\waifu2x-models"
           git clone --depth 1 https://github.com/nihui/realcugan-ncnn-vulkan.git "$env:RUNNER_TEMP\realcugan-models"
