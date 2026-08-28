@@ -1,0 +1,148 @@
+name: Windows Release
+
+on:
+  push:
+    branches:
+      - fix/preserve-icc-profile
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          cache: true
+          stripdown: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Download prebuilt ncnn
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/Tencent/ncnn/releases/latest/download/ncnn-windows.zip' `
+            -OutFile "$env:RUNNER_TEMP\ncnn-windows.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\ncnn-windows.zip" -DestinationPath "$env:RUNNER_TEMP\ncnn" -Force
+
+          $ncnnConfig = Get-ChildItem "$env:RUNNER_TEMP\ncnn" -Recurse -Filter 'ncnnConfig.cmake' |
+            Select-Object -First 1
+          if (-not $ncnnConfig) {
+            throw 'Could not find ncnnConfig.cmake in the downloaded ncnn package.'
+          }
+
+          $ncnnRoot = $ncnnConfig.Directory.Parent.Parent.Parent.FullName
+          "NCNN_ROOT=$ncnnRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ncnn_DIR=$($ncnnConfig.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $prefix = "$ncnnRoot;$env:CMAKE_PREFIX_PATH"
+          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $ncnnDll = Get-ChildItem "$ncnnRoot" -Recurse -Filter 'ncnn.dll' |
+            Select-Object -First 1
+          if (-not $ncnnDll) {
+            throw 'Could not find ncnn.dll in the downloaded ncnn package.'
+          }
+          "NCNN_DLL=$($ncnnDll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure Vulkan and glslang paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $glslangDir = Join-Path $env:VULKAN_SDK 'Lib\cmake\glslang'
+          if (-not (Test-Path (Join-Path $glslangDir 'glslangTargets.cmake'))) {
+            throw "Could not find glslangTargets.cmake at $glslangDir"
+          }
+          "GLSLANG_TARGET_DIR=$glslangDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build kurp
+        shell: pwsh
+        env:
+          CMAKE_BUILD_TYPE: Release
+        run: cargo build --release
+
+      - name: Package Windows release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path dist\models -Force | Out-Null
+
+          Copy-Item target\release\kurp.exe dist\kurp.exe
+          Copy-Item $env:NCNN_DLL dist\ncnn.dll
+          Copy-Item README.md, LICENSE dist\
+
+          git clone --depth 1 https://github.com/nihui/waifu2x-ncnn-vulkan.git "$env:RUNNER_TEMP\waifu2x-models"
+          git clone --depth 1 https://github.com/nihui/realcugan-ncnn-vulkan.git "$env:RUNNER_TEMP\realcugan-models"
+
+          Copy-Item "$env:RUNNER_TEMP\waifu2x-models\models\*" dist\models\ -Recurse -Force
+          Copy-Item "$env:RUNNER_TEMP\realcugan-models\models\*" dist\models\ -Recurse -Force
+
+          Compress-Archive -Path dist\* -DestinationPath kurp-windows-x64.zip -Force
+          (Get-FileHash kurp-windows-x64.zip -Algorithm SHA256).Hash | Out-File kurp-windows-x64.sha256 -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: kurp-windows-x64
+          path: |
+            kurp-windows-x64.zip
+            kurp-windows-x64.sha256
+          if-no-files-found: error
+
+      - name: Publish Windows Latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'windows-latest'
+          $title = 'Windows Latest'
+          $notes = @"
+          Automated Windows x64 build from commit $env:GITHUB_SHA.
+
+          Includes the ICC profile preservation fix and bundled Waifu2x/Real-CUGAN models.
+          This is a prerelease build.
+          "@
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              kurp-windows-x64.zip `
+              kurp-windows-x64.sha256 `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title $title `
+              --notes $notes `
+              --prerelease
+          }
+          else {
+            gh release edit $tag `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title $title `
+              --notes $notes `
+              --prerelease
+            gh release upload $tag `
+              kurp-windows-x64.zip `
+              kurp-windows-x64.sha256 `
+              --repo $env:GITHUB_REPOSITORY `
+              --clobber
+          }
