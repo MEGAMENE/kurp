@@ -36,6 +36,7 @@ jobs:
             git clone --no-checkout --filter=blob:none $Repo $Path
             git -C $Path fetch --depth 1 origin $Commit
             git -C $Path checkout --detach $Commit
+            git -C $Path submodule update --init --recursive
           }
 
           Replace-Wrapper 'waifu2x-ncnn-vulkan-rs' $waifu2xRepo $waifu2xCommit
@@ -55,9 +56,6 @@ jobs:
           Remove-Item $glslangDir -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $glslangDir -Force | Out-Null
 
-          # CMake's FindVulkan exposes Vulkan::glslang only when the glslang
-          # component is requested. The Papaj wrappers expect the conventional
-          # glslang::glslang and glslang::SPIRV package targets.
           @'
           find_package(Vulkan REQUIRED COMPONENTS glslang)
 
@@ -67,19 +65,16 @@ jobs:
 
           if (NOT TARGET glslang::glslang)
               add_library(glslang::glslang INTERFACE IMPORTED)
-              set_property(TARGET glslang::glslang PROPERTY
-                  INTERFACE_LINK_LIBRARIES Vulkan::glslang)
+              set_property(TARGET glslang::glslang PROPERTY INTERFACE_LINK_LIBRARIES Vulkan::glslang)
           endif()
 
           if (NOT TARGET glslang::SPIRV)
               add_library(glslang::SPIRV INTERFACE IMPORTED)
-              set_property(TARGET glslang::SPIRV PROPERTY
-                  INTERFACE_LINK_LIBRARIES Vulkan::glslang)
+              set_property(TARGET glslang::SPIRV PROPERTY INTERFACE_LINK_LIBRARIES Vulkan::glslang)
           endif()
           '@ | Set-Content -Path (Join-Path $glslangDir 'glslangConfig.cmake') -Encoding utf8
 
-          "glslang_DIR=$glslangDir" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "glslang_DIR=$glslangDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -95,36 +90,26 @@ jobs:
             'Accept' = 'application/vnd.github+json'
           }
 
-          $release = Invoke-RestMethod `
-            -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' `
-            -Headers $headers
-
-          $ncnnAsset = $release.assets |
-            Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } |
-            Select-Object -First 1
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' -Headers $headers
+          $ncnnAsset = $release.assets | Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } | Select-Object -First 1
 
           if (-not $ncnnAsset) {
             Write-Host 'Available NCNN Windows assets:'
-            $release.assets |
-              Where-Object { $_.name -match '(?i)windows' } |
-              ForEach-Object { Write-Host " - $($_.name)" }
+            $release.assets | Where-Object { $_.name -match '(?i)windows' } | ForEach-Object { Write-Host " - $($_.name)" }
             throw 'Could not find the NCNN Windows VS2022 shared package.'
           }
 
           $zipPath = Join-Path $env:RUNNER_TEMP 'ncnn-windows.zip'
           $ncnnPath = Join-Path $env:RUNNER_TEMP 'ncnn'
           Remove-Item $ncnnPath -Recurse -Force -ErrorAction SilentlyContinue
-
           Invoke-WebRequest -Uri $ncnnAsset.browser_download_url -Headers $headers -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath $ncnnPath -Force
 
           $configs = Get-ChildItem $ncnnPath -Recurse -Filter 'ncnnConfig.cmake'
-          $ncnnConfig = $configs |
-            Where-Object {
-              $_.FullName -match '(?i)(^|[\\/])(x64|x86_64)([\\/]|$)' -and
-              $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))'
-            } |
-            Select-Object -First 1
+          $ncnnConfig = $configs | Where-Object {
+            $_.FullName -match '(?i)(^|[\\/])(x64|x86_64)([\\/]|$)' -and
+            $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))'
+          } | Select-Object -First 1
 
           if (-not $ncnnConfig) {
             $configs | ForEach-Object { Write-Host " - $($_.FullName)" }
@@ -135,9 +120,7 @@ jobs:
           $ncnnDir = $ncnnConfig.Directory.FullName
           "NCNN_ROOT=$ncnnRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ncnn_DIR=$ncnnDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "$ncnnRoot;$env:CMAKE_PREFIX_PATH" |
-            ForEach-Object { "CMAKE_PREFIX_PATH=$($_)" } |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_PREFIX_PATH=$ncnnRoot;$env:CMAKE_PREFIX_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           $ncnnDll = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.dll' | Select-Object -First 1
           if (-not $ncnnDll) { throw 'Could not find ncnn.dll in the selected x64 NCNN package.' }
