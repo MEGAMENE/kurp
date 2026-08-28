@@ -31,6 +31,7 @@ bytes = "1.4.0"
 image = { version = "0.24.5", features = ["jpeg", "png", "webp", "webp-encoder", "gif"] }
 img-parts = "=0.3.3"
 zenavif = "0.1.6"
+zenpixels = "0.2.13"
 zenpixels-convert = { version = "0.2.13", features = ["rgb"] }
 headers = "0.3.8"
 once_cell = "1.10"
