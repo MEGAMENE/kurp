@@ -26,8 +26,6 @@ jobs:
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
           cache: true
-          # The Rust wrapper CMake explicitly includes the glslang CMake
-          # target files. stripdown removes files we need, so keep the full SDK.
           stripdown: false
 
       - name: Set up Rust
@@ -49,16 +47,19 @@ jobs:
             -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' `
             -Headers $headers
 
-          # windows-2022 is an x64 MSVC runner. NCNN's VS2022 shared package
-          # is the correct ABI and supplies ncnn.dll for the final package.
+          # The generic Windows package contains x86/x64/ARM/ARM64 builds.
+          # Select the x64 CMake package from it instead of assuming the first
+          # ncnnConfig.cmake belongs to the runner architecture.
           $ncnnAsset = $release.assets |
-            Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } |
+            Where-Object { $_.name -match '^ncnn-\d+-windows\.zip$' } |
             Select-Object -First 1
 
           if (-not $ncnnAsset) {
-            Write-Host 'Available NCNN release assets:'
-            $release.assets | ForEach-Object { Write-Host " - $($_.name)" }
-            throw 'Could not find the NCNN Windows VS2022 shared package.'
+            Write-Host 'Available NCNN Windows assets:'
+            $release.assets |
+              Where-Object { $_.name -match '(?i)windows' } |
+              ForEach-Object { Write-Host " - $($_.name)" }
+            throw 'Could not find the versioned NCNN Windows package.'
           }
 
           Write-Host "NCNN release: $($release.tag_name)"
@@ -77,24 +78,33 @@ jobs:
             -DestinationPath $ncnnPath `
             -Force
 
-          # The package may contain multiple architecture directories. Do not
-          # blindly take the first ncnnConfig.cmake: this build is x86_64.
           $configs = Get-ChildItem $ncnnPath -Recurse -Filter 'ncnnConfig.cmake'
+
+          if (-not $configs) {
+            throw 'Could not find ncnnConfig.cmake in the downloaded NCNN package.'
+          }
+
+          Write-Host 'NCNN config files found:'
+          $configs | ForEach-Object { Write-Host " - $($_.FullName)" }
+
+          # The generic package contains separate architecture roots. Prefer an
+          # explicitly x64/x86_64 path and reject ARM/ARM64 paths.
           $ncnnConfig = $configs |
-            Where-Object { $_.FullName -match '(?i)(^|[\\/])(x64|x86_64)([\\/]|$)' } |
+            Where-Object {
+              $_.FullName -match '(?i)(^|[\\/])(x64|x86_64)([\\/]|$)' -and
+              $_.FullName -notmatch '(?i)(arm64|aarch64|\\arm[\\/])'
+            } |
             Select-Object -First 1
 
           if (-not $ncnnConfig) {
-            Write-Host 'NCNN config files found:'
-            $configs | ForEach-Object { Write-Host " - $($_.FullName)" }
-            throw 'Could not find an x64 ncnnConfig.cmake in the downloaded package.'
+            throw 'Could not find an x64 ncnnConfig.cmake in the downloaded NCNN package.'
           }
 
           $ncnnRoot = $ncnnConfig.Directory.Parent.Parent.Parent.FullName
           $ncnnDir = $ncnnConfig.Directory.FullName
 
-          Write-Host "NCNN_ROOT = $ncnnRoot"
-          Write-Host "ncnn_DIR  = $ncnnDir"
+          Write-Host "Selected NCNN_ROOT = $ncnnRoot"
+          Write-Host "Selected ncnn_DIR  = $ncnnDir"
 
           "NCNN_ROOT=$ncnnRoot" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -113,40 +123,8 @@ jobs:
             throw 'Could not find ncnn.dll in the selected x64 NCNN package.'
           }
 
-          Write-Host "NCNN_DLL  = $($ncnnDll.FullName)"
+          Write-Host "NCNN_DLL = $($ncnnDll.FullName)"
           "NCNN_DLL=$($ncnnDll.FullName)" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Configure Vulkan and glslang paths
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          # The wrapper CMakeLists.txt expects these legacy glslang target files
-          # to all be in the same directory.
-          $required = @(
-            'glslangTargets.cmake',
-            'SPIRVTargets.cmake',
-            'OSDependentTargets.cmake',
-            'OGLCompilerTargets.cmake'
-          )
-
-          $candidates = Get-ChildItem "$env:VULKAN_SDK" -Recurse -Filter 'glslangTargets.cmake'
-          $glslangTargets = $candidates |
-            Where-Object {
-              $dir = $_.Directory.FullName
-              ($required | ForEach-Object { Test-Path (Join-Path $dir $_) }) -notcontains $false
-            } |
-            Select-Object -First 1
-
-          if (-not $glslangTargets) {
-            Write-Host 'glslangTargets.cmake candidates:'
-            $candidates | ForEach-Object { Write-Host " - $($_.FullName)" }
-            throw "Could not find a complete glslang CMake target set below $env:VULKAN_SDK"
-          }
-
-          Write-Host "GLSLANG_TARGET_DIR=$($glslangTargets.Directory.FullName)"
-          "GLSLANG_TARGET_DIR=$($glslangTargets.Directory.FullName)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build kurp
