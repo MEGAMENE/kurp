@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use image::{DynamicImage, ImageFormat};
-use log::info;
+use img_parts::{DynImage, ImageICC};
+use log::{info, warn};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 use waifu2x_ncnn_vulkan_rs::Waifu2x;
 
@@ -32,7 +33,7 @@ pub trait Upscaler: Send {
         let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
         reader.set_format(image_format);
         let image = reader.decode()
-            .or(image::io::Reader::new(Cursor::new(input))
+            .or(image::io::Reader::new(Cursor::new(input.clone()))
                 .with_guessed_format().unwrap().decode()
             ).unwrap();
 
@@ -47,12 +48,44 @@ pub trait Upscaler: Send {
         };
 
         upscaled.write_to(&mut buf, format_to).expect("can't write image");
-        (Bytes::from(buf.into_inner()), format_to)
+        let output = Bytes::from(buf.into_inner());
+        (preserve_icc_profile(&input, output), format_to)
     }
 
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
 
     fn get_config(&self) -> UpscalerConfig;
+}
+
+fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
+    let input_image = match DynImage::from_bytes(input.to_vec().into()) {
+        Ok(Some(image)) => image,
+        Ok(None) | Err(_) => return output,
+    };
+
+    let profile = match input_image.icc_profile() {
+        Some(profile) => profile,
+        None => return output,
+    };
+
+    let mut output_image = match DynImage::from_bytes(output.to_vec().into()) {
+        Ok(Some(image)) => image,
+        Ok(None) => return output,
+        Err(error) => {
+            warn!("can't parse upscaled image for ICC profile preservation: {error}");
+            return output;
+        }
+    };
+
+    output_image.set_icc_profile(Some(profile));
+
+    let mut writer = Cursor::new(Vec::new());
+    if let Err(error) = output_image.encoder().write_to(&mut writer) {
+        warn!("can't write upscaled image after restoring ICC profile: {error}");
+        return output;
+    }
+
+    Bytes::from(writer.into_inner())
 }
 
 pub struct Waifu2xUpscaler {
@@ -116,7 +149,6 @@ impl RealCuganUpscaler {
         }
     }
 }
-
 
 impl Upscaler for Waifu2xUpscaler {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage {
