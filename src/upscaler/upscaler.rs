@@ -8,7 +8,7 @@ use log::{info, warn};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 use waifu2x_ncnn_vulkan_rs::Waifu2x;
 use zenpixels::{AlphaMode, ChannelLayout, ChannelType, PixelDescriptor};
-use zenpixels_convert::PixelBufferConvertTypedExt;
+use zenpixels_convert::{PixelBufferConvertExt, PixelBufferConvertTypedExt};
 
 use crate::config::app_config::{AppConfig, Format};
 
