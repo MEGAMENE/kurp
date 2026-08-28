@@ -36,30 +36,85 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+
+          $headers = @{
+            'User-Agent' = 'MEGAMENE-kurp-GitHub-Actions'
+            'Accept' = 'application/vnd.github+json'
+          }
+
+          $release = Invoke-RestMethod `
+            -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' `
+            -Headers $headers
+
+          # The Rust wrappers link ncnn dynamically, so use the VS2022 shared
+          # package that matches the windows-2022/MSVC runner.
+          $ncnnAsset = $release.assets |
+            Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } |
+            Select-Object -First 1
+
+          if (-not $ncnnAsset) {
+            Write-Host 'Available NCNN release assets:'
+            $release.assets | ForEach-Object { Write-Host " - $($_.name)" }
+            throw 'Could not find the NCNN Windows VS2022 shared package.'
+          }
+
+          Write-Host "NCNN release: $($release.tag_name)"
+          Write-Host "NCNN asset:   $($ncnnAsset.name)"
+
+          $zipPath = Join-Path $env:RUNNER_TEMP 'ncnn-windows.zip'
+          $ncnnPath = Join-Path $env:RUNNER_TEMP 'ncnn'
+
           Invoke-WebRequest `
-            -Uri 'https://github.com/Tencent/ncnn/releases/latest/download/ncnn-windows.zip' `
-            -OutFile "$env:RUNNER_TEMP\ncnn-windows.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\ncnn-windows.zip" -DestinationPath "$env:RUNNER_TEMP\ncnn" -Force
+            -Uri $ncnnAsset.browser_download_url `
+            -Headers $headers `
+            -OutFile $zipPath
 
-          $ncnnConfig = Get-ChildItem "$env:RUNNER_TEMP\ncnn" -Recurse -Filter 'ncnnConfig.cmake' |
+          if (-not (Test-Path $zipPath)) {
+            throw "NCNN download failed: $zipPath was not created."
+          }
+
+          Expand-Archive `
+            -Path $zipPath `
+            -DestinationPath $ncnnPath `
+            -Force
+
+          $ncnnConfig = Get-ChildItem $ncnnPath -Recurse -Filter 'ncnnConfig.cmake' |
             Select-Object -First 1
+
           if (-not $ncnnConfig) {
-            throw 'Could not find ncnnConfig.cmake in the downloaded ncnn package.'
+            throw 'Could not find ncnnConfig.cmake in the downloaded NCNN package.'
           }
 
+          # ncnnConfig.cmake lives at <root>/lib/cmake/ncnn.
           $ncnnRoot = $ncnnConfig.Directory.Parent.Parent.Parent.FullName
-          "NCNN_ROOT=$ncnnRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "ncnn_DIR=$($ncnnConfig.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $ncnnDir = $ncnnConfig.Directory.FullName
 
+          Write-Host "NCNN_ROOT = $ncnnRoot"
+          Write-Host "ncnn_DIR  = $ncnnDir"
+
+          "NCNN_ROOT=$ncnnRoot" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "ncnn_DIR=$ncnnDir" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # The wrapper crates invoke CMake's find_package(ncnn), so make the
+          # NCNN installation discoverable through the inherited CMake prefix.
           $prefix = "$ncnnRoot;$env:CMAKE_PREFIX_PATH"
-          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_PREFIX_PATH=$prefix" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          $ncnnDll = Get-ChildItem "$ncnnRoot" -Recurse -Filter 'ncnn.dll' |
+          $ncnnDll = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.dll' |
             Select-Object -First 1
+
           if (-not $ncnnDll) {
-            throw 'Could not find ncnn.dll in the downloaded ncnn package.'
+            throw 'Could not find ncnn.dll in the downloaded NCNN package.'
           }
-          "NCNN_DLL=$($ncnnDll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "NCNN_DLL  = $($ncnnDll.FullName)"
+
+          "NCNN_DLL=$($ncnnDll.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Configure Vulkan and glslang paths
         shell: pwsh
