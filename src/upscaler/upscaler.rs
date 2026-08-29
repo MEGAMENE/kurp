@@ -5,11 +5,9 @@ use bytes::Bytes;
 use image::{DynamicImage, ImageFormat};
 use img_parts::{DynImage, ImageICC};
 use log::{info, warn};
-use moxcms::{ColorProfile, Layout, TransformOptions};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 use waifu2x_ncnn_vulkan_rs::Waifu2x;
-use zenpixels::{PixelDescriptor};
-use zenpixels_convert::{PixelBufferConvertExt, PixelBufferConvertTypedExt};
+use zenpixels_convert::PixelBufferConvertTypedExt;
 
 use crate::config::app_config::{AppConfig, Format};
 
@@ -75,8 +73,10 @@ pub trait Upscaler: Send {
         }
 
         let output = Bytes::from(buf.into_inner());
-        // AVIF pixels are normalized to sRGB before they reach the neural
-        // network, so an AVIF ICC profile must not be copied onto the output.
+        // AVIF pixels are decoded to their native RGB representation using the
+        // AVIF CICP information. Do not copy an ICC profile onto the output:
+        // AVIF color metadata is CICP, not ICC, and the resulting pixels are
+        // converted to ordinary sRGB RGBA before the neural network sees them.
         // Other formats retain the existing ICC-preservation behavior.
         let output = if image_format == ImageFormat::Avif {
             output
@@ -96,22 +96,19 @@ fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     let decoded = zenavif::decode(input.as_ref())
         .map_err(|error| format!("{error:?}"))?;
 
-    // zenavif has already performed the AVIF YUV -> RGB conversion using the
-    // image's CICP metadata, including matrix coefficients and signal range.
-    // Do not manufacture a new descriptor here: doing so can relabel the
-    // decoded RGB samples and, in particular, incorrectly force full range.
+    // zenavif performs the AVIF YUV -> RGB conversion itself, using the
+    // container's CICP matrix coefficients and signal range. At this point
+    // the buffer is already color-interpreted RGB; we only need to obtain
+    // tightly-packed 8-bit RGBA samples for image::DynamicImage.
     //
-    // The previous implementation constructed an RGBA descriptor with
-    // `new_full(...)`, which discarded the decoder's range information and
-    // also bypassed the decoder's complete AVIF color interpretation.
-    // Convert the decoder's actual RGB buffer directly to sRGB instead.
-    let srgb = decoded
-        .convert_to(PixelDescriptor::RGBA8_SRGB)
-        .map_err(|error| format!("{error:?}"))?;
-
-    let width = srgb.width();
-    let height = srgb.height();
-    let pixels = srgb.copy_to_contiguous_bytes();
+    // Using to_rgba8() is deliberately different from convert_to(): it is a
+    // representation conversion, not another color-management operation.
+    // This prevents the second conversion from reinterpreting the decoder's
+    // already-converted RGB samples using PixelDescriptor signal-range rules.
+    let rgba = decoded.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let pixels = rgba.copy_to_contiguous_bytes();
 
     image::RgbaImage::from_raw(width, height, pixels)
         .map(DynamicImage::ImageRgba8)
