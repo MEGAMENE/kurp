@@ -76,7 +76,7 @@ pub trait Upscaler: Send {
         // AVIF pixels are decoded to their native RGB representation using the
         // AVIF CICP information. Do not copy an ICC profile onto the output:
         // AVIF color metadata is CICP, not ICC, and the resulting pixels are
-        // converted to ordinary sRGB RGBA before the neural network sees them.
+        // converted to ordinary RGB/RGBA before the neural network sees them.
         // Other formats retain the existing ICC-preservation behavior.
         let output = if image_format == ImageFormat::Avif {
             output
@@ -96,23 +96,35 @@ fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     let decoded = zenavif::decode(input.as_ref())
         .map_err(|error| format!("{error:?}"))?;
 
-    // zenavif performs the AVIF YUV -> RGB conversion itself, using the
-    // container's CICP matrix coefficients and signal range. At this point
-    // the buffer is already color-interpreted RGB; we only need to obtain
-    // tightly-packed 8-bit RGBA samples for image::DynamicImage.
-    //
-    // Using to_rgba8() is deliberately different from convert_to(): it is a
-    // representation conversion, not another color-management operation.
-    // This prevents the second conversion from reinterpreting the decoder's
-    // already-converted RGB samples using PixelDescriptor signal-range rules.
-    let rgba = decoded.to_rgba8();
-    let width = rgba.width();
-    let height = rgba.height();
-    let pixels = rgba.copy_to_contiguous_bytes();
+    let width = decoded.width();
+    let height = decoded.height();
+    let has_alpha = decoded.descriptor().format.channels() == 4;
 
-    image::RgbaImage::from_raw(width, height, pixels)
-        .map(DynamicImage::ImageRgba8)
-        .ok_or_else(|| "decoded AVIF has an invalid pixel buffer".to_string())
+    // Keep the channel count produced by the AVIF decoder. This is important
+    // for the neural upscaler: JPEG/opaque WebP inputs go through the 3-channel
+    // RGB path, while AVIFs with real alpha must go through RGBA. Previously we
+    // forced every AVIF through to_rgba8(), meaning even opaque AVIFs took a
+    // different Real-CUGAN/Waifu2x path from otherwise identical RGB images.
+    // That can change the model's output, including subtle colour differences.
+    //
+    // to_rgb8()/to_rgba8() are only representation conversions here; zenavif
+    // has already performed AVIF YUV -> RGB using the file's CICP matrix and
+    // signal range. We deliberately do not run another color conversion.
+    if has_alpha {
+        let rgba = decoded.to_rgba8();
+        let pixels = rgba.copy_to_contiguous_bytes();
+
+        image::RgbaImage::from_raw(width, height, pixels)
+            .map(DynamicImage::ImageRgba8)
+            .ok_or_else(|| "decoded AVIF has an invalid RGBA pixel buffer".to_string())
+    } else {
+        let rgb = decoded.to_rgb8();
+        let pixels = rgb.copy_to_contiguous_bytes();
+
+        image::RgbImage::from_raw(width, height, pixels)
+            .map(DynamicImage::ImageRgb8)
+            .ok_or_else(|| "decoded AVIF has an invalid RGB pixel buffer".to_string())
+    }
 }
 
 fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
