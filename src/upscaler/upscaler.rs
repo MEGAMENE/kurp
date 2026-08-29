@@ -8,7 +8,7 @@ use log::{info, warn};
 use moxcms::{ColorProfile, Layout, TransformOptions};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 use waifu2x_ncnn_vulkan_rs::Waifu2x;
-use zenpixels::{AlphaMode, ChannelLayout, ChannelType, PixelDescriptor};
+use zenpixels::{PixelDescriptor};
 use zenpixels_convert::{PixelBufferConvertExt, PixelBufferConvertTypedExt};
 
 use crate::config::app_config::{AppConfig, Format};
@@ -96,60 +96,22 @@ fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     let decoded = zenavif::decode(input.as_ref())
         .map_err(|error| format!("{error:?}"))?;
 
-    // First normalize the decoded AVIF pixels to RGBA8 while keeping their
-    // source color semantics. This is only a layout/depth conversion; the
-    // actual color conversion is handled below.
-    let source = decoded.descriptor();
-    let source_rgba = PixelDescriptor::new_full(
-        ChannelType::U8,
-        ChannelLayout::Rgba,
-        Some(AlphaMode::Straight),
-        source.transfer(),
-        source.primaries,
-    );
-
-    let rgba = decoded
-        .convert_to(source_rgba)
+    // zenavif has already performed the AVIF YUV -> RGB conversion using the
+    // image's CICP metadata, including matrix coefficients and signal range.
+    // Do not manufacture a new descriptor here: doing so can relabel the
+    // decoded RGB samples and, in particular, incorrectly force full range.
+    //
+    // The previous implementation constructed an RGBA descriptor with
+    // `new_full(...)`, which discarded the decoder's range information and
+    // also bypassed the decoder's complete AVIF color interpretation.
+    // Convert the decoder's actual RGB buffer directly to sRGB instead.
+    let srgb = decoded
+        .convert_to(PixelDescriptor::RGBA8_SRGB)
         .map_err(|error| format!("{error:?}"))?;
 
-    let width = rgba.width();
-    let height = rgba.height();
-    let mut pixels = rgba.copy_to_contiguous_bytes();
-
-    // `convert_to(RGBA8_SRGB)` handles standard CICP-described spaces such as
-    // sRGB, Display P3 and BT.2020. It does not, however, perform a true ICC
-    // profile transform for an arbitrary embedded ICC profile. Chrome does
-    // color-manage those profiles, so use the same kind of source->sRGB ICC
-    // transform here when the AVIF actually contains one.
-    if let Some(icc) = decoded
-        .color_context()
-        .and_then(|context| context.icc.as_ref())
-    {
-        let source_profile = ColorProfile::new_from_slice(icc.as_ref())
-            .map_err(|error| format!("can't parse AVIF ICC profile: {error}"))?;
-        let destination_profile = ColorProfile::new_srgb();
-        let transform = source_profile
-            .create_transform_8bit(
-                Layout::Rgba,
-                &destination_profile,
-                Layout::Rgba,
-                TransformOptions::default(),
-            )
-            .map_err(|error| format!("can't create AVIF ICC transform: {error}"))?;
-
-        let mut converted = vec![0u8; pixels.len()];
-        transform
-            .transform(&pixels, &mut converted)
-            .map_err(|error| format!("can't transform AVIF colors to sRGB: {error}"))?;
-        pixels = converted;
-    } else {
-        // No ICC profile: use the AVIF's CICP/descriptor metadata to perform
-        // the normal named-profile conversion to sRGB.
-        let srgb = rgba
-            .convert_to(PixelDescriptor::RGBA8_SRGB)
-            .map_err(|error| format!("{error:?}"))?;
-        pixels = srgb.copy_to_contiguous_bytes();
-    }
+    let width = srgb.width();
+    let height = srgb.height();
+    let pixels = srgb.copy_to_contiguous_bytes();
 
     image::RgbaImage::from_raw(width, height, pixels)
         .map(DynamicImage::ImageRgba8)
