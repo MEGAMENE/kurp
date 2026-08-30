@@ -57,6 +57,20 @@ pub trait Upscaler: Send {
             }
         };
 
+        // Diagnostic mode: decode the AVIF and write the decoded RGB/RGBA pixels
+        // directly to a lossless PNG, without Real-CUGAN, WebP encoding, or any
+        // other processing. This isolates AVIF YUV->RGB decoding from the rest
+        // of the upscale pipeline. Enable with KURP_AVIF_DECODE_ONLY=1.
+        if image_format == ImageFormat::Avif && std::env::var_os("KURP_AVIF_DECODE_ONLY").is_some() {
+            let mut buf = Cursor::new(Vec::new());
+            if let Err(error) = image.write_to(&mut buf, ImageFormat::Png) {
+                warn!("can't write AVIF decode diagnostic PNG: {error}");
+                return (input, image_format);
+            }
+            info!("AVIF decode-only diagnostic: returning lossless PNG without upscaling");
+            return (Bytes::from(buf.into_inner()), ImageFormat::Png);
+        }
+
         let upscaled = self.upscale_image(image);
         let mut buf = Cursor::new(Vec::new());
 
@@ -105,11 +119,6 @@ fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     // RGB path, while AVIFs with real alpha must go through RGBA. Previously we
     // forced every AVIF through to_rgba8(), meaning even opaque AVIFs took a
     // different Real-CUGAN/Waifu2x path from otherwise identical RGB images.
-    // That can change the model's output, including subtle colour differences.
-    //
-    // to_rgb8()/to_rgba8() are only representation conversions here; zenavif
-    // has already performed AVIF YUV -> RGB using the file's CICP matrix and
-    // signal range. We deliberately do not run another color conversion.
     if has_alpha {
         let rgba = decoded.to_rgba8();
         let pixels = rgba.copy_to_contiguous_bytes();
@@ -213,10 +222,7 @@ impl RealCuganUpscaler {
             return_format: config.return_format,
         };
 
-        Self {
-            config: upscaler_config,
-            realcugan,
-        }
+        Self { config: upscaler_config, realcugan }
     }
 }
 
