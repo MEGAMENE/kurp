@@ -57,36 +57,7 @@ pub trait Upscaler: Send {
             }
         };
 
-        // Diagnostic mode: decode the AVIF and write the decoded RGB/RGBA pixels
-        // directly to a lossless PNG, without Real-CUGAN, WebP encoding, or any
-        // other processing. This isolates AVIF YUV->RGB decoding from the rest
-        // of the upscale pipeline. Enable with KURP_AVIF_DECODE_ONLY=1.
-        if image_format == ImageFormat::Avif && std::env::var_os("KURP_AVIF_DECODE_ONLY").is_some() {
-            let mut buf = Cursor::new(Vec::new());
-            if let Err(error) = image.write_to(&mut buf, ImageFormat::Png) {
-                warn!("can't write AVIF decode diagnostic PNG: {error}");
-                return (input, image_format);
-            }
-            info!("AVIF decode-only diagnostic: returning lossless PNG without upscaling");
-            return (Bytes::from(buf.into_inner()), ImageFormat::Png);
-        }
-
         let upscaled = self.upscale_image(image);
-
-        // Diagnostic mode: run the neural upscaler but bypass WebP encoding.
-        // If this PNG matches the AVIF's expected colors while the normal WebP
-        // does not, the problem is in the output encoding/metadata path rather
-        // than AVIF decoding or Real-CUGAN itself. Enable with
-        // KURP_AVIF_UPSCALE_PNG=1.
-        if image_format == ImageFormat::Avif && std::env::var_os("KURP_AVIF_UPSCALE_PNG").is_some() {
-            let mut buf = Cursor::new(Vec::new());
-            if let Err(error) = upscaled.write_to(&mut buf, ImageFormat::Png) {
-                warn!("can't write AVIF upscale diagnostic PNG: {error}");
-                return (input, image_format);
-            }
-            info!("AVIF upscale diagnostic: returning lossless PNG after upscaling");
-            return (Bytes::from(buf.into_inner()), ImageFormat::Png);
-        }
 
         let mut buf = Cursor::new(Vec::new());
 
