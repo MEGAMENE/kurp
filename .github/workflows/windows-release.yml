@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/preserve-icc-profile
+      - debug/avif-decode-color
   workflow_dispatch:
 
 permissions:
