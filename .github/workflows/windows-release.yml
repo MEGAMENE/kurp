@@ -5,6 +5,7 @@ on:
     branches:
       - fix/preserve-icc-profile
       - debug/avif-decode-color
+      - debug/avif-png-roundtrip
   workflow_dispatch:
 
 permissions:
