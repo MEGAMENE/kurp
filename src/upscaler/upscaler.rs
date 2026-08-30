@@ -31,14 +31,38 @@ pub trait Upscaler: Send {
             }
         }
 
-        let image = match image_format {
-            ImageFormat::Avif => match decode_avif(&input) {
-                Ok(image) => image,
-                Err(error) => {
-                    warn!("can't decode AVIF image: {error}");
+        // For the round-trip diagnostic branch, deliberately normalize AVIF through
+        // the exact same lossless PNG representation that we established as visually
+        // correct, then feed those PNG pixels to the normal image decoder/upscaler.
+        // This isolates whether the AVIF-specific DynamicImage -> neural-upscaler
+        // handoff is responsible for the observed color shift.
+        let (image, upscale_format) = match image_format {
+            ImageFormat::Avif => {
+                let decoded = match decode_avif(&input) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        warn!("can't decode AVIF image: {error}");
+                        return (input, image_format);
+                    }
+                };
+
+                let mut png_buf = Cursor::new(Vec::new());
+                if let Err(error) = decoded.write_to(&mut png_buf, ImageFormat::Png) {
+                    warn!("can't convert AVIF to PNG for round-trip diagnostic: {error}");
                     return (input, image_format);
                 }
-            },
+
+                let png_bytes = png_buf.into_inner();
+                let mut reader = image::io::Reader::new(Cursor::new(png_bytes));
+                reader.set_format(ImageFormat::Png);
+                match reader.decode() {
+                    Ok(image) => (image, ImageFormat::Png),
+                    Err(error) => {
+                        warn!("can't decode AVIF->PNG round-trip image: {error}");
+                        return (input, image_format);
+                    }
+                }
+            }
             _ => {
                 let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
                 reader.set_format(image_format);
@@ -48,7 +72,7 @@ pub trait Upscaler: Send {
                         .map_err(image::ImageError::IoError)
                         .and_then(|reader| reader.decode())
                 }) {
-                    Ok(image) => image,
+                    Ok(image) => (image, image_format),
                     Err(error) => {
                         warn!("can't decode image: {error}");
                         return (input, image_format);
@@ -65,7 +89,7 @@ pub trait Upscaler: Send {
             Format::Png => ImageFormat::Png,
             Format::Jpeg => ImageFormat::Jpeg,
             Format::WebP => ImageFormat::WebP,
-            Format::Original => image_format,
+            Format::Original => upscale_format,
         };
 
         if let Err(error) = upscaled.write_to(&mut buf, format_to) {
@@ -74,11 +98,6 @@ pub trait Upscaler: Send {
         }
 
         let output = Bytes::from(buf.into_inner());
-        // AVIF pixels are decoded to their native RGB representation using the
-        // AVIF CICP information. Do not copy an ICC profile onto the output:
-        // AVIF color metadata is CICP, not ICC, and the resulting pixels are
-        // converted to ordinary RGB/RGBA before the neural network sees them.
-        // Other formats retain the existing ICC-preservation behavior.
         let output = if image_format == ImageFormat::Avif {
             output
         } else {
