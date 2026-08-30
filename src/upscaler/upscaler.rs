@@ -72,6 +72,22 @@ pub trait Upscaler: Send {
         }
 
         let upscaled = self.upscale_image(image);
+
+        // Diagnostic mode: run the neural upscaler but bypass WebP encoding.
+        // If this PNG matches the AVIF's expected colors while the normal WebP
+        // does not, the problem is in the output encoding/metadata path rather
+        // than AVIF decoding or Real-CUGAN itself. Enable with
+        // KURP_AVIF_UPSCALE_PNG=1.
+        if image_format == ImageFormat::Avif && std::env::var_os("KURP_AVIF_UPSCALE_PNG").is_some() {
+            let mut buf = Cursor::new(Vec::new());
+            if let Err(error) = upscaled.write_to(&mut buf, ImageFormat::Png) {
+                warn!("can't write AVIF upscale diagnostic PNG: {error}");
+                return (input, image_format);
+            }
+            info!("AVIF upscale diagnostic: returning lossless PNG after upscaling");
+            return (Bytes::from(buf.into_inner()), ImageFormat::Png);
+        }
+
         let mut buf = Cursor::new(Vec::new());
 
         let format_to = match config.return_format {
@@ -114,11 +130,6 @@ fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     let height = decoded.height();
     let has_alpha = decoded.descriptor().format.channels() == 4;
 
-    // Keep the channel count produced by the AVIF decoder. This is important
-    // for the neural upscaler: JPEG/opaque WebP inputs go through the 3-channel
-    // RGB path, while AVIFs with real alpha must go through RGBA. Previously we
-    // forced every AVIF through to_rgba8(), meaning even opaque AVIFs took a
-    // different Real-CUGAN/Waifu2x path from otherwise identical RGB images.
     if has_alpha {
         let rgba = decoded.to_rgba8();
         let pixels = rgba.copy_to_contiguous_bytes();
