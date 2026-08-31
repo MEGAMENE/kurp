@@ -25,6 +25,7 @@ struct ChromaStats {
     max_spread: u8,
     pixels_over_tolerance: usize,
     total_pixels: usize,
+    has_localized_color: bool,
 }
 
 impl ChromaStats {
@@ -72,18 +73,20 @@ pub trait Upscaler: Send {
         };
 
         // Real-CUGAN is a colour model. For pages that are effectively grayscale,
-        // its reconstruction can introduce a small chroma bias. Detect grayscale
-        // input and normalize the model output back to neutral RGB. This is
-        // deliberately based on the decoded pixels, so it applies equally to
-        // AVIF, PNG, WebP, JPEG, etc. and is not an AVIF-specific conversion.
+        // its reconstruction can introduce a small chroma bias. Normalize those
+        // outputs back to neutral RGB, but never do that when the source contains
+        // a meaningful localized colour region (for example, a coloured watermark).
+        // A global colour percentage alone is not sufficient: a watermark can be
+        // only a fraction of a percent of the page while still being important.
         let input_stats = chroma_stats(&image);
         let preserve_grayscale = is_effectively_grayscale(input_stats);
         info!(
-            "grayscale diagnostic [{}]: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}% -> {}",
+            "grayscale diagnostic [{}]: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%, localized color {} -> {}",
             source_name,
             input_stats.average_spread,
             input_stats.max_spread,
             input_stats.percentage_over_tolerance(),
+            input_stats.has_localized_color,
             if preserve_grayscale { "GRAYSCALE" } else { "COLOR" }
         );
 
@@ -142,16 +145,22 @@ fn is_effectively_grayscale(stats: ChromaStats) -> bool {
 
     stats.average_spread <= MAX_AVERAGE_SPREAD
         && stats.percentage_over_tolerance() <= MAX_PIXELS_OVER_TOLERANCE_PERCENT
+        && !stats.has_localized_color
 }
 
 fn chroma_stats(image: &DynamicImage) -> ChromaStats {
+    // Work on RGB8 once so the same pixel data is used for both the global
+    // statistics and the localized-colour test.
     let rgb = image.to_rgb8();
+    let width = rgb.width() as usize;
+    let height = rgb.height() as usize;
+    let total_pixels = width * height;
     let mut total_spread = 0u64;
     let mut max_spread = 0u8;
     let mut pixels_over_tolerance = 0usize;
-    let total_pixels = rgb.width() as usize * rgb.height() as usize;
+    let mut colour_mask = vec![false; total_pixels];
 
-    for pixel in rgb.pixels() {
+    for (index, pixel) in rgb.pixels().enumerate() {
         let r = pixel[0] as i16;
         let g = pixel[1] as i16;
         let b = pixel[2] as i16;
@@ -159,14 +168,63 @@ fn chroma_stats(image: &DynamicImage) -> ChromaStats {
         total_spread += spread as u64;
         max_spread = max_spread.max(spread);
         if spread > 3 { pixels_over_tolerance += 1; }
+        // A higher threshold than the global tolerance filters codec noise while
+        // retaining actual saturated watermark/logo pixels.
+        colour_mask[index] = spread >= 12;
     }
+
+    let has_localized_color = has_significant_color_component(&colour_mask, width, height);
 
     ChromaStats {
         average_spread: if total_pixels == 0 { 0.0 } else { total_spread as f64 / total_pixels as f64 },
         max_spread,
         pixels_over_tolerance,
         total_pixels,
+        has_localized_color,
     }
+}
+
+fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -> bool {
+    // A component of only a handful of pixels is usually compression noise or an
+    // isolated coloured speck. A small connected region catches text, logos and
+    // watermarks without relying on the global colour percentage.
+    const MIN_COMPONENT_PIXELS: usize = 8;
+    if width == 0 || height == 0 { return false; }
+
+    let mut visited = vec![false; mask.len()];
+    let mut stack = Vec::with_capacity(64);
+
+    for start in 0..mask.len() {
+        if !mask[start] || visited[start] { continue; }
+
+        visited[start] = true;
+        stack.push(start);
+        let mut component_size = 0usize;
+
+        while let Some(index) = stack.pop() {
+            component_size += 1;
+            if component_size >= MIN_COMPONENT_PIXELS { return true; }
+
+            let x = index % width;
+            let y = index / width;
+            let x_start = x.saturating_sub(1);
+            let x_end = (x + 1).min(width - 1);
+            let y_start = y.saturating_sub(1);
+            let y_end = (y + 1).min(height - 1);
+
+            for ny in y_start..=y_end {
+                for nx in x_start..=x_end {
+                    let neighbour = ny * width + nx;
+                    if mask[neighbour] && !visited[neighbour] {
+                        visited[neighbour] = true;
+                        stack.push(neighbour);
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn grayscale_rgb(image: &DynamicImage) -> DynamicImage {
