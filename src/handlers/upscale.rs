@@ -97,6 +97,12 @@ async fn upscale_response(
     }
     let image_format = ImageFormat::from_mime_type(content_type).unwrap();
 
+    let source_name = headers
+        .get("content-disposition")
+        .and_then(|value| value.to_str().ok())
+        .and_then(filename_from_content_disposition)
+        .unwrap_or_else(|| "unknown-source".to_string());
+
     let encoding = headers.get("content-encoding");
     let response_bytes = to_bytes(response).await.unwrap();
 
@@ -110,7 +116,7 @@ async fn upscale_response(
     };
 
     let (upscaled, format) =
-        call!(upscaler, UpscaleSupervisorMessage::Upscale, to_upscale, image_format).unwrap();
+        call!(upscaler, UpscaleSupervisorMessage::Upscale, to_upscale, image_format, source_name,).unwrap();
 
     let body_to_compress = upscaled.clone();
     let compressed = encoding
@@ -123,6 +129,22 @@ async fn upscale_response(
     };
 
     to_response(status, response_body, &headers, format)
+}
+
+fn filename_from_content_disposition(value: &str) -> Option<String> {
+    value
+        .split(';')
+        .map(str::trim)
+        .find_map(|param| {
+            if let Some(filename) = param.strip_prefix("filename*=") {
+                Some(filename.trim_matches('"').strip_prefix("UTF-8''").unwrap_or(filename).to_string())
+            } else if let Some(filename) = param.strip_prefix("filename=") {
+                Some(filename.trim_matches('"').to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|filename| !filename.is_empty())
 }
 
 fn to_response(
