@@ -57,7 +57,20 @@ pub trait Upscaler: Send {
             }
         };
 
+        // Real-CUGAN is a colour model. For pages that are effectively grayscale,
+        // its reconstruction can introduce a small chroma bias (for example a
+        // warm/cool tint in areas that should remain neutral). Detect grayscale
+        // input and normalize the model output back to neutral RGB. This is
+        // deliberately based on the decoded pixels, so it applies equally to
+        // AVIF, PNG, WebP, JPEG, etc. and is not an AVIF-specific conversion.
+        let preserve_grayscale = is_effectively_grayscale(&image);
         let upscaled = self.upscale_image(image);
+        let upscaled = if preserve_grayscale {
+            info!("input is effectively grayscale; normalizing upscaled output to grayscale");
+            grayscale_rgb(&upscaled)
+        } else {
+            upscaled
+        };
 
         let mut buf = Cursor::new(Vec::new());
 
@@ -91,6 +104,43 @@ pub trait Upscaler: Send {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
 
     fn get_config(&self) -> UpscalerConfig;
+}
+
+fn is_effectively_grayscale(image: &DynamicImage) -> bool {
+    let rgb = image.to_rgb8();
+    let mut non_gray = 0usize;
+    let mut total = 0usize;
+
+    for pixel in rgb.pixels() {
+        let r = pixel[0] as i16;
+        let g = pixel[1] as i16;
+        let b = pixel[2] as i16;
+        let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs());
+
+        total += 1;
+        if spread > 3 {
+            non_gray += 1;
+            if non_gray > total / 1000 {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn grayscale_rgb(image: &DynamicImage) -> DynamicImage {
+    let gray = image.to_luma8();
+    let width = gray.width();
+    let height = gray.height();
+    let mut rgb = image::RgbImage::new(width, height);
+
+    for (x, y, pixel) in gray.enumerate_pixels() {
+        let value = pixel[0];
+        rgb.put_pixel(x, y, image::Rgb([value, value, value]));
+    }
+
+    DynamicImage::ImageRgb8(rgb)
 }
 
 fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
