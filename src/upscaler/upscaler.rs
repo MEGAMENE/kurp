@@ -19,6 +19,24 @@ pub struct UpscalerConfig {
     return_format: Format,
 }
 
+#[derive(Copy, Clone)]
+struct ChromaStats {
+    average_spread: f64,
+    max_spread: u8,
+    pixels_over_tolerance: usize,
+    total_pixels: usize,
+}
+
+impl ChromaStats {
+    fn percentage_over_tolerance(self) -> f64 {
+        if self.total_pixels == 0 {
+            0.0
+        } else {
+            self.pixels_over_tolerance as f64 * 100.0 / self.total_pixels as f64
+        }
+    }
+}
+
 pub trait Upscaler: Send {
     fn upscale(&self, input: Bytes, image_format: ImageFormat) -> (Bytes, ImageFormat) {
         let config = self.get_config();
@@ -63,12 +81,38 @@ pub trait Upscaler: Send {
         // input and normalize the model output back to neutral RGB. This is
         // deliberately based on the decoded pixels, so it applies equally to
         // AVIF, PNG, WebP, JPEG, etc. and is not an AVIF-specific conversion.
-        let preserve_grayscale = is_effectively_grayscale(&image);
+        let input_stats = chroma_stats(&image);
+        let preserve_grayscale = is_effectively_grayscale(input_stats);
+        info!(
+            "grayscale diagnostic: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}% -> {}",
+            input_stats.average_spread,
+            input_stats.max_spread,
+            input_stats.percentage_over_tolerance(),
+            if preserve_grayscale { "GRAYSCALE" } else { "COLOR" }
+        );
+
         let upscaled = self.upscale_image(image);
+        let output_stats = chroma_stats(&upscaled);
+        info!(
+            "grayscale diagnostic: upscaled avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
+            output_stats.average_spread,
+            output_stats.max_spread,
+            output_stats.percentage_over_tolerance()
+        );
+
         let upscaled = if preserve_grayscale {
-            info!("input is effectively grayscale; normalizing upscaled output to grayscale");
-            grayscale_rgb(&upscaled)
+            info!("grayscale diagnostic: applying grayscale normalization");
+            let normalized = grayscale_rgb(&upscaled);
+            let normalized_stats = chroma_stats(&normalized);
+            info!(
+                "grayscale diagnostic: normalized avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
+                normalized_stats.average_spread,
+                normalized_stats.max_spread,
+                normalized_stats.percentage_over_tolerance()
+            );
+            normalized
         } else {
+            info!("grayscale diagnostic: no grayscale normalization applied");
             upscaled
         };
 
@@ -106,27 +150,37 @@ pub trait Upscaler: Send {
     fn get_config(&self) -> UpscalerConfig;
 }
 
-fn is_effectively_grayscale(image: &DynamicImage) -> bool {
+fn is_effectively_grayscale(stats: ChromaStats) -> bool {
+    // At most 0.1% of pixels may have a channel spread greater than 3.
+    stats.pixels_over_tolerance <= stats.total_pixels / 1000
+}
+
+fn chroma_stats(image: &DynamicImage) -> ChromaStats {
     let rgb = image.to_rgb8();
-    let mut non_gray = 0usize;
-    let mut total = 0usize;
+    let mut total_spread = 0u64;
+    let mut max_spread = 0u8;
+    let mut pixels_over_tolerance = 0usize;
+    let total_pixels = rgb.width() as usize * rgb.height() as usize;
 
     for pixel in rgb.pixels() {
         let r = pixel[0] as i16;
         let g = pixel[1] as i16;
         let b = pixel[2] as i16;
-        let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs());
+        let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs()) as u8;
 
-        total += 1;
+        total_spread += spread as u64;
+        max_spread = max_spread.max(spread);
         if spread > 3 {
-            non_gray += 1;
-            if non_gray > total / 1000 {
-                return false;
-            }
+            pixels_over_tolerance += 1;
         }
     }
 
-    true
+    ChromaStats {
+        average_spread: if total_pixels == 0 { 0.0 } else { total_spread as f64 / total_pixels as f64 },
+        max_spread,
+        pixels_over_tolerance,
+        total_pixels,
+    }
 }
 
 fn grayscale_rgb(image: &DynamicImage) -> DynamicImage {
