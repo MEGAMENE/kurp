@@ -3,13 +3,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use image::ImageFormat;
 use log::{error, info};
-use realcugan_ncnn_vulkan_rs::RealCugan;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
-use waifu2x_ncnn_vulkan_rs::Waifu2x;
 
 use EnabledUpscaler::{Realcugan, Waifu2x};
 
 use crate::config::app_config::{AppConfig, EnabledUpscaler};
+use crate::upscaler::upscale_actor::UpscaleSupervisorMessage::*;
 use crate::upscaler::upscaler::{RealCuganUpscaler, Upscaler, Waifu2xUpscaler};
 
 pub enum UpscaleSupervisorMessage {
