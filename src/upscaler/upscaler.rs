@@ -19,6 +19,13 @@ pub struct UpscalerConfig {
     return_format: Format,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SourceClass {
+    Grayscale,
+    GrayscaleWithColor,
+    Color,
+}
+
 #[derive(Copy, Clone)]
 struct ChromaStats {
     average_spread: f64,
@@ -72,22 +79,19 @@ pub trait Upscaler: Send {
             }
         };
 
-        // Real-CUGAN is a colour model. For pages that are effectively grayscale,
-        // its reconstruction can introduce a small chroma bias. Normalize those
-        // outputs back to neutral RGB, but never do that when the source contains
-        // a meaningful localized colour region (for example, a coloured watermark).
-        // A global colour percentage alone is not sufficient: a watermark can be
-        // only a fraction of a percent of the page while still being important.
+        // Classify the ORIGINAL pixels before the neural upscaler runs. The
+        // upscaler can introduce chroma into an otherwise grayscale page, so
+        // post-processing must never re-classify the upscaled result.
         let input_stats = chroma_stats(&image);
-        let preserve_grayscale = is_effectively_grayscale(input_stats);
+        let source_class = classify_source(input_stats);
         info!(
-            "grayscale diagnostic [{}]: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%, localized color {} -> {}",
+            "grayscale diagnostic [{}]: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%, localized color {} -> {:?}",
             source_name,
             input_stats.average_spread,
             input_stats.max_spread,
             input_stats.percentage_over_tolerance(),
             input_stats.has_localized_color,
-            if preserve_grayscale { "GRAYSCALE" } else { "COLOR" }
+            source_class
         );
 
         let upscaled = self.upscale_image(image);
@@ -100,22 +104,29 @@ pub trait Upscaler: Send {
             output_stats.percentage_over_tolerance()
         );
 
-        let upscaled = if preserve_grayscale {
-            info!("grayscale diagnostic [{}]: applying grayscale normalization", source_name);
-            let normalized = grayscale_rgb(&upscaled);
-            let normalized_stats = chroma_stats(&normalized);
-            info!(
-                "grayscale diagnostic [{}]: normalized avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
-                source_name,
-                normalized_stats.average_spread,
-                normalized_stats.max_spread,
-                normalized_stats.percentage_over_tolerance()
-            );
-            normalized
-        } else {
-            info!("grayscale diagnostic [{}]: no grayscale normalization applied", source_name);
-            upscaled
+        let upscaled = match source_class {
+            SourceClass::Grayscale => {
+                info!("grayscale diagnostic [{}]: pure grayscale source; enforcing neutral RGB and correcting levels", source_name);
+                normalize_grayscale(&upscaled)
+            }
+            SourceClass::GrayscaleWithColor => {
+                info!("grayscale diagnostic [{}]: grayscale source with localized color; correcting luminance levels while preserving color", source_name);
+                normalize_luminance_preserve_color(&upscaled)
+            }
+            SourceClass::Color => {
+                info!("grayscale diagnostic [{}]: color source; no grayscale/levels post-processing", source_name);
+                upscaled
+            }
         };
+
+        let final_stats = chroma_stats(&upscaled);
+        info!(
+            "grayscale diagnostic [{}]: final avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
+            source_name,
+            final_stats.average_spread,
+            final_stats.max_spread,
+            final_stats.percentage_over_tolerance()
+        );
 
         let mut buf = Cursor::new(Vec::new());
         let format_to = match config.return_format {
@@ -139,18 +150,28 @@ pub trait Upscaler: Send {
     fn get_config(&self) -> UpscalerConfig;
 }
 
-fn is_effectively_grayscale(stats: ChromaStats) -> bool {
-    const MAX_AVERAGE_SPREAD: f64 = 2.0;
-    const MAX_PIXELS_OVER_TOLERANCE_PERCENT: f64 = 10.0;
+fn classify_source(stats: ChromaStats) -> SourceClass {
+    const MAX_GRAYSCALE_AVERAGE_SPREAD: f64 = 2.0;
+    const MAX_GRAYSCALE_PIXELS_OVER_TOLERANCE_PERCENT: f64 = 10.0;
+    const MAX_BW_COLOR_AVERAGE_SPREAD: f64 = 12.0;
+    const MAX_BW_COLOR_PIXELS_OVER_TOLERANCE_PERCENT: f64 = 35.0;
 
-    stats.average_spread <= MAX_AVERAGE_SPREAD
-        && stats.percentage_over_tolerance() <= MAX_PIXELS_OVER_TOLERANCE_PERCENT
-        && !stats.has_localized_color
+    let is_low_chroma = stats.average_spread <= MAX_GRAYSCALE_AVERAGE_SPREAD
+        && stats.percentage_over_tolerance() <= MAX_GRAYSCALE_PIXELS_OVER_TOLERANCE_PERCENT;
+
+    if is_low_chroma {
+        if stats.has_localized_color { SourceClass::GrayscaleWithColor } else { SourceClass::Grayscale }
+    } else if stats.average_spread <= MAX_BW_COLOR_AVERAGE_SPREAD
+        && stats.percentage_over_tolerance() <= MAX_BW_COLOR_PIXELS_OVER_TOLERANCE_PERCENT
+        && stats.has_localized_color
+    {
+        SourceClass::GrayscaleWithColor
+    } else {
+        SourceClass::Color
+    }
 }
 
 fn chroma_stats(image: &DynamicImage) -> ChromaStats {
-    // Work on RGB8 once so the same pixel data is used for both the global
-    // statistics and the localized-colour test.
     let rgb = image.to_rgb8();
     let width = rgb.width() as usize;
     let height = rgb.height() as usize;
@@ -168,8 +189,6 @@ fn chroma_stats(image: &DynamicImage) -> ChromaStats {
         total_spread += spread as u64;
         max_spread = max_spread.max(spread);
         if spread > 3 { pixels_over_tolerance += 1; }
-        // A higher threshold than the global tolerance filters codec noise while
-        // retaining actual saturated watermark/logo pixels.
         colour_mask[index] = spread >= 12;
     }
 
@@ -185,9 +204,6 @@ fn chroma_stats(image: &DynamicImage) -> ChromaStats {
 }
 
 fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -> bool {
-    // A component of only a handful of pixels is usually compression noise or an
-    // isolated coloured speck. A small connected region catches text, logos and
-    // watermarks without relying on the global colour percentage.
     const MIN_COMPONENT_PIXELS: usize = 8;
     if width == 0 || height == 0 { return false; }
 
@@ -196,7 +212,6 @@ fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -
 
     for start in 0..mask.len() {
         if !mask[start] || visited[start] { continue; }
-
         visited[start] = true;
         stack.push(start);
         let mut component_size = 0usize;
@@ -227,17 +242,102 @@ fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -
     false
 }
 
-fn grayscale_rgb(image: &DynamicImage) -> DynamicImage {
-    let gray = image.to_luma8();
-    let width = gray.width();
-    let height = gray.height();
-    let mut rgb = image::RgbImage::new(width, height);
+fn normalize_grayscale(image: &DynamicImage) -> DynamicImage {
+    let gray = normalize_luma_channel(&image.to_luma8());
+    let mut rgb = image::RgbImage::new(gray.width(), gray.height());
     for (x, y, pixel) in gray.enumerate_pixels() {
         let value = pixel[0];
         rgb.put_pixel(x, y, image::Rgb([value, value, value]));
     }
     DynamicImage::ImageRgb8(rgb)
 }
+
+fn normalize_luminance_preserve_color(image: &DynamicImage) -> DynamicImage {
+    let rgb = image.to_rgb8();
+    let mut luminance = image::GrayImage::new(rgb.width(), rgb.height());
+
+    for (x, y, pixel) in rgb.enumerate_pixels() {
+        luminance.put_pixel(x, y, image::Luma([rgb_luminance(pixel[0], pixel[1], pixel[2])]));
+    }
+
+    let normalized_luminance = normalize_luma_channel(&luminance);
+    let mut output = image::RgbImage::new(rgb.width(), rgb.height());
+
+    for (x, y, pixel) in rgb.enumerate_pixels() {
+        let old_y = luminance.get_pixel(x, y)[0] as f32;
+        let new_y = normalized_luminance.get_pixel(x, y)[0] as f32;
+        let (r, g, b) = ycbcr_rescale(pixel[0], pixel[1], pixel[2], old_y, new_y);
+        output.put_pixel(x, y, image::Rgb([r, g, b]));
+    }
+
+    DynamicImage::ImageRgb8(output)
+}
+
+fn normalize_luma_channel(image: &image::GrayImage) -> image::GrayImage {
+    let (black_point, white_point) = percentile_points(image);
+    if black_point == 0 && white_point == 255 { return image.clone(); }
+    if white_point <= black_point { return image.clone(); }
+
+    let range = (white_point - black_point) as u16;
+    let mut output = image::GrayImage::new(image.width(), image.height());
+
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let value = pixel[0] as i16;
+        let mapped = if value <= black_point as i16 {
+            0
+        } else if value >= white_point as i16 {
+            255
+        } else {
+            (((value - black_point as i16) as u16 * 255 + range / 2) / range) as u8
+        };
+        output.put_pixel(x, y, image::Luma([mapped]));
+    }
+    output
+}
+
+fn percentile_points(image: &image::GrayImage) -> (u8, u8) {
+    const LOW_PERCENTILE: f64 = 0.005;
+    const HIGH_PERCENTILE: f64 = 0.995;
+
+    let mut histogram = [0u64; 256];
+    for pixel in image.pixels() { histogram[pixel[0] as usize] += 1; }
+
+    let total = image.width() as u64 * image.height() as u64;
+    if total == 0 { return (0, 255); }
+
+    let low_target = ((total as f64 * LOW_PERCENTILE).ceil() as u64).max(1);
+    let high_target = ((total as f64 * HIGH_PERCENTILE).ceil() as u64).min(total);
+
+    let mut cumulative = 0u64;
+    let mut low = 0u8;
+    for (value, count) in histogram.iter().enumerate() {
+        cumulative += *count;
+        if cumulative >= low_target { low = value as u8; break; }
+    }
+
+    cumulative = 0;
+    let mut high = 255u8;
+    for (value, count) in histogram.iter().enumerate() {
+        cumulative += *count;
+        if cumulative >= high_target { high = value as u8; break; }
+    }
+    (low, high)
+}
+
+fn rgb_luminance(r: u8, g: u8, b: u8) -> u8 {
+    ((299u32 * r as u32 + 587u32 * g as u32 + 114u32 * b as u32 + 500) / 1000) as u8
+}
+
+fn ycbcr_rescale(r: u8, g: u8, b: u8, old_y: f32, new_y: f32) -> (u8, u8, u8) {
+    let cb = b as f32 - old_y;
+    let cr = r as f32 - old_y;
+    let out_r = new_y + 1.402f32 * cr;
+    let out_g = new_y - 0.344136f32 * cb - 0.714136f32 * cr;
+    let out_b = new_y + 1.772f32 * cb;
+    (clamp_u8(out_r), clamp_u8(out_g), clamp_u8(out_b))
+}
+
+fn clamp_u8(value: f32) -> u8 { value.round().clamp(0.0, 255.0) as u8 }
 
 fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     let decoded = zenavif::decode(input.as_ref()).map_err(|error| format!("{error:?}"))?;
@@ -312,4 +412,42 @@ impl Upscaler for Waifu2xUpscaler {
 impl Upscaler for RealCuganUpscaler {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage { self.realcugan.proc_image(image) }
     fn get_config(&self) -> UpscalerConfig { self.config }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_range_grayscale_is_unchanged() {
+        let mut image = image::GrayImage::new(2, 1);
+        image.put_pixel(0, 0, image::Luma([0]));
+        image.put_pixel(1, 0, image::Luma([255]));
+        assert_eq!(percentile_points(&image), (0, 255));
+        assert_eq!(normalize_luma_channel(&image), image);
+    }
+
+    #[test]
+    fn narrow_grayscale_range_is_expanded() {
+        let mut image = image::GrayImage::new(100, 1);
+        for x in 0..100 { image.put_pixel(x, 0, image::Luma([50 + (x as u8 / 2)])); }
+        let normalized = normalize_luma_channel(&image);
+        assert_eq!(normalized.get_pixel(0, 0)[0], 0);
+        assert_eq!(normalized.get_pixel(99, 0)[0], 255);
+    }
+
+    #[test]
+    fn localized_color_is_classified_as_grayscale_with_color() {
+        let mut image = image::RgbImage::from_pixel(100, 100, image::Rgb([128, 128, 128]));
+        for y in 40..60 { for x in 40..60 { image.put_pixel(x, y, image::Rgb([255, 0, 0])); } }
+        let stats = chroma_stats(&DynamicImage::ImageRgb8(image));
+        assert_eq!(classify_source(stats), SourceClass::GrayscaleWithColor);
+    }
+
+    #[test]
+    fn full_color_image_is_not_treated_as_grayscale() {
+        let image = image::RgbImage::from_pixel(10, 10, image::Rgb([255, 0, 0]));
+        let stats = chroma_stats(&DynamicImage::ImageRgb8(image));
+        assert_eq!(classify_source(stats), SourceClass::Color);
+    }
 }
