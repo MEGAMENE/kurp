@@ -34,13 +34,13 @@ impl ChromaStats {
 }
 
 pub trait Upscaler: Send {
-    fn upscale(&self, input: Bytes, image_format: ImageFormat) -> (Bytes, ImageFormat) {
+    fn upscale(&self, input: Bytes, image_format: ImageFormat, source_name: &str) -> (Bytes, ImageFormat) {
         let config = self.get_config();
         if config.threshold_enabled {
             let input_kb = (input.len() / 1024) as u32;
             let threshold = if image_format == ImageFormat::Png { config.threshold_png } else { config.threshold };
             if input_kb > threshold {
-                info!("image size {} is bigger than threshold {}. skipping upscale", input_kb, threshold);
+                info!("image {}: size {} is bigger than threshold {}. skipping upscale", source_name, input_kb, threshold);
                 return (input, image_format);
             }
         }
@@ -49,7 +49,7 @@ pub trait Upscaler: Send {
             ImageFormat::Avif => match decode_avif(&input) {
                 Ok(image) => image,
                 Err(error) => {
-                    warn!("can't decode AVIF image: {error}");
+                    warn!("image {}: can't decode AVIF image: {error}", source_name);
                     return (input, image_format);
                 }
             },
@@ -64,7 +64,7 @@ pub trait Upscaler: Send {
                 }) {
                     Ok(image) => image,
                     Err(error) => {
-                        warn!("can't decode image: {error}");
+                        warn!("image {}: can't decode image: {error}", source_name);
                         return (input, image_format);
                     }
                 }
@@ -79,7 +79,8 @@ pub trait Upscaler: Send {
         let input_stats = chroma_stats(&image);
         let preserve_grayscale = is_effectively_grayscale(input_stats);
         info!(
-            "grayscale diagnostic: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}% -> {}",
+            "grayscale diagnostic [{}]: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}% -> {}",
+            source_name,
             input_stats.average_spread,
             input_stats.max_spread,
             input_stats.percentage_over_tolerance(),
@@ -89,25 +90,27 @@ pub trait Upscaler: Send {
         let upscaled = self.upscale_image(image);
         let output_stats = chroma_stats(&upscaled);
         info!(
-            "grayscale diagnostic: upscaled avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
+            "grayscale diagnostic [{}]: upscaled avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
+            source_name,
             output_stats.average_spread,
             output_stats.max_spread,
             output_stats.percentage_over_tolerance()
         );
 
         let upscaled = if preserve_grayscale {
-            info!("grayscale diagnostic: applying grayscale normalization");
+            info!("grayscale diagnostic [{}]: applying grayscale normalization", source_name);
             let normalized = grayscale_rgb(&upscaled);
             let normalized_stats = chroma_stats(&normalized);
             info!(
-                "grayscale diagnostic: normalized avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
+                "grayscale diagnostic [{}]: normalized avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
+                source_name,
                 normalized_stats.average_spread,
                 normalized_stats.max_spread,
                 normalized_stats.percentage_over_tolerance()
             );
             normalized
         } else {
-            info!("grayscale diagnostic: no grayscale normalization applied");
+            info!("grayscale diagnostic [{}]: no grayscale normalization applied", source_name);
             upscaled
         };
 
@@ -120,7 +123,7 @@ pub trait Upscaler: Send {
         };
 
         if let Err(error) = upscaled.write_to(&mut buf, format_to) {
-            warn!("can't write upscaled image: {error}");
+            warn!("image {}: can't write upscaled image: {error}", source_name);
             return (input, image_format);
         }
 
@@ -134,12 +137,6 @@ pub trait Upscaler: Send {
 }
 
 fn is_effectively_grayscale(stats: ChromaStats) -> bool {
-    // Manga scans can contain a small amount of chroma from compression,
-    // scanning, paper, or anti-aliasing even when they are visually grayscale.
-    // Use average chroma as the primary signal and allow a modest tail of
-    // colored/noisy pixels. The average threshold prevents genuinely colorful
-    // pages from being normalized, while the tail threshold rejects pages with
-    // substantial real color content.
     const MAX_AVERAGE_SPREAD: f64 = 2.0;
     const MAX_PIXELS_OVER_TOLERANCE_PERCENT: f64 = 10.0;
 
