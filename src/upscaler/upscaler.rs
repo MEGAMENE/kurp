@@ -29,11 +29,7 @@ struct ChromaStats {
 
 impl ChromaStats {
     fn percentage_over_tolerance(self) -> f64 {
-        if self.total_pixels == 0 {
-            0.0
-        } else {
-            self.pixels_over_tolerance as f64 * 100.0 / self.total_pixels as f64
-        }
+        if self.total_pixels == 0 { 0.0 } else { self.pixels_over_tolerance as f64 * 100.0 / self.total_pixels as f64 }
     }
 }
 
@@ -76,8 +72,7 @@ pub trait Upscaler: Send {
         };
 
         // Real-CUGAN is a colour model. For pages that are effectively grayscale,
-        // its reconstruction can introduce a small chroma bias (for example a
-        // warm/cool tint in areas that should remain neutral). Detect grayscale
+        // its reconstruction can introduce a small chroma bias. Detect grayscale
         // input and normalize the model output back to neutral RGB. This is
         // deliberately based on the decoded pixels, so it applies equally to
         // AVIF, PNG, WebP, JPEG, etc. and is not an AVIF-specific conversion.
@@ -117,7 +112,6 @@ pub trait Upscaler: Send {
         };
 
         let mut buf = Cursor::new(Vec::new());
-
         let format_to = match config.return_format {
             Format::Png => ImageFormat::Png,
             Format::Jpeg => ImageFormat::Jpeg,
@@ -131,28 +125,26 @@ pub trait Upscaler: Send {
         }
 
         let output = Bytes::from(buf.into_inner());
-        // AVIF pixels are decoded to their native RGB representation using the
-        // AVIF CICP information. Do not copy an ICC profile onto the output:
-        // AVIF color metadata is CICP, not ICC, and the resulting pixels are
-        // converted to ordinary RGB/RGBA before the neural network sees them.
-        // Other formats retain the existing ICC-preservation behavior.
-        let output = if image_format == ImageFormat::Avif {
-            output
-        } else {
-            preserve_icc_profile(&input, output)
-        };
-
+        let output = if image_format == ImageFormat::Avif { output } else { preserve_icc_profile(&input, output) };
         (output, format_to)
     }
 
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
-
     fn get_config(&self) -> UpscalerConfig;
 }
 
 fn is_effectively_grayscale(stats: ChromaStats) -> bool {
-    // At most 0.1% of pixels may have a channel spread greater than 3.
-    stats.pixels_over_tolerance <= stats.total_pixels / 1000
+    // Manga scans can contain a small amount of chroma from compression,
+    // scanning, paper, or anti-aliasing even when they are visually grayscale.
+    // Use average chroma as the primary signal and allow a modest tail of
+    // colored/noisy pixels. The average threshold prevents genuinely colorful
+    // pages from being normalized, while the tail threshold rejects pages with
+    // substantial real color content.
+    const MAX_AVERAGE_SPREAD: f64 = 2.0;
+    const MAX_PIXELS_OVER_TOLERANCE_PERCENT: f64 = 10.0;
+
+    stats.average_spread <= MAX_AVERAGE_SPREAD
+        && stats.percentage_over_tolerance() <= MAX_PIXELS_OVER_TOLERANCE_PERCENT
 }
 
 fn chroma_stats(image: &DynamicImage) -> ChromaStats {
@@ -167,12 +159,9 @@ fn chroma_stats(image: &DynamicImage) -> ChromaStats {
         let g = pixel[1] as i16;
         let b = pixel[2] as i16;
         let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs()) as u8;
-
         total_spread += spread as u64;
         max_spread = max_spread.max(spread);
-        if spread > 3 {
-            pixels_over_tolerance += 1;
-        }
+        if spread > 3 { pixels_over_tolerance += 1; }
     }
 
     ChromaStats {
@@ -188,34 +177,27 @@ fn grayscale_rgb(image: &DynamicImage) -> DynamicImage {
     let width = gray.width();
     let height = gray.height();
     let mut rgb = image::RgbImage::new(width, height);
-
     for (x, y, pixel) in gray.enumerate_pixels() {
         let value = pixel[0];
         rgb.put_pixel(x, y, image::Rgb([value, value, value]));
     }
-
     DynamicImage::ImageRgb8(rgb)
 }
 
 fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
-    let decoded = zenavif::decode(input.as_ref())
-        .map_err(|error| format!("{error:?}"))?;
-
+    let decoded = zenavif::decode(input.as_ref()).map_err(|error| format!("{error:?}"))?;
     let width = decoded.width();
     let height = decoded.height();
     let has_alpha = decoded.descriptor().format.channels() == 4;
-
     if has_alpha {
         let rgba = decoded.to_rgba8();
         let pixels = rgba.copy_to_contiguous_bytes();
-
         image::RgbaImage::from_raw(width, height, pixels)
             .map(DynamicImage::ImageRgba8)
             .ok_or_else(|| "decoded AVIF has an invalid RGBA pixel buffer".to_string())
     } else {
         let rgb = decoded.to_rgb8();
         let pixels = rgb.copy_to_contiguous_bytes();
-
         image::RgbImage::from_raw(width, height, pixels)
             .map(DynamicImage::ImageRgb8)
             .ok_or_else(|| "decoded AVIF has an invalid RGB pixel buffer".to_string())
@@ -227,12 +209,10 @@ fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
         Ok(Some(image)) => image,
         Ok(None) | Err(_) => return output,
     };
-
     let profile = match input_image.icc_profile() {
         Some(profile) => profile.to_vec(),
         None => return output,
     };
-
     let mut output_image = match DynImage::from_bytes(output.to_vec().into()) {
         Ok(Some(image)) => image,
         Ok(None) => return output,
@@ -241,93 +221,40 @@ fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
             return output;
         }
     };
-
     output_image.set_icc_profile(Some(profile.into()));
-
     let mut writer = Cursor::new(Vec::new());
     if let Err(error) = output_image.encoder().write_to(&mut writer) {
         warn!("can't write upscaled image after restoring ICC profile: {error}");
         return output;
     }
-
     Bytes::from(writer.into_inner())
 }
 
-pub struct Waifu2xUpscaler {
-    config: UpscalerConfig,
-    waifu2x: Waifu2x,
-}
-
-pub struct RealCuganUpscaler {
-    config: UpscalerConfig,
-    realcugan: RealCugan,
-}
+pub struct Waifu2xUpscaler { config: UpscalerConfig, waifu2x: Waifu2x }
+pub struct RealCuganUpscaler { config: UpscalerConfig, realcugan: RealCugan }
 
 impl Waifu2xUpscaler {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        let waifu2x = Waifu2x::new(
-            config.waifu2x.gpuid,
-            config.waifu2x.noise,
-            config.waifu2x.scale,
-            config.waifu2x.model,
-            config.waifu2x.tile_size,
-            config.waifu2x.tta_mode,
-            config.waifu2x.num_threads,
-            config.waifu2x.models_path.clone(),
-        );
-
-        let upscaler_config = UpscalerConfig {
-            threshold_enabled: config.size_threshold_enabled,
-            threshold: config.size_threshold,
-            threshold_png: config.size_threshold_png,
-            return_format: config.return_format,
-        };
-
+        let waifu2x = Waifu2x::new(config.waifu2x.gpuid, config.waifu2x.noise, config.waifu2x.scale, config.waifu2x.model, config.waifu2x.tile_size, config.waifu2x.tta_mode, config.waifu2x.num_threads, config.waifu2x.models_path.clone());
+        let upscaler_config = UpscalerConfig { threshold_enabled: config.size_threshold_enabled, threshold: config.size_threshold, threshold_png: config.size_threshold_png, return_format: config.return_format };
         Self { config: upscaler_config, waifu2x }
     }
 }
 
 impl RealCuganUpscaler {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        let realcugan = RealCugan::new(
-            config.realcugan.gpuid,
-            config.realcugan.noise,
-            config.realcugan.scale,
-            config.realcugan.model,
-            config.realcugan.tile_size,
-            config.realcugan.sync_gap,
-            config.realcugan.tta_mode,
-            config.realcugan.num_threads,
-            config.realcugan.models_path.clone(),
-        );
-
-        let upscaler_config = UpscalerConfig {
-            threshold_enabled: config.size_threshold_enabled,
-            threshold: config.size_threshold,
-            threshold_png: config.size_threshold_png,
-            return_format: config.return_format,
-        };
-
+        let realcugan = RealCugan::new(config.realcugan.gpuid, config.realcugan.noise, config.realcugan.scale, config.realcugan.model, config.realcugan.tile_size, config.realcugan.sync_gap, config.realcugan.tta_mode, config.realcugan.num_threads, config.realcugan.models_path.clone());
+        let upscaler_config = UpscalerConfig { threshold_enabled: config.size_threshold_enabled, threshold: config.size_threshold, threshold_png: config.size_threshold_png, return_format: config.return_format };
         Self { config: upscaler_config, realcugan }
     }
 }
 
 impl Upscaler for Waifu2xUpscaler {
-    fn upscale_image(&self, image: DynamicImage) -> DynamicImage {
-        self.waifu2x.proc_image(image)
-    }
-
-    fn get_config(&self) -> UpscalerConfig {
-        self.config
-    }
+    fn upscale_image(&self, image: DynamicImage) -> DynamicImage { self.waifu2x.proc_image(image) }
+    fn get_config(&self) -> UpscalerConfig { self.config }
 }
 
 impl Upscaler for RealCuganUpscaler {
-    fn upscale_image(&self, image: DynamicImage) -> DynamicImage {
-        self.realcugan.proc_image(image)
-    }
-
-    fn get_config(&self) -> UpscalerConfig {
-        self.config
-    }
+    fn upscale_image(&self, image: DynamicImage) -> DynamicImage { self.realcugan.proc_image(image) }
+    fn get_config(&self) -> UpscalerConfig { self.config }
 }
