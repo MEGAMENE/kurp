@@ -6,6 +6,7 @@ on:
       - fix/preserve-icc-profile
       - debug/avif-decode-color
       - debug/avif-png-roundtrip
+      - debug/grayscale-color-shift
   workflow_dispatch:
 
 permissions:
