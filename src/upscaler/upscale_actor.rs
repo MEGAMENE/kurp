@@ -3,7 +3,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use image::ImageFormat;
 use log::{error, info};
+use realcugan_ncnn_vulkan_rs::RealCugan;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
+use waifu2x_ncnn_vulkan_rs::Waifu2x;
 
 use EnabledUpscaler::{Realcugan, Waifu2x};
 
@@ -11,13 +13,13 @@ use crate::config::app_config::{AppConfig, EnabledUpscaler};
 use crate::upscaler::upscaler::{RealCuganUpscaler, Upscaler, Waifu2xUpscaler};
 
 pub enum UpscaleSupervisorMessage {
-    Upscale(Bytes, ImageFormat, RpcReplyPort<(Bytes, ImageFormat)>),
+    Upscale(Bytes, ImageFormat, String, RpcReplyPort<(Bytes, ImageFormat)>),
     Init(Arc<AppConfig>),
     Destroy,
 }
 
 pub enum UpscaleMessage {
-    Upscale(Bytes, ImageFormat, RpcReplyPort<(Bytes, ImageFormat)>),
+    Upscale(Bytes, ImageFormat, String, RpcReplyPort<(Bytes, ImageFormat)>),
 }
 
 pub struct UpscaleSupervisorActor;
@@ -39,12 +41,12 @@ impl Actor for UpscaleSupervisorActor {
 
     async fn handle(&self, myself: ActorRef<Self>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
         match message {
-            UpscaleSupervisorMessage::Upscale(image, format, reply_to) => {
+            UpscaleSupervisorMessage::Upscale(image, format, source_name, reply_to) => {
                 match &state.upscale_actor {
                     None => { return Err(From::from("Upscale Actor is not Initialized")); }
                     Some(upscale_actor) => {
                         let _ = upscale_actor
-                            .send_message(UpscaleMessage::Upscale(image, format, reply_to));
+                            .send_message(UpscaleMessage::Upscale(image, format, source_name, reply_to));
                     }
                 }
             }
@@ -76,7 +78,7 @@ impl Actor for UpscaleSupervisorActor {
         Ok(())
     }
 
-    async fn handle_supervisor_evt(&self, myself: ActorRef<Self>, message: SupervisionEvent, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
+    async fn handle_supervisor_evt(&self, myself: ActorRef<Self>, message: SupervisionEvent, state: &mut SupervisorState) -> Result<(), ActorProcessingErr> {
         match message {
             SupervisionEvent::ActorPanicked(_, panic_msg) => {
                 error!("Upscale actor panicked with '{panic_msg}'");
@@ -120,8 +122,8 @@ impl Actor for UpscaleActor {
 
     async fn handle(&self, _myself: ActorRef<Self>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
         match message {
-            UpscaleMessage::Upscale(image, format, reply_to) => {
-                let _ = reply_to.send(state.upscale(image, format));
+            UpscaleMessage::Upscale(image, format, source_name, reply_to) => {
+                let _ = reply_to.send(state.upscale(image, format, &source_name));
             }
         }
 
