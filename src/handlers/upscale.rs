@@ -116,7 +116,7 @@ async fn upscale_response(
     };
 
     let (upscaled, format) =
-        call!(upscaler, UpscaleSupervisorMessage::Upscale, to_upscale, image_format, source_name,).unwrap();
+        call!(upscaler, UpscaleSupervisorMessage::Upscale, to_upscale, image_format, source_name).unwrap();
 
     let body_to_compress = upscaled.clone();
     let compressed = encoding
