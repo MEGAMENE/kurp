@@ -1,0 +1,97 @@
+name: Diagnose Page 5 grayscale cast
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Analyze Page 5 RGB / black point
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download Page 5 original
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 \
+            -o Page05Original.png \
+            https://raw.githubusercontent.com/MEGAMENE/AIChatMessages/main/Page05Original.png
+          file Page05Original.png
+
+      - name: Install Pillow
+        run: python3 -m pip install --quiet Pillow
+
+      - name: Analyze RGB distribution
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from PIL import Image
+          from collections import Counter
+          import math
+
+          path = 'Page05Original.png'
+          im = Image.open(path).convert('RGB')
+          pixels = list(im.getdata())
+          n = len(pixels)
+
+          print(f'Page 5 dimensions: {im.width} x {im.height}')
+          print(f'Total pixels: {n}')
+
+          def percentile(values, p):
+              values = sorted(values)
+              if not values:
+                  return 0
+              k = (len(values) - 1) * p
+              f = math.floor(k)
+              c = math.ceil(k)
+              if f == c:
+                  return values[int(k)]
+              return round(values[f] + (values[c] - values[f]) * (k - f), 3)
+
+          rs = [p[0] for p in pixels]
+          gs = [p[1] for p in pixels]
+          bs = [p[2] for p in pixels]
+          spreads = [max(p) - min(p) for p in pixels]
+          lumas = [round(0.299*r + 0.587*g + 0.114*b) for r,g,b in pixels]
+
+          print('\nChannel percentiles:')
+          for q in (0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 0.50, 0.90, 0.99, 0.995, 0.999):
+              print(f'  p{q*100:6.2f}%: R={percentile(rs,q):6.2f} G={percentile(gs,q):6.2f} B={percentile(bs,q):6.2f} L={percentile(lumas,q):6.2f}')
+
+          print('\nChroma spread percentiles:')
+          for q in (0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 0.50, 0.90, 0.99):
+              print(f'  p{q*100:6.2f}%: spread={percentile(spreads,q):6.2f}')
+
+          print('\nDark-pixel RGB samples by luminance:')
+          for threshold in (5, 10, 15, 20, 25, 30, 40, 50, 64):
+              selected = [p for p,l in zip(pixels,lumas) if l <= threshold]
+              if not selected:
+                  print(f'  L<= {threshold:2}: none')
+                  continue
+              ar = sum(p[0] for p in selected)/len(selected)
+              ag = sum(p[1] for p in selected)/len(selected)
+              ab = sum(p[2] for p in selected)/len(selected)
+              print(f'  L<= {threshold:2}: count={len(selected):8} ({len(selected)*100/n:7.3f}%) avg RGB=({ar:6.2f},{ag:6.2f},{ab:6.2f}) min RGB=({min(p[0] for p in selected)},{min(p[1] for p in selected)},{min(p[2] for p in selected)})')
+
+          print('\nWarm-black candidates (R>G>B, luminance <= 64):')
+          warm = [p for p,l in zip(pixels,lumas) if l <= 64 and p[0] > p[1] and p[1] > p[2] and p[0]-p[2] >= 4]
+          print(f'  count={len(warm)} ({len(warm)*100/n:.3f}%)')
+          if warm:
+              print(f'  average RGB=({sum(p[0] for p in warm)/len(warm):.2f},{sum(p[1] for p in warm)/len(warm):.2f},{sum(p[2] for p in warm)/len(warm):.2f})')
+
+          print('\nCommon dark RGB values:')
+          counts = Counter(p for p,l in zip(pixels,lumas) if l <= 64)
+          for rgb,count in counts.most_common(25):
+              print(f'  {rgb}: {count} ({count*100/n:.4f}%)')
+
+          print('\nCandidate transforms for the observed (28,16,8) sample:')
+          r,g,b = 28,16,8
+          print(f'  luminance: {round(0.299*r + 0.587*g + 0.114*b)}')
+          print(f'  min channel: {min(r,g,b)}')
+          print(f'  max channel: {max(r,g,b)}')
+          print(f'  average: {round((r+g+b)/3)}')
+          PY
