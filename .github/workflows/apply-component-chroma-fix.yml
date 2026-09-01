@@ -1,0 +1,52 @@
+name: Apply component chroma fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/improved-grayscale-color-pipeline
+
+      - name: Apply component chroma criterion
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/upscaler/upscaler.rs')
+          s = p.read_text()
+          old = '''        if component.len() < min_size {
+            for index in component.iter().copied() { mask[index] = false; }
+        }
+'''
+          new = '''        const STRONG_CHROMA_THRESHOLD: i16 = 40;
+        const MIN_STRONG_CHROMA_FRACTION: f64 = 0.10;
+
+        if component.len() < min_size {
+            for index in component.iter().copied() { mask[index] = false; }
+            continue;
+        }
+
+        let strong_chroma_pixels = component.iter().filter(|&&index| {
+            let x = index % width;
+            let y = index / width;
+            // The mask only stores whether spread >= 16, so recover the source
+            // pixel spread from the original image is not possible here.
+            // This workflow intentionally leaves the implementation unchanged
+            // until the source-image-aware component pass is applied.
+            let _ = (x, y);
+            false
+        }).count();
+        let _ = (strong_chroma_pixels, STRONG_CHROMA_THRESHOLD, MIN_STRONG_CHROMA_FRACTION);
+'''
+          if old not in s:
+              raise SystemExit('target block not found')
+          # Do not commit an incomplete approximation. This workflow is only a
+          # staging hook and intentionally fails until the source-aware patch is supplied.
+          raise SystemExit('staging hook created; no source-aware patch committed')
+          PY
