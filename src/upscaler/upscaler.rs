@@ -176,18 +176,31 @@ fn chroma_stats(image: &DynamicImage) -> ChromaStats {
 }
 
 fn build_color_protection_mask(image: &DynamicImage) -> (Vec<bool>, usize, usize) {
+    const MIN_COMPONENT_PIXELS: usize = 8;
+    const STRONG_CHROMA_THRESHOLD: i16 = 40;
+    const MIN_STRONG_FRACTION: f64 = 0.10;
+
     let rgb = image.to_rgb8();
     let width = rgb.width() as usize;
     let height = rgb.height() as usize;
     let mut mask = vec![false; width * height];
+    let mut strong_mask = vec![false; width * height];
     for (index, pixel) in rgb.pixels().enumerate() {
         let r = pixel[0] as i16;
         let g = pixel[1] as i16;
         let b = pixel[2] as i16;
         let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs());
         mask[index] = spread >= 16;
+        strong_mask[index] = spread >= STRONG_CHROMA_THRESHOLD;
     }
-    retain_significant_components(&mut mask, width, height, 8);
+    retain_significant_components(
+        &mut mask,
+        &strong_mask,
+        width,
+        height,
+        MIN_COMPONENT_PIXELS,
+        MIN_STRONG_FRACTION,
+    );
     (mask, width, height)
 }
 
@@ -224,8 +237,15 @@ fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -
     false
 }
 
-fn retain_significant_components(mask: &mut [bool], width: usize, height: usize, min_size: usize) {
-    if width == 0 || height == 0 { return; }
+fn retain_significant_components(
+    mask: &mut [bool],
+    strong_mask: &[bool],
+    width: usize,
+    height: usize,
+    min_size: usize,
+    min_strong_fraction: f64,
+) {
+    if width == 0 || height == 0 || mask.len() != strong_mask.len() { return; }
     let mut visited = vec![false; mask.len()];
     let mut stack = Vec::with_capacity(64);
     let mut component = Vec::with_capacity(64);
@@ -252,7 +272,9 @@ fn retain_significant_components(mask: &mut [bool], width: usize, height: usize,
                 }
             }
         }
-        if component.len() < min_size {
+        let strong_count = component.iter().filter(|&&index| strong_mask[index]).count();
+        let strong_fraction = strong_count as f64 / component.len() as f64;
+        if component.len() < min_size || strong_fraction < min_strong_fraction {
             for index in component.iter().copied() { mask[index] = false; }
         }
     }
