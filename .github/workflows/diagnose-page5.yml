@@ -17,9 +17,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -L --fail --retry 3 \
-            -o Page05Original.png \
-            https://raw.githubusercontent.com/MEGAMENE/AIChatMessages/main/Page05Original.png
+          git clone --depth 1 --branch main https://github.com/MEGAMENE/AIChatMessages.git aichatmessages
+          test -f aichatmessages/Page05Original.png
+          cp aichatmessages/Page05Original.png Page05Original.png
           file Page05Original.png
 
       - name: Install Pillow
