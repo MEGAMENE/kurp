@@ -20,33 +20,70 @@ jobs:
           from pathlib import Path
           p = Path('src/upscaler/upscaler.rs')
           s = p.read_text()
+
+          old = '''    let mut mask = vec![false; width * height];
+    for (index, pixel) in rgb.pixels().enumerate() {
+        let r = pixel[0] as i16;
+        let g = pixel[1] as i16;
+        let b = pixel[2] as i16;
+        let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs());
+        mask[index] = spread >= 16;
+    }
+    retain_significant_components(&mut mask, width, height, 8);
+'''
+          new = '''    let mut mask = vec![false; width * height];
+    let mut strong_mask = vec![false; width * height];
+    for (index, pixel) in rgb.pixels().enumerate() {
+        let r = pixel[0] as i16;
+        let g = pixel[1] as i16;
+        let b = pixel[2] as i16;
+        let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs());
+        mask[index] = spread >= 16;
+        strong_mask[index] = spread >= 40;
+    }
+    retain_significant_components(&mut mask, &strong_mask, width, height, 8, 0.10);
+'''
+          if old not in s:
+              raise SystemExit('build_color_protection_mask target not found')
+          s = s.replace(old, new, 1)
+
+          old = '''fn retain_significant_components(mask: &mut [bool], width: usize, height: usize, min_size: usize) {
+'''
+          new = '''fn retain_significant_components(
+    mask: &mut [bool],
+    strong_mask: &[bool],
+    width: usize,
+    height: usize,
+    min_size: usize,
+    min_strong_fraction: f64,
+) {
+'''
+          if old not in s:
+              raise SystemExit('retain_significant_components signature not found')
+          s = s.replace(old, new, 1)
+
           old = '''        if component.len() < min_size {
             for index in component.iter().copied() { mask[index] = false; }
         }
 '''
-          new = '''        const STRONG_CHROMA_THRESHOLD: i16 = 40;
-        const MIN_STRONG_CHROMA_FRACTION: f64 = 0.10;
-
-        if component.len() < min_size {
+          new = '''        let strong_count = component.iter().filter(|&&index| strong_mask[index]).count();
+        let strong_fraction = strong_count as f64 / component.len() as f64;
+        if component.len() < min_size || strong_fraction < min_strong_fraction {
             for index in component.iter().copied() { mask[index] = false; }
-            continue;
         }
-
-        let strong_chroma_pixels = component.iter().filter(|&&index| {
-            let x = index % width;
-            let y = index / width;
-            // The mask only stores whether spread >= 16, so recover the source
-            // pixel spread from the original image is not possible here.
-            // This workflow intentionally leaves the implementation unchanged
-            // until the source-image-aware component pass is applied.
-            let _ = (x, y);
-            false
-        }).count();
-        let _ = (strong_chroma_pixels, STRONG_CHROMA_THRESHOLD, MIN_STRONG_CHROMA_FRACTION);
 '''
           if old not in s:
-              raise SystemExit('target block not found')
-          # Do not commit an incomplete approximation. This workflow is only a
-          # staging hook and intentionally fails until the source-aware patch is supplied.
-          raise SystemExit('staging hook created; no source-aware patch committed')
+              raise SystemExit('component retention block not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
           PY
+
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/upscaler/upscaler.rs
+          git diff --cached --check
+          git commit -m "Improve grayscale color component protection"
+          git push origin HEAD:fix/improved-grayscale-color-pipeline
