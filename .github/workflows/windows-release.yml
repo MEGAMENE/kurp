@@ -8,6 +8,7 @@ on:
       - debug/avif-png-roundtrip
       - debug/grayscale-color-shift
       - fix/final-grayscale-color-pipeline
+      - fix/improved-grayscale-color-pipeline
   workflow_dispatch:
 
 permissions:
