@@ -20,11 +20,7 @@ pub struct UpscalerConfig {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum SourceClass {
-    Grayscale,
-    GrayscaleWithColor,
-    Color,
-}
+enum SourceClass { Grayscale, GrayscaleWithColor, Color }
 
 #[derive(Copy, Clone)]
 struct ChromaStats {
@@ -37,11 +33,7 @@ struct ChromaStats {
 
 impl ChromaStats {
     fn percentage_over_tolerance(self) -> f64 {
-        if self.total_pixels == 0 {
-            0.0
-        } else {
-            self.pixels_over_tolerance as f64 * 100.0 / self.total_pixels as f64
-        }
+        if self.total_pixels == 0 { 0.0 } else { self.pixels_over_tolerance as f64 * 100.0 / self.total_pixels as f64 }
     }
 }
 
@@ -60,61 +52,38 @@ pub trait Upscaler: Send {
         let image = match image_format {
             ImageFormat::Avif => match decode_avif(&input) {
                 Ok(image) => image,
-                Err(error) => {
-                    warn!("image {}: can't decode AVIF image: {error}", source_name);
-                    return (input, image_format);
-                }
+                Err(error) => { warn!("image {}: can't decode AVIF image: {error}", source_name); return (input, image_format); }
             },
             _ => {
                 let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
                 reader.set_format(image_format);
                 match reader.decode().or_else(|_| {
                     image::io::Reader::new(Cursor::new(input.clone()))
-                        .with_guessed_format()
-                        .map_err(image::ImageError::IoError)
-                        .and_then(|reader| reader.decode())
+                        .with_guessed_format().map_err(image::ImageError::IoError).and_then(|reader| reader.decode())
                 }) {
                     Ok(image) => image,
-                    Err(error) => {
-                        warn!("image {}: can't decode image: {error}", source_name);
-                        return (input, image_format);
-                    }
+                    Err(error) => { warn!("image {}: can't decode image: {error}", source_name); return (input, image_format); }
                 }
             }
         };
 
-        // Classify the ORIGINAL pixels before the neural upscaler runs. The
-        // upscaler can introduce chroma into an otherwise grayscale page, so
-        // post-processing must never re-classify the upscaled result.
         let input_stats = chroma_stats(&image);
         let source_class = classify_source(input_stats);
         info!(
             "grayscale diagnostic [{}]: input avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%, localized color {} -> {:?}",
-            source_name,
-            input_stats.average_spread,
-            input_stats.max_spread,
-            input_stats.percentage_over_tolerance(),
-            input_stats.has_localized_color,
-            source_class
+            source_name, input_stats.average_spread, input_stats.max_spread,
+            input_stats.percentage_over_tolerance(), input_stats.has_localized_color, source_class
         );
 
-        // Build the protection mask from the SOURCE, not from the upscaled
-        // image. This prevents Real-CUGAN/waifu2x's small chroma errors from
-        // being mistaken for intentional color.
         let source_color_mask = if source_class == SourceClass::GrayscaleWithColor {
             Some(build_color_protection_mask(&image))
-        } else {
-            None
-        };
+        } else { None };
 
         let upscaled = self.upscale_image(image);
         let output_stats = chroma_stats(&upscaled);
         info!(
             "grayscale diagnostic [{}]: upscaled avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
-            source_name,
-            output_stats.average_spread,
-            output_stats.max_spread,
-            output_stats.percentage_over_tolerance()
+            source_name, output_stats.average_spread, output_stats.max_spread, output_stats.percentage_over_tolerance()
         );
 
         let upscaled = match source_class {
@@ -124,7 +93,6 @@ pub trait Upscaler: Send {
             }
             SourceClass::GrayscaleWithColor => {
                 info!("grayscale diagnostic [{}]: grayscale source with localized color; correcting grayscale regions while protecting source color", source_name);
-                normalize_luminance_preserve_source_color(&upscaled, source_color_mask.as_ref().unwrap());
                 normalize_luminance_preserve_source_color(&upscaled, source_color_mask.as_ref().unwrap())
             }
             SourceClass::Color => {
@@ -136,10 +104,7 @@ pub trait Upscaler: Send {
         let final_stats = chroma_stats(&upscaled);
         info!(
             "grayscale diagnostic [{}]: final avg chroma {:.3}, max chroma {}, pixels over tolerance {:.3}%",
-            source_name,
-            final_stats.average_spread,
-            final_stats.max_spread,
-            final_stats.percentage_over_tolerance()
+            source_name, final_stats.average_spread, final_stats.max_spread, final_stats.percentage_over_tolerance()
         );
 
         let mut buf = Cursor::new(Vec::new());
@@ -149,7 +114,6 @@ pub trait Upscaler: Send {
             Format::WebP => ImageFormat::WebP,
             Format::Original => image_format,
         };
-
         if let Err(error) = upscaled.write_to(&mut buf, format_to) {
             warn!("image {}: can't write upscaled image: {error}", source_name);
             return (input, image_format);
@@ -165,32 +129,20 @@ pub trait Upscaler: Send {
 }
 
 fn classify_source(stats: ChromaStats) -> SourceClass {
-    // A small amount of RGB channel disagreement is common in scanned/compressed
-    // grayscale material. Use a stricter per-pixel threshold so that this noise
-    // does not turn an otherwise grayscale page into a color page.
-    const SIGNIFICANT_CHROMA: u8 = 8;
-    const LOCALIZED_COLOR_CHROMA: u8 = 16;
     const MAX_GRAYSCALE_AVERAGE_SPREAD: f64 = 2.5;
     const MAX_GRAYSCALE_PIXELS_OVER_TOLERANCE_PERCENT: f64 = 8.0;
     const MAX_BW_COLOR_AVERAGE_SPREAD: f64 = 12.0;
     const MAX_BW_COLOR_PIXELS_OVER_TOLERANCE_PERCENT: f64 = 35.0;
 
-    let _ = SIGNIFICANT_CHROMA;
-    let _ = LOCALIZED_COLOR_CHROMA;
-
     let is_low_chroma = stats.average_spread <= MAX_GRAYSCALE_AVERAGE_SPREAD
         && stats.percentage_over_tolerance() <= MAX_GRAYSCALE_PIXELS_OVER_TOLERANCE_PERCENT;
-
     if is_low_chroma {
         if stats.has_localized_color { SourceClass::GrayscaleWithColor } else { SourceClass::Grayscale }
     } else if stats.average_spread <= MAX_BW_COLOR_AVERAGE_SPREAD
         && stats.percentage_over_tolerance() <= MAX_BW_COLOR_PIXELS_OVER_TOLERANCE_PERCENT
-        && stats.has_localized_color
-    {
+        && stats.has_localized_color {
         SourceClass::GrayscaleWithColor
-    } else {
-        SourceClass::Color
-    }
+    } else { SourceClass::Color }
 }
 
 fn chroma_stats(image: &DynamicImage) -> ChromaStats {
@@ -214,23 +166,20 @@ fn chroma_stats(image: &DynamicImage) -> ChromaStats {
         colour_mask[index] = spread >= 16;
     }
 
-    let has_localized_color = has_significant_color_component(&colour_mask, width, height);
-
     ChromaStats {
         average_spread: if total_pixels == 0 { 0.0 } else { total_spread as f64 / total_pixels as f64 },
         max_spread,
         pixels_over_tolerance,
         total_pixels,
-        has_localized_color,
+        has_localized_color: has_significant_color_component(&colour_mask, width, height),
     }
 }
 
-fn build_color_protection_mask(image: &DynamicImage) -> Vec<bool> {
+fn build_color_protection_mask(image: &DynamicImage) -> (Vec<bool>, usize, usize) {
     let rgb = image.to_rgb8();
     let width = rgb.width() as usize;
     let height = rgb.height() as usize;
     let mut mask = vec![false; width * height];
-
     for (index, pixel) in rgb.pixels().enumerate() {
         let r = pixel[0] as i16;
         let g = pixel[1] as i16;
@@ -238,36 +187,29 @@ fn build_color_protection_mask(image: &DynamicImage) -> Vec<bool> {
         let spread = (r - g).abs().max((r - b).abs()).max((g - b).abs());
         mask[index] = spread >= 16;
     }
-
-    // Remove isolated compression/noise pixels before the mask is enlarged.
     retain_significant_components(&mut mask, width, height, 8);
-    mask
+    (mask, width, height)
 }
 
 fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -> bool {
     const MIN_COMPONENT_PIXELS: usize = 8;
     if width == 0 || height == 0 { return false; }
-
     let mut visited = vec![false; mask.len()];
     let mut stack = Vec::with_capacity(64);
-
     for start in 0..mask.len() {
         if !mask[start] || visited[start] { continue; }
         visited[start] = true;
         stack.push(start);
         let mut component_size = 0usize;
-
         while let Some(index) = stack.pop() {
             component_size += 1;
             if component_size >= MIN_COMPONENT_PIXELS { return true; }
-
             let x = index % width;
             let y = index / width;
             let x_start = x.saturating_sub(1);
             let x_end = (x + 1).min(width - 1);
             let y_start = y.saturating_sub(1);
             let y_end = (y + 1).min(height - 1);
-
             for ny in y_start..=y_end {
                 for nx in x_start..=x_end {
                     let neighbour = ny * width + nx;
@@ -279,7 +221,6 @@ fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -
             }
         }
     }
-
     false
 }
 
@@ -288,13 +229,11 @@ fn retain_significant_components(mask: &mut [bool], width: usize, height: usize,
     let mut visited = vec![false; mask.len()];
     let mut stack = Vec::with_capacity(64);
     let mut component = Vec::with_capacity(64);
-
     for start in 0..mask.len() {
         if !mask[start] || visited[start] { continue; }
         visited[start] = true;
         stack.push(start);
         component.clear();
-
         while let Some(index) = stack.pop() {
             component.push(index);
             let x = index % width;
@@ -303,7 +242,6 @@ fn retain_significant_components(mask: &mut [bool], width: usize, height: usize,
             let x_end = (x + 1).min(width - 1);
             let y_start = y.saturating_sub(1);
             let y_end = (y + 1).min(height - 1);
-
             for ny in y_start..=y_end {
                 for nx in x_start..=x_end {
                     let neighbour = ny * width + nx;
@@ -314,7 +252,6 @@ fn retain_significant_components(mask: &mut [bool], width: usize, height: usize,
                 }
             }
         }
-
         if component.len() < min_size {
             for index in component.iter().copied() { mask[index] = false; }
         }
@@ -331,22 +268,19 @@ fn normalize_grayscale(image: &DynamicImage) -> DynamicImage {
     DynamicImage::ImageRgb8(rgb)
 }
 
-fn normalize_luminance_preserve_source_color(image: &DynamicImage, source_mask: &[bool]) -> DynamicImage {
+fn normalize_luminance_preserve_source_color(image: &DynamicImage, source_mask: &(Vec<bool>, usize, usize)) -> DynamicImage {
     let rgb = image.to_rgb8();
-    let width = rgb.width() as usize;
-    let height = rgb.height() as usize;
-    if source_mask.is_empty() || width == 0 || height == 0 {
-        return normalize_grayscale(image);
-    }
+    let target_width = rgb.width() as usize;
+    let target_height = rgb.height() as usize;
+    let protected = resize_and_dilate_mask(&source_mask.0, source_mask.1, source_mask.2, target_width, target_height);
 
-    let protected = resize_and_dilate_mask(source_mask, infer_mask_dimensions(source_mask.len(), width, height), width, height);
     let mut luminance = image::GrayImage::new(rgb.width(), rgb.height());
     for (x, y, pixel) in rgb.enumerate_pixels() {
         luminance.put_pixel(x, y, image::Luma([rgb_luminance(pixel[0], pixel[1], pixel[2])]));
     }
-
     let normalized_luminance = normalize_luma_channel(&luminance);
     let mut output = image::RgbImage::new(rgb.width(), rgb.height());
+
     for (index, (x, y, pixel)) in rgb.enumerate_pixels().enumerate() {
         if protected[index] {
             output.put_pixel(x, y, *pixel);
@@ -355,42 +289,13 @@ fn normalize_luminance_preserve_source_color(image: &DynamicImage, source_mask: 
             output.put_pixel(x, y, image::Rgb([value, value, value]));
         }
     }
-
     DynamicImage::ImageRgb8(output)
 }
 
-// The source mask is stored as a flat array. We do not have its dimensions in
-// the function signature above, so recover the original dimensions from the
-// fact that the source mask was built from an image. The helper below uses the
-// nearest sensible aspect-ratio pair; for normal manga/comic pages this is exact
-// when the upscaler uses a uniform scale.
-fn infer_mask_dimensions(mask_len: usize, target_width: usize, target_height: usize) -> (usize, usize) {
-    if mask_len == target_width * target_height {
-        return (target_width, target_height);
-    }
-
-    let target_ratio = target_width as f64 / target_height.max(1) as f64;
-    let mut best = (mask_len, 1usize);
-    let mut best_error = f64::MAX;
-    let limit = (mask_len as f64).sqrt() as usize + 1;
-    for h in 1..=limit {
-        if mask_len % h != 0 { continue; }
-        let w = mask_len / h;
-        let error = ((w as f64 / h as f64) - target_ratio).abs();
-        if error < best_error {
-            best = (w, h);
-            best_error = error;
-        }
-    }
-    best
-}
-
-fn resize_and_dilate_mask(source: &[bool], source_dims: (usize, usize), target_width: usize, target_height: usize) -> Vec<bool> {
-    let (source_width, source_height) = source_dims;
+fn resize_and_dilate_mask(source: &[bool], source_width: usize, source_height: usize, target_width: usize, target_height: usize) -> Vec<bool> {
     if source_width == 0 || source_height == 0 || source.len() != source_width * source_height {
         return vec![false; target_width * target_height];
     }
-
     let mut mask = vec![false; target_width * target_height];
     for y in 0..target_height {
         let sy = (y * source_height / target_height).min(source_height - 1);
@@ -403,8 +308,6 @@ fn resize_and_dilate_mask(source: &[bool], source_dims: (usize, usize), target_w
     let scale_x = (target_width / source_width).max(1);
     let scale_y = (target_height / source_height).max(1);
     let radius = (scale_x.min(scale_y) / 2).clamp(1, 3);
-    if radius == 0 { return mask; }
-
     let original = mask.clone();
     for y in 0..target_height {
         for x in 0..target_width {
@@ -430,16 +333,11 @@ fn normalize_luma_channel(image: &image::GrayImage) -> image::GrayImage {
     let (black_point, white_point) = percentile_points(image);
     if black_point == 0 && white_point == 255 { return image.clone(); }
     if white_point <= black_point { return image.clone(); }
-
     let range = (white_point - black_point) as u16;
     let mut output = image::GrayImage::new(image.width(), image.height());
     for (x, y, pixel) in image.enumerate_pixels() {
         let value = pixel[0] as i16;
-        let mapped = if value <= black_point as i16 {
-            0
-        } else if value >= white_point as i16 {
-            255
-        } else {
+        let mapped = if value <= black_point as i16 { 0 } else if value >= white_point as i16 { 255 } else {
             (((value - black_point as i16) as u16 * 255 + range / 2) / range) as u8
         };
         output.put_pixel(x, y, image::Luma([mapped]));
@@ -450,22 +348,18 @@ fn normalize_luma_channel(image: &image::GrayImage) -> image::GrayImage {
 fn percentile_points(image: &image::GrayImage) -> (u8, u8) {
     const LOW_PERCENTILE: f64 = 0.005;
     const HIGH_PERCENTILE: f64 = 0.995;
-
     let mut histogram = [0u64; 256];
     for pixel in image.pixels() { histogram[pixel[0] as usize] += 1; }
     let total = image.width() as u64 * image.height() as u64;
     if total == 0 { return (0, 255); }
-
     let low_target = ((total as f64 * LOW_PERCENTILE).ceil() as u64).max(1);
     let high_target = ((total as f64 * HIGH_PERCENTILE).ceil() as u64).min(total);
-
     let mut cumulative = 0u64;
     let mut low = 0u8;
     for (value, count) in histogram.iter().enumerate() {
         cumulative += *count;
         if cumulative >= low_target { low = value as u8; break; }
     }
-
     cumulative = 0;
     let mut high = 255u8;
     for (value, count) in histogram.iter().enumerate() {
@@ -479,8 +373,6 @@ fn rgb_luminance(r: u8, g: u8, b: u8) -> u8 {
     ((299u32 * r as u32 + 587u32 * g as u32 + 114u32 * b as u32 + 500) / 1000) as u8
 }
 
-fn clamp_u8(value: f32) -> u8 { value.round().clamp(0.0, 255.0) as u8 }
-
 fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     let decoded = zenavif::decode(input.as_ref()).map_err(|error| format!("{error:?}"))?;
     let width = decoded.width();
@@ -489,15 +381,11 @@ fn decode_avif(input: &Bytes) -> Result<DynamicImage, String> {
     if has_alpha {
         let rgba = decoded.to_rgba8();
         let pixels = rgba.copy_to_contiguous_bytes();
-        image::RgbaImage::from_raw(width, height, pixels)
-            .map(DynamicImage::ImageRgba8)
-            .ok_or_else(|| "decoded AVIF has an invalid RGBA pixel buffer".to_string())
+        image::RgbaImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgba8).ok_or_else(|| "decoded AVIF has an invalid RGBA pixel buffer".to_string())
     } else {
         let rgb = decoded.to_rgb8();
         let pixels = rgb.copy_to_contiguous_bytes();
-        image::RgbImage::from_raw(width, height, pixels)
-            .map(DynamicImage::ImageRgb8)
-            .ok_or_else(|| "decoded AVIF has an invalid RGB pixel buffer".to_string())
+        image::RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8).ok_or_else(|| "decoded AVIF has an invalid RGB pixel buffer".to_string())
     }
 }
 
@@ -513,10 +401,7 @@ fn preserve_icc_profile(input: &Bytes, output: Bytes) -> Bytes {
     let mut output_image = match DynImage::from_bytes(output.to_vec().into()) {
         Ok(Some(image)) => image,
         Ok(None) => return output,
-        Err(error) => {
-            warn!("can't parse upscaled image for ICC profile preservation: {error}");
-            return output;
-        }
+        Err(error) => { warn!("can't parse upscaled image for ICC profile preservation: {error}"); return output; }
     };
     output_image.set_icc_profile(Some(profile.into()));
     let mut writer = Cursor::new(Vec::new());
@@ -559,7 +444,6 @@ impl Upscaler for RealCuganUpscaler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn full_range_grayscale_is_unchanged() {
         let mut image = image::GrayImage::new(2, 1);
@@ -568,7 +452,6 @@ mod tests {
         assert_eq!(percentile_points(&image), (0, 255));
         assert_eq!(normalize_luma_channel(&image), image);
     }
-
     #[test]
     fn narrow_grayscale_range_is_expanded() {
         let mut image = image::GrayImage::new(100, 1);
@@ -577,7 +460,6 @@ mod tests {
         assert_eq!(normalized.get_pixel(0, 0)[0], 0);
         assert_eq!(normalized.get_pixel(99, 0)[0], 255);
     }
-
     #[test]
     fn localized_color_is_classified_as_grayscale_with_color() {
         let mut image = image::RgbImage::from_pixel(100, 100, image::Rgb([128, 128, 128]));
@@ -585,7 +467,6 @@ mod tests {
         let stats = chroma_stats(&DynamicImage::ImageRgb8(image));
         assert_eq!(classify_source(stats), SourceClass::GrayscaleWithColor);
     }
-
     #[test]
     fn full_color_image_is_not_treated_as_grayscale() {
         let image = image::RgbImage::from_pixel(10, 10, image::Rgb([255, 0, 0]));
