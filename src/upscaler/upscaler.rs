@@ -193,14 +193,7 @@ fn build_color_protection_mask(image: &DynamicImage) -> (Vec<bool>, usize, usize
         mask[index] = spread >= 16;
         strong_mask[index] = spread >= STRONG_CHROMA_THRESHOLD;
     }
-    retain_significant_components(
-        &mut mask,
-        &strong_mask,
-        width,
-        height,
-        MIN_COMPONENT_PIXELS,
-        MIN_STRONG_FRACTION,
-    );
+    retain_significant_components(&mut mask, &strong_mask, width, height, MIN_COMPONENT_PIXELS, MIN_STRONG_FRACTION);
     (mask, width, height)
 }
 
@@ -237,14 +230,7 @@ fn has_significant_color_component(mask: &[bool], width: usize, height: usize) -
     false
 }
 
-fn retain_significant_components(
-    mask: &mut [bool],
-    strong_mask: &[bool],
-    width: usize,
-    height: usize,
-    min_size: usize,
-    min_strong_fraction: f64,
-) {
+fn retain_significant_components(mask: &mut [bool], strong_mask: &[bool], width: usize, height: usize, min_size: usize, min_strong_fraction: f64) {
     if width == 0 || height == 0 || mask.len() != strong_mask.len() { return; }
     let mut visited = vec![false; mask.len()];
     let mut stack = Vec::with_capacity(64);
@@ -315,9 +301,7 @@ fn normalize_luminance_preserve_source_color(image: &DynamicImage, source_mask: 
 }
 
 fn resize_and_dilate_mask(source: &[bool], source_width: usize, source_height: usize, target_width: usize, target_height: usize) -> Vec<bool> {
-    if source_width == 0 || source_height == 0 || source.len() != source_width * source_height {
-        return vec![false; target_width * target_height];
-    }
+    if source_width == 0 || source_height == 0 || source.len() != source_width * source_height { return vec![false; target_width * target_height]; }
     let mut mask = vec![false; target_width * target_height];
     for y in 0..target_height {
         let sy = (y * source_height / target_height).min(source_height - 1);
@@ -326,7 +310,6 @@ fn resize_and_dilate_mask(source: &[bool], source_width: usize, source_height: u
             mask[y * target_width + x] = source[sy * source_width + sx];
         }
     }
-
     let scale_x = (target_width / source_width).max(1);
     let scale_y = (target_height / source_height).max(1);
     let radius = (scale_x.min(scale_y) / 2).clamp(1, 3);
@@ -359,9 +342,7 @@ fn normalize_luma_channel(image: &image::GrayImage) -> image::GrayImage {
     let mut output = image::GrayImage::new(image.width(), image.height());
     for (x, y, pixel) in image.enumerate_pixels() {
         let value = pixel[0] as i16;
-        let mapped = if value <= black_point as i16 { 0 } else if value >= white_point as i16 { 255 } else {
-            (((value - black_point as i16) as u16 * 255 + range / 2) / range) as u8
-        };
+        let mapped = if value <= black_point as i16 { 0 } else if value >= white_point as i16 { 255 } else { (((value - black_point as i16) as u16 * 255 + range / 2) / range) as u8 };
         output.put_pixel(x, y, image::Luma([mapped]));
     }
     output
@@ -392,6 +373,22 @@ fn percentile_points(image: &image::GrayImage) -> (u8, u8) {
 }
 
 fn rgb_luminance(r: u8, g: u8, b: u8) -> u8 {
+    const WARM_BLACK_MAX: u8 = 40;
+    const WARM_BLACK_MIN_RED_GREEN_GAP: i16 = 8;
+    const WARM_BLACK_MIN_GREEN_BLUE_GAP: i16 = 4;
+
+    let r_i = r as i16;
+    let g_i = g as i16;
+    let b_i = b as i16;
+    let max_channel = r.max(g).max(b);
+
+    if max_channel <= WARM_BLACK_MAX
+        && r_i - g_i >= WARM_BLACK_MIN_RED_GREEN_GAP
+        && g_i - b_i >= WARM_BLACK_MIN_GREEN_BLUE_GAP
+    {
+        return 0;
+    }
+
     ((299u32 * r as u32 + 587u32 * g as u32 + 114u32 * b as u32 + 500) / 1000) as u8
 }
 
