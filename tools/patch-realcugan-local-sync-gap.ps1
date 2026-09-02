@@ -6,6 +6,7 @@ $end = $text.IndexOf("`nint RealCUGAN::process_se_very_rough_stage0(", $start)
 if ($start -lt 0 -or $end -lt 0) { throw 'Could not locate process_se_sync_gap in Real-CUGAN source.' }
 
 $replacement = @'
+#pragma message("KURP EXPERIMENT: local 3x3 sync-gap patch compiled")
 int RealCUGAN::process_se_sync_gap(const ncnn::Mat& inimage, const std::vector<std::string>& names, const ncnn::Option& opt, FeatureCache& cache) const
 {
     const int w = inimage.w;
@@ -145,3 +146,4 @@ int RealCUGAN::process_se_sync_gap(const ncnn::Mat& inimage, const std::vector<s
 $text = $text.Substring(0, $start) + $replacement + $text.Substring($end)
 Set-Content -Path $source -Value $text -NoNewline
 Write-Host 'Applied local 3x3 sync-gap averaging patch.'
+Write-Host 'The C++ compiler should emit: KURP EXPERIMENT: local 3x3 sync-gap patch compiled'
