@@ -145,5 +145,10 @@ int RealCUGAN::process_se_sync_gap(const ncnn::Mat& inimage, const std::vector<s
 
 $text = $text.Substring(0, $start) + $replacement + $text.Substring($end)
 Set-Content -Path $source -Value $text -NoNewline
+
+# Force Cargo/CMake to rebuild the native Real-CUGAN code from the patched source.
+Remove-Item target -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host 'Applied local 3x3 sync-gap averaging patch.'
+Write-Host 'Cleared target/ to force a native rebuild.'
 Write-Host 'The C++ compiler should emit: KURP EXPERIMENT: local 3x3 sync-gap patch compiled'
