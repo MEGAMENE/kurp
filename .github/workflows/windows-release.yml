@@ -150,7 +150,8 @@ jobs:
         shell: pwsh
         env:
           CMAKE_BUILD_TYPE: Release
-        run: cargo build --release
+          CMAKE_VERBOSE_MAKEFILE: ON
+        run: cargo build --release -vv
 
       - name: Package Windows release
         shell: pwsh
