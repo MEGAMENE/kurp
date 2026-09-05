@@ -25,7 +25,6 @@ pub struct SupervisorState {
     upscale_actor: Option<ActorRef<UpscaleMessage>>,
 }
 
-#[async_trait::async_trait]
 impl Actor for UpscaleSupervisorActor {
     type Msg = UpscaleSupervisorMessage;
     type State = SupervisorState;
@@ -100,7 +99,6 @@ impl Actor for UpscaleSupervisorActor {
 
 pub struct UpscaleActor;
 
-#[async_trait::async_trait]
 impl Actor for UpscaleActor {
     type Msg = UpscaleMessage;
     type State = Box<dyn Upscaler>;
