@@ -1,16 +1,17 @@
-use axum::extract::State;
-use axum::http::{Request, Response, StatusCode};
-use hyper::{Body, body};
+use axum::body::{to_bytes, Body};
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::response::Response;
 
 use crate::app_state::AppState;
 use crate::models::komga::{KomgaBookMetadataUpdate, KomgaSeriesMetadataUpdate};
 
 pub async fn check_tags_on_series_metadata_update(
     State(state): State<AppState>,
-    request: Request<Body>,
-) -> Result<Response<Body>, StatusCode> {
+    request: Request,
+) -> Result<Response, StatusCode> {
     let (parts, body) = request.into_parts();
-    let bytes = body::to_bytes(body).await
+    let bytes = to_bytes(body, usize::MAX).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let json: KomgaSeriesMetadataUpdate = serde_json::from_slice(&bytes)
@@ -29,10 +30,10 @@ pub async fn check_tags_on_series_metadata_update(
 
 pub async fn check_tags_on_book_metadata_update(
     State(state): State<AppState>,
-    request: Request<Body>,
-) -> Result<Response<Body>, StatusCode> {
+    request: Request,
+) -> Result<Response, StatusCode> {
     let (parts, body) = request.into_parts();
-    let bytes = body::to_bytes(body).await
+    let bytes = to_bytes(body, usize::MAX).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let json: KomgaBookMetadataUpdate = serde_json::from_slice(&bytes)

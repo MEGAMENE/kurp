@@ -1,7 +1,9 @@
-use axum::http::{HeaderMap, HeaderValue, Request};
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
-use hyper::Body;
 use once_cell::sync::Lazy;
+use sync_wrapper::SyncStream;
 use unicase::Ascii;
 
 use crate::models::errors::ProxyError;
@@ -19,8 +21,8 @@ impl ProxyClient {
 
     pub async fn proxy_request(
         &self,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, ProxyError> {
+        req: Request,
+    ) -> Result<Response, ProxyError> {
         let request = self.to_proxy_request(req)?;
         let response = self.call_proxy_request(request).await?;
 
@@ -30,13 +32,13 @@ impl ProxyClient {
     async fn response_to_reply(
         &self,
         response: reqwest::Response,
-    ) -> Result<Response<Body>, ProxyError> {
+    ) -> Result<Response, ProxyError> {
         let mut builder = Response::builder();
         for (k, v) in self.remove_hop_headers(response.headers()).iter() {
             builder = builder.header(k, v);
         }
         let status = response.status();
-        let body = Body::wrap_stream(response.bytes_stream());
+        let body = Body::from_stream(response.bytes_stream());
         builder
             .status(status)
             .body(body)
@@ -75,7 +77,7 @@ impl ProxyClient {
 
     fn to_proxy_request(
         &self,
-        request: Request<Body>,
+        request: Request,
     ) -> Result<reqwest::Request, ProxyError> {
         let url = if let Some(path) = request.uri().path_and_query() {
             format!("{}{}", self.base_url, path.as_str())
@@ -84,11 +86,12 @@ impl ProxyClient {
         };
 
         let headers = self.remove_hop_headers(request.headers());
+        let body_stream = SyncStream::new(request.into_body().into_data_stream());
 
         self.client
             .request(request.method().clone(), url)
             .headers(headers)
-            .body(request.into_body())
+            .body(reqwest::Body::wrap_stream(body_stream))
             .build()
             .map_err(|err| ProxyError { message: err.to_string() })
     }

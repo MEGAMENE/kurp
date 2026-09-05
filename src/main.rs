@@ -1,7 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
-
-use hyper::Uri;
+use axum::http::Uri;
 use log::LevelFilter;
 use moka::future::Cache;
 use ractor::Actor;

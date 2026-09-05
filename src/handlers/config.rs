@@ -3,7 +3,7 @@ use std::ops::Deref;
 use axum::extract::State;
 use axum::Json;
 use axum::response::IntoResponse;
-use hyper::StatusCode;
+use axum::http::StatusCode;
 
 use crate::app_state::AppState;
 use crate::config::app_config::AppConfig;

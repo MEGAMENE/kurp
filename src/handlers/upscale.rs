@@ -2,14 +2,14 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
-use axum::TypedHeader;
+use axum::body::{to_bytes, Body};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::Response;
+use axum_extra::TypedHeader;
 use bytes::Bytes;
 use headers::{Authorization, Cookie};
 use headers::authorization::Basic;
-use hyper::Body;
-use hyper::body::to_bytes;
 use image::ImageFormat;
 use log::info;
 use moka::future::Cache;
@@ -28,8 +28,8 @@ pub async fn upscale_komga(
     State(state): State<AppState>,
     authorization: Option<TypedHeader<Authorization<Basic>>>,
     cookie: Option<TypedHeader<Cookie>>,
-    req: Request<Body>,
-) -> Result<Response<Body>, StatusCode> {
+    req: Request,
+) -> Result<Response, StatusCode> {
     let uri = req.uri().clone();
     let tag_checker = state.upscale_tag_checker.clone();
     let cookie = cookie.map(|c| c.0);
@@ -48,16 +48,16 @@ pub async fn upscale_komga(
 
 pub async fn upscale_kavita(
     State(state): State<AppState>,
-    req: Request<Body>,
-) -> Result<Response<Body>, StatusCode> {
+    req: Request,
+) -> Result<Response, StatusCode> {
     upscale(state, req, || async { Ok(true) }).await
 }
 
 pub async fn upscale<F, Fut>(
     state: AppState,
-    request: Request<Body>,
+    request: Request,
     upscale_condition: F,
-) -> Result<Response<Body>, StatusCode>
+) -> Result<Response, StatusCode>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output=Result<bool, HttpError>>
@@ -86,9 +86,9 @@ pub async fn upscale<F, Fut>(
 }
 
 async fn upscale_response(
-    response: Response<Body>,
+    response: Response,
     upscaler: ActorRef<UpscaleSupervisorMessage>,
-) -> Response<Body> {
+) -> Response {
     let status = response.status();
     let headers = response.headers().clone();
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -102,7 +102,7 @@ async fn upscale_response(
     };
 
     let encoding = headers.get("content-encoding");
-    let response_bytes = to_bytes(response).await.unwrap();
+    let response_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
     let decompressed = encoding
         .map(unwrap_encoding_header)
@@ -134,7 +134,7 @@ fn to_response(
     bytes: Bytes,
     headers: &HeaderMap<HeaderValue>,
     format: ImageFormat,
-) -> Response<Body> {
+) -> Response {
     let mime_type = match format {
         ImageFormat::Png => { Some(("image/png", "png")) }
         ImageFormat::Jpeg => { Some(("image/jpeg", "jpeg")) }
@@ -188,28 +188,21 @@ fn unwrap_encoding_header(encoding: &HeaderValue) -> Algorithm {
 
 async fn to_proxy_request(
     call_cache: Arc<Cache<String, ()>>,
-    req: Request<Body>,
-) -> Request<Body> {
+    req: Request,
+) -> Request {
     let request_path = req.uri().path_and_query()
         .map(|path| path.to_string())
         .unwrap_or("/".to_string());
 
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
 
-    let headers = remove_uncached_conditional_headers(
+    parts.headers = remove_uncached_conditional_headers(
         parts.headers,
         call_cache.clone(),
         request_path,
     ).await;
 
-    let mut builder = Request::builder()
-        .method(parts.method)
-        .uri(parts.uri)
-        .version(parts.version)
-        .extension(parts.extensions);
-    builder.headers_mut().unwrap().extend(headers);
-
-    builder.body(body).unwrap()
+    Request::from_parts(parts, body)
 }
 
 fn is_conditional_header(header_name: &str) -> bool {
