@@ -12,6 +12,7 @@ use hyper::Body;
 use hyper::body::to_bytes;
 use image::ImageFormat;
 use log::info;
+use moka::future::Cache;
 use once_cell::sync::Lazy;
 use ractor::{ActorRef, call};
 use regex::Regex;
@@ -61,7 +62,7 @@ pub async fn upscale<F, Fut>(
         F: FnOnce() -> Fut,
         Fut: Future<Output=Result<bool, HttpError>>
 {
-    let request = to_proxy_request(state.upscale_call_history_cache.clone(), request);
+    let request = to_proxy_request(state.upscale_call_history_cache.clone(), request).await;
     let request_path = request.uri().path_and_query()
         .map(|path| path.to_string())
         .unwrap_or("/".to_string());
@@ -185,7 +186,7 @@ fn unwrap_encoding_header(encoding: &HeaderValue) -> Algorithm {
     }
 }
 
-fn to_proxy_request(
+async fn to_proxy_request(
     call_cache: Arc<Cache<String, ()>>,
     req: Request<Body>,
 ) -> Request<Body> {
@@ -199,7 +200,7 @@ fn to_proxy_request(
         parts.headers,
         call_cache.clone(),
         request_path,
-    );
+    ).await;
 
     let mut builder = Request::builder()
         .method(parts.method)
@@ -218,12 +219,12 @@ fn is_conditional_header(header_name: &str) -> bool {
     CONDITIONAL_HEADERS.iter().any(|h| h == &header_name)
 }
 
-fn remove_uncached_conditional_headers(
+async fn remove_uncached_conditional_headers(
     headers: HeaderMap<HeaderValue>,
     call_cache: Arc<Cache<String, ()>>,
     request_path: String,
 ) -> HeaderMap<HeaderValue> {
-    if call_cache.get(&request_path).is_some() {
+    if call_cache.get(&request_path).await.is_some() {
         return headers;
     }
 

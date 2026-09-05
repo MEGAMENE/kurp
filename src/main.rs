@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use hyper::Uri;
 use log::LevelFilter;
+use moka::future::Cache;
 use ractor::Actor;
 use reqwest::redirect::Policy;
 use tokio::sync::broadcast;

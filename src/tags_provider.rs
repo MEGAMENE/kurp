@@ -34,7 +34,7 @@ impl UpscaleTagChecker {
         match &self.upscale_tag {
             None => Ok(true),
             Some(upscale_tag) => {
-                match self.cache.get(&book_id.to_string()) {
+                match self.cache.get(&book_id.to_string()).await {
                     None => Ok(self.check_kavita_tags(upscale_tag, book_id, auth).await?),
                     Some(contains) => Ok(contains)
                 }
@@ -51,7 +51,7 @@ impl UpscaleTagChecker {
         match &self.upscale_tag {
             None => Ok(true),
             Some(upscale_tag) => {
-                match self.cache.get(book_id) {
+                match self.cache.get(book_id).await {
                     None => Ok(self.check_komga_tags(upscale_tag, book_id, cookie, auth).await?),
                     Some(contains) => Ok(contains)
                 }
