@@ -85,11 +85,12 @@ impl ProxyClient {
             format!("{}{}", self.base_url, request.uri().path())
         };
 
+        let method = request.method().clone();
         let headers = self.remove_hop_headers(request.headers());
         let body_stream = SyncStream::new(request.into_body().into_data_stream());
 
         self.client
-            .request(request.method().clone(), url)
+            .request(method, url)
             .headers(headers)
             .body(reqwest::Body::wrap_stream(body_stream))
             .build()
