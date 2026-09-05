@@ -91,11 +91,15 @@ async fn upscale_response(
 ) -> Response<Body> {
     let status = response.status();
     let headers = response.headers().clone();
-    let mut content_type = headers.get("content-type").unwrap().to_str().unwrap();
-    if content_type == "image/jpg" {
-        content_type = "image/jpeg"
-    }
-    let image_format = ImageFormat::from_mime_type(content_type).unwrap();
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let image_format = match content_type {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
+        "image/webp" => ImageFormat::WebP,
+        "image/gif" => ImageFormat::Gif,
+        _ => ImageFormat::from_extension(content_type.trim_start_matches("image/"))
+            .unwrap_or(ImageFormat::Png),
+    };
 
     let encoding = headers.get("content-encoding");
     let response_bytes = to_bytes(response).await.unwrap();

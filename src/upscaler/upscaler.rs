@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use image::codecs::webp::WebPEncoder;
-use image::{DynamicImage, ImageEncoder, ImageFormat};
+use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
 use log::info;
 use realcugan_ncnn_vulkan_rs::RealCugan;
 
@@ -29,10 +29,10 @@ pub trait Upscaler: Send {
             }
         }
 
-        let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
+        let mut reader = ImageReader::new(Cursor::new(input.clone()));
         reader.set_format(image_format);
         let image = match reader.decode().or_else(|_| {
-            image::io::Reader::new(Cursor::new(input.clone()))
+            ImageReader::new(Cursor::new(input.clone()))
                 .with_guessed_format()
                 .unwrap()
                 .decode()
@@ -51,7 +51,7 @@ pub trait Upscaler: Send {
             Format::LosslessWebP => {
                 let encoder = WebPEncoder::new_lossless(&mut buf);
                 let (w, h) = (upscaled.width(), upscaled.height());
-                let color_type = upscaled.color();
+                let color_type: ExtendedColorType = upscaled.color().into();
                 encoder
                     .write_image(upscaled.as_bytes(), w, h, color_type)
                     .expect("can't write lossless WebP image");
