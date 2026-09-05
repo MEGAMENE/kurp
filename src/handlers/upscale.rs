@@ -22,7 +22,7 @@ use crate::app_state::AppState;
 use crate::http_compression;
 use crate::http_compression::{Algorithm, compress};
 use crate::models::errors::HttpError;
-use crate::upscaler::upscale_actor::{UpscaleSupervisorActor, UpscaleSupervisorMessage};
+use crate::upscaler::upscale_actor::UpscaleSupervisorMessage;
 
 pub async fn upscale_komga(
     State(state): State<AppState>,
@@ -87,7 +87,7 @@ pub async fn upscale<F, Fut>(
 
 async fn upscale_response(
     response: Response<Body>,
-    upscaler: ActorRef<UpscaleSupervisorActor>,
+    upscaler: ActorRef<UpscaleSupervisorMessage>,
 ) -> Response<Body> {
     let status = response.status();
     let headers = response.headers().clone();

@@ -22,7 +22,7 @@ pub struct UpscaleSupervisorActor;
 
 pub struct SupervisorState {
     config: Option<Arc<AppConfig>>,
-    upscale_actor: Option<ActorRef<UpscaleActor>>,
+    upscale_actor: Option<ActorRef<UpscaleMessage>>,
 }
 
 #[async_trait::async_trait]
@@ -31,11 +31,11 @@ impl Actor for UpscaleSupervisorActor {
     type State = SupervisorState;
     type Arguments = ();
 
-    async fn pre_start(&self, _myself: ActorRef<Self>, _args: Self::Arguments) -> Result<Self::State, ActorProcessingErr> {
+    async fn pre_start(&self, _myself: ActorRef<Self::Msg>, _args: Self::Arguments) -> Result<Self::State, ActorProcessingErr> {
         Ok(SupervisorState { config: None, upscale_actor: None })
     }
 
-    async fn handle(&self, myself: ActorRef<Self>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
+    async fn handle(&self, myself: ActorRef<Self::Msg>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
         match message {
             UpscaleSupervisorMessage::Upscale(image, format, reply_to) => {
                 match &state.upscale_actor {
@@ -48,16 +48,15 @@ impl Actor for UpscaleSupervisorActor {
             }
 
             UpscaleSupervisorMessage::Init(config) => {
-                match &state.upscale_actor {
-                    Some(actor) => actor.stop(None),
-                    None => {}
+                if let Some(actor) = &state.upscale_actor {
+                    actor.stop(None);
                 }
 
                 let (upscale_actor, _) = Actor::spawn_linked(
                     None,
                     UpscaleActor,
                     config.clone(),
-                    myself.into(),
+                    myself.get_cell(),
                 ).await?;
                 state.config = Some(config);
                 state.upscale_actor = Some(upscale_actor);
@@ -74,10 +73,10 @@ impl Actor for UpscaleSupervisorActor {
         Ok(())
     }
 
-    async fn handle_supervisor_evt(&self, myself: ActorRef<Self>, message: SupervisionEvent, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
+    async fn handle_supervisor_evt(&self, myself: ActorRef<Self::Msg>, message: SupervisionEvent, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
         match message {
-            SupervisionEvent::ActorPanicked(_, panic_msg) => {
-                error!("Upscale actor panicked with '{panic_msg}'");
+            SupervisionEvent::ActorFailed(cell, panic_msg) => {
+                error!("Upscale actor {cell:?} panicked with '{panic_msg}'");
                 info!("Restarting Upscale actor");
                 match &state.config {
                     None => { error!("Config is not Initialized") }
@@ -86,7 +85,7 @@ impl Actor for UpscaleSupervisorActor {
                             None,
                             UpscaleActor,
                             config.clone(),
-                            myself.into(),
+                            myself.get_cell(),
                         ).await?;
                         state.upscale_actor = Some(upscale_actor);
                     }
@@ -107,13 +106,13 @@ impl Actor for UpscaleActor {
     type State = Box<dyn Upscaler>;
     type Arguments = Arc<AppConfig>;
 
-    async fn pre_start(&self, _myself: ActorRef<Self>, args: Self::Arguments) -> Result<Self::State, ActorProcessingErr> {
+    async fn pre_start(&self, _myself: ActorRef<Self::Msg>, args: Self::Arguments) -> Result<Self::State, ActorProcessingErr> {
         let upscaler: Box<dyn Upscaler> = Box::new(RealCuganUpscaler::new(args));
 
         Ok(upscaler)
     }
 
-    async fn handle(&self, _myself: ActorRef<Self>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
+    async fn handle(&self, _myself: ActorRef<Self::Msg>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
         match message {
             UpscaleMessage::Upscale(image, format, reply_to) => {
                 let _ = reply_to.send(state.upscale(image, format));
