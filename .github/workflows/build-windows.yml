@@ -177,10 +177,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $shortSha = $env:GITHUB_SHA.Substring(0, 7)
-          $tag = "dev-$shortSha"
-          $title = "Kurp Windows x64 ($shortSha)"
+          $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy.MM.dd-HHmm")
+          $tag = "dev-$buildDate-$shortSha"
+          $title = "Kurp Windows x64 - $buildDate ($shortSha)"
           $notes = @"
           Automated Windows x64 build from commit $env:GITHUB_SHA on branch development.
+          Build date: $((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'"))
 
           Includes bundled Real-CUGAN models and ncnn Vulkan runtime.
           This is a prerelease build.
