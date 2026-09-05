@@ -1,3 +1,4 @@
 [submodule "realcugan-ncnn-vulkan-rs"]
 	path = realcugan-ncnn-vulkan-rs
-	url = https://github.com/Snd-R/realcugan-ncnn-vulkan-rs
+	url = https://github.com/MEGAMENE/realcugan-ncnn-vulkan-rs
+	branch = development
