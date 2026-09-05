@@ -15,11 +15,9 @@ RUN apt-get update && apt-get -y install locales  \
     && ln -s /usr/lib/libncnn.so.1.0.20240102 /usr/lib/libncnn.so.1 \
     && rm -rf ncnn-20240102-ubuntu-2204-shared.zip \
     && rm -rf ncnn.zip \
-    && git clone https://github.com/nihui/waifu2x-ncnn-vulkan \
-    && mv waifu2x-ncnn-vulkan/models . \
     && git clone https://github.com/nihui/realcugan-ncnn-vulkan \
-    && mv realcugan-ncnn-vulkan/models/* ./models \
-    && rm -rf waifu2x-ncnn-vulkan \
+    && mkdir -p ./models \
+    && mv realcugan-ncnn-vulkan/models/* ./models/ \
     && rm -rf realcugan-ncnn-vulkan \
     && apt-get -y remove wget unzip git \
     && apt-get -y autoremove \

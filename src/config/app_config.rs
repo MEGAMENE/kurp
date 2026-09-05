@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use config::{Config, ConfigError, Environment, File};
 use realcugan_ncnn_vulkan_rs::RealCuganModelType;
 use serde_derive::{Deserialize, Serialize};
-use waifu2x_ncnn_vulkan_rs::ModelType;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[allow(unused)]
@@ -17,33 +16,18 @@ pub struct AppConfig {
     pub size_threshold_enabled: bool,
     pub size_threshold: u32,
     pub size_threshold_png: u32,
-    pub upscaler: EnabledUpscaler,
-    pub waifu2x: Waifu2xConfig,
     pub realcugan: RealCuganConfig,
     pub upscale_tag: Option<String>,
     pub allow_config_updates: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
 pub enum Format {
     Png,
     Jpeg,
     WebP,
+    LosslessWebP,
     Original,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum EnabledUpscaler {
-    Waifu2x,
-    Realcugan,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(remote = "ModelType")]
-enum ModelTypeDef {
-    Cunet,
-    Upconv7AnimeStyleArtRgb,
-    Upconv7Photo,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -52,20 +36,6 @@ enum RealCuganModelTypeDef {
     Nose,
     Pro,
     Se,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Waifu2xConfig {
-    pub gpuid: i32,
-    pub scale: u32,
-    pub noise: i32,
-
-    #[serde(with = "ModelTypeDef")]
-    pub model: ModelType,
-    pub tile_size: u32,
-    pub tta_mode: bool,
-    pub num_threads: i32,
-    pub models_path: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -88,16 +58,6 @@ impl AppConfig {
         let config_dir = AppConfig::get_config_directory();
 
         let models_default_dir = config_dir.join("models");
-        let mut waifu2x_config = config::Map::new();
-        waifu2x_config.insert("gpuid".to_string(), "0");
-        waifu2x_config.insert("scale".to_string(), "2");
-        waifu2x_config.insert("noise".to_string(), "-1");
-        waifu2x_config.insert("model".to_string(), "Cunet");
-        waifu2x_config.insert("tile_size".to_string(), "0");
-        waifu2x_config.insert("tta_mode".to_string(), "false");
-        waifu2x_config.insert("num_threads".to_string(), "2");
-        waifu2x_config.insert("models_path".to_string(), models_default_dir.to_str().unwrap());
-
         let mut realcugan_config = config::Map::new();
         realcugan_config.insert("gpuid".to_string(), "0");
         realcugan_config.insert("scale".to_string(), "2");
@@ -108,7 +68,6 @@ impl AppConfig {
         realcugan_config.insert("tta_mode".to_string(), "false");
         realcugan_config.insert("num_threads".to_string(), "2");
         realcugan_config.insert("models_path".to_string(), models_default_dir.to_str().unwrap());
-
 
         let mut config = Config::builder();
         if config_dir.join("config.yml").exists() {
@@ -123,9 +82,7 @@ impl AppConfig {
             .set_default("size_threshold_enabled", "true")?
             .set_default("size_threshold", "500")?
             .set_default("size_threshold_png", "1000")?
-            .set_default("waifu2x", waifu2x_config)?
             .set_default("realcugan", realcugan_config)?
-            .set_default("upscaler", "Waifu2x")?
             .set_default("allow_config_updates", false)?;
 
         config.build()?.try_deserialize()

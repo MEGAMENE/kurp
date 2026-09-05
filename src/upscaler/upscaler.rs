@@ -2,10 +2,10 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use image::{DynamicImage, ImageFormat};
+use image::codecs::webp::WebPEncoder;
+use image::{DynamicImage, ImageEncoder, ImageFormat};
 use log::info;
 use realcugan_ncnn_vulkan_rs::RealCugan;
-use waifu2x_ncnn_vulkan_rs::Waifu2x;
 
 use crate::config::app_config::{AppConfig, Format};
 
@@ -31,23 +31,49 @@ pub trait Upscaler: Send {
 
         let mut reader = image::io::Reader::new(Cursor::new(input.clone()));
         reader.set_format(image_format);
-        let image = reader.decode()
-            .or(image::io::Reader::new(Cursor::new(input))
-                .with_guessed_format().unwrap().decode()
-            ).unwrap();
+        let image = match reader.decode().or_else(|_| {
+            image::io::Reader::new(Cursor::new(input.clone()))
+                .with_guessed_format()
+                .unwrap()
+                .decode()
+        }) {
+            Ok(img) => img,
+            Err(e) => {
+                info!("failed to decode image: {}. Returning original", e);
+                return (input, image_format);
+            }
+        };
 
         let upscaled = self.upscale_image(image);
         let mut buf = Cursor::new(Vec::new());
 
-        let format_to = match config.return_format {
-            Format::Png => { ImageFormat::Png }
-            Format::Jpeg => { ImageFormat::Jpeg }
-            Format::WebP => { ImageFormat::WebP }
-            Format::Original => { image_format }
-        };
-
-        upscaled.write_to(&mut buf, format_to).expect("can't write image");
-        (Bytes::from(buf.into_inner()), format_to)
+        match config.return_format {
+            Format::LosslessWebP => {
+                let encoder = WebPEncoder::new_lossless(&mut buf);
+                let (w, h) = (upscaled.width(), upscaled.height());
+                let color_type = upscaled.color();
+                encoder
+                    .write_image(upscaled.as_bytes(), w, h, color_type)
+                    .expect("can't write lossless WebP image");
+                (Bytes::from(buf.into_inner()), ImageFormat::WebP)
+            }
+            Format::Png => {
+                upscaled.write_to(&mut buf, ImageFormat::Png).expect("can't write image");
+                (Bytes::from(buf.into_inner()), ImageFormat::Png)
+            }
+            Format::Jpeg => {
+                upscaled.write_to(&mut buf, ImageFormat::Jpeg).expect("can't write image");
+                (Bytes::from(buf.into_inner()), ImageFormat::Jpeg)
+            }
+            Format::WebP => {
+                upscaled.write_to(&mut buf, ImageFormat::WebP).expect("can't write image");
+                (Bytes::from(buf.into_inner()), ImageFormat::WebP)
+            }
+            Format::Original => {
+                upscaled.write_to(&mut buf, image_format).expect("can't write image");
+                (Bytes::from(buf.into_inner()), image_format)
+            }
+        }
     }
 
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
@@ -55,38 +81,9 @@ pub trait Upscaler: Send {
     fn get_config(&self) -> UpscalerConfig;
 }
 
-pub struct Waifu2xUpscaler {
-    config: UpscalerConfig,
-    waifu2x: Waifu2x,
-}
-
 pub struct RealCuganUpscaler {
     config: UpscalerConfig,
     realcugan: RealCugan,
-}
-
-impl Waifu2xUpscaler {
-    pub fn new(config: Arc<AppConfig>) -> Self {
-        let waifu2x = Waifu2x::new(
-            config.waifu2x.gpuid,
-            config.waifu2x.noise,
-            config.waifu2x.scale,
-            config.waifu2x.model,
-            config.waifu2x.tile_size,
-            config.waifu2x.tta_mode,
-            config.waifu2x.num_threads,
-            config.waifu2x.models_path.clone(),
-        );
-
-        let upscaler_config = UpscalerConfig {
-            threshold_enabled: config.size_threshold_enabled,
-            threshold: config.size_threshold,
-            threshold_png: config.size_threshold_png,
-            return_format: config.return_format,
-        };
-
-        Self { config: upscaler_config, waifu2x }
-    }
 }
 
 impl RealCuganUpscaler {
@@ -114,17 +111,6 @@ impl RealCuganUpscaler {
             config: upscaler_config,
             realcugan,
         }
-    }
-}
-
-
-impl Upscaler for Waifu2xUpscaler {
-    fn upscale_image(&self, image: DynamicImage) -> DynamicImage {
-        self.waifu2x.proc_image(image)
-    }
-
-    fn get_config(&self) -> UpscalerConfig {
-        self.config
     }
 }
 

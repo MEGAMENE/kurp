@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-waifu2x-ncnn-vulkan-rs = { path = "waifu2x-ncnn-vulkan-rs" }
 realcugan-ncnn-vulkan-rs = { path = "realcugan-ncnn-vulkan-rs" }
 
 hyper = { version = "0.14", features = ["full"] }
