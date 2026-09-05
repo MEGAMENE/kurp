@@ -56,18 +56,7 @@ pub struct RealCuganConfig {
 impl AppConfig {
     pub fn new() -> Result<Self, ConfigError> {
         let config_dir = AppConfig::get_config_directory();
-
         let models_default_dir = config_dir.join("models");
-        let mut realcugan_config = config::Map::new();
-        realcugan_config.insert("gpuid".to_string(), "0");
-        realcugan_config.insert("scale".to_string(), "2");
-        realcugan_config.insert("noise".to_string(), "-1");
-        realcugan_config.insert("model".to_string(), "Se");
-        realcugan_config.insert("tile_size".to_string(), "0");
-        realcugan_config.insert("sync_gap".to_string(), "3");
-        realcugan_config.insert("tta_mode".to_string(), "false");
-        realcugan_config.insert("num_threads".to_string(), "2");
-        realcugan_config.insert("models_path".to_string(), models_default_dir.to_str().unwrap());
 
         let mut config = Config::builder();
         if config_dir.join("config.yml").exists() {
@@ -75,14 +64,22 @@ impl AppConfig {
         }
 
         config = config.add_source(Environment::with_prefix("kurp"))
-            .set_default("port", "3030")?
+            .set_default("port", 3030)?
             .set_default("upstream_url", "http://localhost:8080")?
             .set_default("upscale", true)?
             .set_default("return_format", "WebP")?
-            .set_default("size_threshold_enabled", "true")?
-            .set_default("size_threshold", "500")?
-            .set_default("size_threshold_png", "1000")?
-            .set_default("realcugan", realcugan_config)?
+            .set_default("size_threshold_enabled", true)?
+            .set_default("size_threshold", 500)?
+            .set_default("size_threshold_png", 1000)?
+            .set_default("realcugan.gpuid", 0)?
+            .set_default("realcugan.scale", 2)?
+            .set_default("realcugan.noise", -1)?
+            .set_default("realcugan.model", "Se")?
+            .set_default("realcugan.tile_size", 0)?
+            .set_default("realcugan.sync_gap", 3)?
+            .set_default("realcugan.tta_mode", false)?
+            .set_default("realcugan.num_threads", 2)?
+            .set_default("realcugan.models_path", models_default_dir.to_str().unwrap())?
             .set_default("allow_config_updates", false)?;
 
         config.build()?.try_deserialize()

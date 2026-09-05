@@ -12,7 +12,6 @@ use hyper::Body;
 use hyper::body::to_bytes;
 use image::ImageFormat;
 use log::info;
-use moka::future::Cache;
 use once_cell::sync::Lazy;
 use ractor::{ActorRef, call};
 use regex::Regex;
