@@ -70,8 +70,12 @@ pub trait Upscaler: Send {
                 (Bytes::from(buf.into_inner()), ImageFormat::WebP)
             }
             Format::Original => {
-                upscaled.write_to(&mut buf, image_format).expect("can't write image");
-                (Bytes::from(buf.into_inner()), image_format)
+                let target_format = match image_format {
+                    ImageFormat::Avif => ImageFormat::WebP,
+                    other => other,
+                };
+                upscaled.write_to(&mut buf, target_format).expect("can't write image");
+                (Bytes::from(buf.into_inner()), target_format)
             }
         }
     }

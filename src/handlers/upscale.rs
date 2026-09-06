@@ -97,6 +97,7 @@ async fn upscale_response(
         "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
         "image/webp" => ImageFormat::WebP,
         "image/gif" => ImageFormat::Gif,
+        "image/avif" => ImageFormat::Avif,
         _ => ImageFormat::from_extension(content_type.trim_start_matches("image/"))
             .unwrap_or(ImageFormat::Png),
     };
@@ -139,6 +140,7 @@ fn to_response(
         ImageFormat::Png => { Some(("image/png", "png")) }
         ImageFormat::Jpeg => { Some(("image/jpeg", "jpeg")) }
         ImageFormat::WebP => { Some(("image/webp", "webp")) }
+        ImageFormat::Avif => { Some(("image/avif", "avif")) }
         _ => { None }
     };
     let mut builder = Response::builder();
