@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use image::codecs::webp::WebPEncoder;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
-use log::info;
+use log::{error, info};
 use realcugan_ncnn_vulkan_rs::RealCugan;
 
 use crate::config::app_config::{AppConfig, Format};
@@ -116,7 +116,13 @@ impl RealCuganUpscaler {
 
 impl Upscaler for RealCuganUpscaler {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage {
-        self.realcugan.proc_image(image)
+        match self.realcugan.proc_image(image.clone()) {
+            Ok(upscaled) => upscaled,
+            Err(e) => {
+                error!("Real-CUGAN upscale error: {}. Falling back to original image.", e);
+                image
+            }
+        }
     }
 
     fn get_config(&self) -> UpscalerConfig {
