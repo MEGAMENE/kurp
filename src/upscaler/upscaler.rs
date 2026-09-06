@@ -5,7 +5,7 @@ use bytes::Bytes;
 use image::codecs::webp::WebPEncoder;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
 use log::{error, info};
-use realcugan_ncnn_vulkan_rs::RealCugan;
+use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganError};
 
 use crate::config::app_config::{AppConfig, Format};
 
@@ -87,7 +87,7 @@ pub struct RealCuganUpscaler {
 }
 
 impl RealCuganUpscaler {
-    pub fn new(config: Arc<AppConfig>) -> Self {
+    pub fn new(config: Arc<AppConfig>) -> Result<Self, RealCuganError> {
         let realcugan = RealCugan::new(
             config.realcugan.gpuid,
             config.realcugan.noise,
@@ -98,7 +98,7 @@ impl RealCuganUpscaler {
             config.realcugan.tta_mode,
             config.realcugan.num_threads,
             config.realcugan.models_path.clone(),
-        );
+        )?;
 
         let upscaler_config = UpscalerConfig {
             threshold_enabled: config.size_threshold_enabled,
@@ -107,16 +107,16 @@ impl RealCuganUpscaler {
             return_format: config.return_format,
         };
 
-        Self {
+        Ok(Self {
             config: upscaler_config,
             realcugan,
-        }
+        })
     }
 }
 
 impl Upscaler for RealCuganUpscaler {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage {
-        match self.realcugan.proc_image(image.clone()) {
+        match self.realcugan.proc_image(&image) {
             Ok(upscaled) => upscaled,
             Err(e) => {
                 error!("Real-CUGAN upscale error: {}. Falling back to original image.", e);

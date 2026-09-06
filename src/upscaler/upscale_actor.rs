@@ -105,9 +105,9 @@ impl Actor for UpscaleActor {
     type Arguments = Arc<AppConfig>;
 
     async fn pre_start(&self, _myself: ActorRef<Self::Msg>, args: Self::Arguments) -> Result<Self::State, ActorProcessingErr> {
-        let upscaler: Box<dyn Upscaler> = Box::new(RealCuganUpscaler::new(args));
+        let upscaler = RealCuganUpscaler::new(args)?;
 
-        Ok(upscaler)
+        Ok(Box::new(upscaler))
     }
 
     async fn handle(&self, _myself: ActorRef<Self::Msg>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {

@@ -31,6 +31,7 @@ mod server;
 async fn main() {
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
+        .filter_module("ractor", LevelFilter::Warn)
         .parse_default_env()
         .init();
 
