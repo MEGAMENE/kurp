@@ -63,26 +63,37 @@ jobs:
 
       - name: Download prebuilt ncnn
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $headers = @{
             'User-Agent' = 'MEGAMENE-kurp-GitHub-Actions'
             'Accept' = 'application/vnd.github+json'
+            'Authorization' = "Bearer $env:GH_TOKEN"
           }
 
-          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' -Headers $headers
-          $ncnnAsset = $release.assets | Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } | Select-Object -First 1
-
-          if (-not $ncnnAsset) {
-            Write-Host 'Available NCNN Windows assets:'
-            $release.assets | Where-Object { $_.name -match '(?i)windows' } | ForEach-Object { Write-Host " - $($_.name)" }
-            throw 'Could not find the NCNN Windows VS2022 shared package.'
+          $downloadUrl = $null
+          try {
+            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' -Headers $headers
+            $ncnnAsset = $release.assets | Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } | Select-Object -First 1
+            if ($ncnnAsset) {
+              $downloadUrl = $ncnnAsset.browser_download_url
+            }
+          } catch {
+            Write-Host "Warning: GitHub API query failed: $_"
           }
 
+          if (-not $downloadUrl) {
+            Write-Host "Falling back to official NCNN 20260526 release asset URL..."
+            $downloadUrl = 'https://github.com/Tencent/ncnn/releases/download/20260526/ncnn-20260526-windows-vs2022-shared.zip'
+          }
+
+          Write-Host "Downloading NCNN package from: $downloadUrl"
           $zipPath = Join-Path $env:RUNNER_TEMP 'ncnn-windows.zip'
           $ncnnPath = Join-Path $env:RUNNER_TEMP 'ncnn'
           Remove-Item $ncnnPath -Recurse -Force -ErrorAction SilentlyContinue
-          Invoke-WebRequest -Uri $ncnnAsset.browser_download_url -Headers $headers -OutFile $zipPath
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath $ncnnPath -Force
 
           $configs = Get-ChildItem $ncnnPath -Recurse -Filter 'ncnnConfig.cmake'
