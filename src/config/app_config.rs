@@ -27,7 +27,6 @@ pub struct AppConfig {
 pub enum Format {
     Png,
     Jpeg,
-    #[serde(alias = "LosslessWebP")]
     WebP,
     Original,
 }

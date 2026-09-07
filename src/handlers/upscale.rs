@@ -53,13 +53,6 @@ pub async fn upscale_kavita(
     upscale(state, req, || async { Ok(true) }).await
 }
 
-pub async fn upscale_suwayomi(
-    State(state): State<AppState>,
-    req: Request,
-) -> Result<Response, StatusCode> {
-    upscale(state, req, || async { Ok(true) }).await
-}
-
 pub async fn upscale<F, Fut>(
     state: AppState,
     request: Request,

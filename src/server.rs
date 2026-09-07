@@ -12,7 +12,7 @@ use crate::app_state::AppState;
 use crate::handlers::config::{get_config, update_config};
 use crate::handlers::komga::{check_tags_on_book_metadata_update, check_tags_on_series_metadata_update};
 use crate::handlers::proxy::{kavita_ws_proxy_handler, proxy_handler};
-use crate::handlers::upscale::{upscale_kavita, upscale_komga, upscale_suwayomi};
+use crate::handlers::upscale::{upscale_kavita, upscale_komga};
 
 pub async fn start(state: AppState, mut shutdown_rx: Receiver<()>) {
     let config = state.config.clone();
@@ -39,7 +39,6 @@ fn make_routes(state: AppState) -> Router {
 
     let mut routes = Router::new()
         .route("/api/v1/books/{book_id}/pages/{page_number}", get(upscale_komga))
-        .route("/api/v1/manga/{manga_id}/chapter/{chapter_id}/page/{page_index}", get(upscale_suwayomi))
         .route("/api/reader/image", get(upscale_kavita))
         .route("/hubs/messages", get(kavita_ws_proxy_handler))
         .route("/", any(proxy_handler))
