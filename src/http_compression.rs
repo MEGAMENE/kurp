@@ -53,6 +53,7 @@ pub async fn compress(bytes: Bytes, algorithm: Algorithm) -> Result<Bytes> {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     Brotli,
     Gzip,
