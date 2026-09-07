@@ -56,7 +56,8 @@ pub struct RealCuganConfig {
 
 impl AppConfig {
     pub fn new() -> Result<Self, ConfigError> {
-        let config_dir = AppConfig::get_config_directory();
+        let config_dir = AppConfig::get_config_directory()
+            .map_err(|e| ConfigError::Message(e.to_string()))?;
         let models_default_dir = config_dir.join("models");
 
         let mut config = Config::builder();
