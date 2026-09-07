@@ -56,6 +56,7 @@ impl ProxyClient {
                 Ascii::new("Trailers"),
                 Ascii::new("Transfer-Encoding"),
                 Ascii::new("Upgrade"),
+                Ascii::new("Host"),
             ]
         });
 

@@ -16,6 +16,8 @@ pub struct UpscalerConfig {
     threshold_enabled: bool,
     threshold: u32,
     threshold_png: u32,
+    max_upscale_dimension: u32,
+    jpeg_quality: u8,
     return_format: Format,
 }
 
@@ -23,6 +25,7 @@ fn encode_image(
     image: &DynamicImage,
     target_format: ImageFormat,
     icc_profile: Option<&[u8]>,
+    jpeg_quality: u8,
 ) -> Bytes {
     let mut buf = Cursor::new(Vec::new());
     match target_format {
@@ -40,7 +43,11 @@ fn encode_image(
                 .expect("can't write lossless WebP image");
         }
         ImageFormat::Png => {
-            let mut encoder = PngEncoder::new(&mut buf);
+            let mut encoder = PngEncoder::new_with_quality(
+                &mut buf,
+                image::codecs::png::CompressionType::Fast,
+                image::codecs::png::FilterType::Adaptive,
+            );
             if let Some(icc) = icc_profile {
                 if let Err(e) = encoder.set_icc_profile(icc.to_vec()) {
                     error!("failed to set ICC profile on PNG encoder: {}", e);
@@ -53,7 +60,7 @@ fn encode_image(
                 .expect("can't write PNG image");
         }
         ImageFormat::Jpeg => {
-            let mut encoder = JpegEncoder::new(&mut buf);
+            let mut encoder = JpegEncoder::new_with_quality(&mut buf, jpeg_quality);
             if let Some(icc) = icc_profile {
                 if let Err(e) = encoder.set_icc_profile(icc.to_vec()) {
                     error!("failed to set ICC profile on JPEG encoder: {}", e);
@@ -132,6 +139,16 @@ pub trait Upscaler: Send {
             }
         };
 
+        let (dim_w, dim_h) = decoder.dimensions();
+        if config.max_upscale_dimension > 0 && (dim_w > config.max_upscale_dimension || dim_h > config.max_upscale_dimension) {
+            info!(
+                "image dimensions ({}x{}) exceed max_upscale_dimension ({}). Returning original without upscaling",
+                dim_w, dim_h, config.max_upscale_dimension
+            );
+            return (input, image_format);
+        }
+
+        let orientation = decoder.orientation().ok();
         let icc_profile = decoder.icc_profile().ok().flatten().or_else(|| {
             avif_color_info.as_ref().and_then(|info| info.icc_profile.clone())
         });
@@ -147,24 +164,28 @@ pub trait Upscaler: Send {
             }
         };
 
+        if let Some(orientation) = orientation {
+            image.apply_orientation(orientation);
+        }
+
         let upscaled = self.upscale_image(image);
 
         let (output_bytes, final_format) = match config.return_format {
-            Format::LosslessWebP | Format::WebP => {
-                (encode_image(&upscaled, ImageFormat::WebP, icc_profile.as_deref()), ImageFormat::WebP)
+            Format::WebP => {
+                (encode_image(&upscaled, ImageFormat::WebP, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::WebP)
             }
             Format::Png => {
-                (encode_image(&upscaled, ImageFormat::Png, icc_profile.as_deref()), ImageFormat::Png)
+                (encode_image(&upscaled, ImageFormat::Png, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Png)
             }
             Format::Jpeg => {
-                (encode_image(&upscaled, ImageFormat::Jpeg, icc_profile.as_deref()), ImageFormat::Jpeg)
+                (encode_image(&upscaled, ImageFormat::Jpeg, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Jpeg)
             }
             Format::Original => {
                 let target_format = match image_format {
                     ImageFormat::Avif => ImageFormat::WebP,
                     other => other,
                 };
-                (encode_image(&upscaled, target_format, icc_profile.as_deref()), target_format)
+                (encode_image(&upscaled, target_format, icc_profile.as_deref(), config.jpeg_quality), target_format)
             }
         };
 
@@ -199,6 +220,8 @@ impl RealCuganUpscaler {
             threshold_enabled: config.size_threshold_enabled,
             threshold: config.size_threshold,
             threshold_png: config.size_threshold_png,
+            max_upscale_dimension: config.max_upscale_dimension,
+            jpeg_quality: config.jpeg_quality,
             return_format: config.return_format,
         };
 

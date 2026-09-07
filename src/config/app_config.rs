@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub size_threshold_enabled: bool,
     pub size_threshold: u32,
     pub size_threshold_png: u32,
+    pub max_upscale_dimension: u32,
+    pub jpeg_quality: u8,
     pub realcugan: RealCuganConfig,
     pub upscale_tag: Option<String>,
     pub allow_config_updates: bool,
@@ -25,8 +27,8 @@ pub struct AppConfig {
 pub enum Format {
     Png,
     Jpeg,
+    #[serde(alias = "LosslessWebP")]
     WebP,
-    LosslessWebP,
     Original,
 }
 
@@ -71,6 +73,8 @@ impl AppConfig {
             .set_default("size_threshold_enabled", true)?
             .set_default("size_threshold", 500)?
             .set_default("size_threshold_png", 1000)?
+            .set_default("max_upscale_dimension", 4000)?
+            .set_default("jpeg_quality", 90)?
             .set_default("realcugan.gpuid", 0)?
             .set_default("realcugan.scale", 2)?
             .set_default("realcugan.noise", -1)?

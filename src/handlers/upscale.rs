@@ -53,6 +53,13 @@ pub async fn upscale_kavita(
     upscale(state, req, || async { Ok(true) }).await
 }
 
+pub async fn upscale_suwayomi(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Response, StatusCode> {
+    upscale(state, req, || async { Ok(true) }).await
+}
+
 pub async fn upscale<F, Fut>(
     state: AppState,
     request: Request,
@@ -103,28 +110,46 @@ async fn upscale_response(
     };
 
     let encoding = headers.get("content-encoding");
-    let response_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-
-    let decompressed = encoding
-        .map(unwrap_encoding_header)
-        .map(|algo| http_compression::decompress(response_bytes.clone(), algo));
-
-    let to_upscale = match decompressed {
-        None => response_bytes,
-        Some(decompressed) => decompressed.await.unwrap()
+    let response_bytes = match to_bytes(response.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("failed to read response body: {}", e);
+            return Response::builder().status(status).body(Body::empty()).unwrap();
+        }
     };
 
-    let (upscaled, format) =
-        call!(upscaler, UpscaleSupervisorMessage::Upscale, to_upscale, image_format).unwrap();
+    let algo = encoding.and_then(parse_encoding_header);
 
-    let body_to_compress = upscaled.clone();
-    let compressed = encoding
-        .map(unwrap_encoding_header)
-        .map(|algo| compress(body_to_compress, algo));
+    let to_upscale = if let Some(a) = algo {
+        match http_compression::decompress(response_bytes.clone(), a).await {
+            Ok(dec) => dec,
+            Err(e) => {
+                log::error!("Failed to decompress image body: {}. Returning original response.", e);
+                return to_response(status, response_bytes, &headers, image_format);
+            }
+        }
+    } else {
+        response_bytes.clone()
+    };
 
-    let response_body = match compressed {
-        None => upscaled,
-        Some(compressed) => compressed.await.unwrap()
+    let (upscaled, format) = match call!(upscaler, UpscaleSupervisorMessage::Upscale, to_upscale, image_format) {
+        Ok(res) => res,
+        Err(e) => {
+            log::error!("Upscale actor call failed: {}. Returning original response.", e);
+            return to_response(status, response_bytes, &headers, image_format);
+        }
+    };
+
+    let response_body = if let Some(a) = algo {
+        match compress(upscaled.clone(), a).await {
+            Ok(comp) => comp,
+            Err(e) => {
+                log::error!("Failed to recompress upscaled image: {}. Returning uncompressed.", e);
+                upscaled
+            }
+        }
+    } else {
+        upscaled
     };
 
     to_response(status, response_body, &headers, format)
@@ -150,14 +175,18 @@ fn to_response(
         } else if Ascii::new("Content-Type") == k && mime_type.is_some() {
             builder = builder.header("Content-Type", mime_type.unwrap().0)
         } else if Ascii::new("Content-Disposition") == k && mime_type.is_some() {
-            let new_value: String = v.to_str().unwrap().split("; ")
-                .map(|param| if param.starts_with("filename=") {
-                    with_new_file_extension(param, mime_type.unwrap().1)
-                } else if param.starts_with("filename*=") {
-                    with_new_file_extension(param, mime_type.unwrap().1)
-                } else { param.to_string() })
-                .collect::<Vec<String>>().join("; ");
-            builder = builder.header("Content-Disposition", new_value)
+            if let Ok(val_str) = v.to_str() {
+                let new_value: String = val_str.split("; ")
+                    .map(|param| if param.starts_with("filename=") || param.starts_with("filename*=") {
+                        with_new_file_extension(param, mime_type.unwrap().1)
+                    } else {
+                        param.to_string()
+                    })
+                    .collect::<Vec<String>>().join("; ");
+                builder = builder.header("Content-Disposition", new_value);
+            } else {
+                builder = builder.header(k, v);
+            }
         } else {
             builder = builder.header(k, v);
         }
@@ -168,23 +197,36 @@ fn to_response(
         .unwrap()
 }
 
+static FILENAME_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(filename\*=UTF-8''|filename=)(.+)").unwrap()
+});
+
 fn with_new_file_extension(name: &str, extension: &str) -> String {
-    let regex = Regex::new(r"(filename\*=UTF-8''|filename=)(.+\b)").unwrap();
-    let captures = regex.captures(name).unwrap();
-    let param_name = captures.get(1).unwrap().as_str();
-    let filename = captures.get(2).unwrap().as_str();
-    let new_filename = Path::new(filename).with_extension(extension)
-        .into_os_string().into_string().unwrap();
-    format!("{}{}", param_name, new_filename)
+    if let Some(captures) = FILENAME_REGEX.captures(name) {
+        let param_name = captures.get(1).map(|m| m.as_str()).unwrap_or("filename=");
+        let raw_filename = captures.get(2).map(|m| m.as_str()).unwrap_or("");
+        let trimmed = raw_filename.trim().trim_matches('"');
+        let new_filename = Path::new(trimmed)
+            .with_extension(extension)
+            .to_string_lossy()
+            .to_string();
+        if raw_filename.starts_with('"') && raw_filename.ends_with('"') {
+            format!("{}\"{}\"", param_name, new_filename)
+        } else {
+            format!("{}{}", param_name, new_filename)
+        }
+    } else {
+        name.to_string()
+    }
 }
 
-fn unwrap_encoding_header(encoding: &HeaderValue) -> Algorithm {
-    let encoding = encoding.to_str().unwrap();
-    match encoding {
-        "gzip" => Algorithm::Gzip,
-        "deflate" => Algorithm::Deflate,
-        "br" => Algorithm::Brotli,
-        _ => panic!("unsupported compression algorithm")
+fn parse_encoding_header(encoding: &HeaderValue) -> Option<Algorithm> {
+    let encoding = encoding.to_str().ok()?;
+    match encoding.trim().to_lowercase().as_str() {
+        "gzip" => Some(Algorithm::Gzip),
+        "deflate" => Some(Algorithm::Deflate),
+        "br" => Some(Algorithm::Brotli),
+        _ => None,
     }
 }
 

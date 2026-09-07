@@ -45,7 +45,9 @@ async fn handle_socket(
 
     let mut incoming_send_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = incoming_receiver.next().await {
-            upstream_sender.send(to_tungstenite(msg)).await.unwrap();
+            if upstream_sender.send(to_tungstenite(msg)).await.is_err() {
+                break;
+            }
         }
     });
 
@@ -53,10 +55,12 @@ async fn handle_socket(
         while let Some(Ok(msg)) = upstream_receiver.next().await {
             let axum_message = match from_tungstenite(msg) {
                 Some(msg) => msg,
-                None => continue
+                None => continue,
             };
 
-            incoming_sender.send(axum_message).await.unwrap();
+            if incoming_sender.send(axum_message).await.is_err() {
+                break;
+            }
         }
     });
 

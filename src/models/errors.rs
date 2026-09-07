@@ -23,3 +23,12 @@ impl Display for UpscaleError {
 impl Display for ProxyError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result { write!(f, "{}", self.message) }
 }
+
+impl Display for HttpError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result { write!(f, "{}", self.message) }
+}
+
+impl std::error::Error for UpscaleError {}
+impl std::error::Error for ProxyError {}
+impl std::error::Error for HttpError {}
+
