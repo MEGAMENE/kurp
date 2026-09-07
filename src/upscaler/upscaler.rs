@@ -2,8 +2,10 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
-use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
+use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use log::{error, info};
 use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganError};
 
@@ -15,6 +17,73 @@ pub struct UpscalerConfig {
     threshold: u32,
     threshold_png: u32,
     return_format: Format,
+}
+
+fn encode_image(
+    image: &DynamicImage,
+    target_format: ImageFormat,
+    icc_profile: Option<&[u8]>,
+) -> Bytes {
+    let mut buf = Cursor::new(Vec::new());
+    match target_format {
+        ImageFormat::WebP => {
+            let mut encoder = WebPEncoder::new_lossless(&mut buf);
+            if let Some(icc) = icc_profile {
+                if let Err(e) = encoder.set_icc_profile(icc.to_vec()) {
+                    error!("failed to set ICC profile on WebP encoder: {}", e);
+                }
+            }
+            let (w, h) = (image.width(), image.height());
+            let color_type: ExtendedColorType = image.color().into();
+            encoder
+                .write_image(image.as_bytes(), w, h, color_type)
+                .expect("can't write lossless WebP image");
+        }
+        ImageFormat::Png => {
+            let mut encoder = PngEncoder::new(&mut buf);
+            if let Some(icc) = icc_profile {
+                if let Err(e) = encoder.set_icc_profile(icc.to_vec()) {
+                    error!("failed to set ICC profile on PNG encoder: {}", e);
+                }
+            }
+            let (w, h) = (image.width(), image.height());
+            let color_type: ExtendedColorType = image.color().into();
+            encoder
+                .write_image(image.as_bytes(), w, h, color_type)
+                .expect("can't write PNG image");
+        }
+        ImageFormat::Jpeg => {
+            let mut encoder = JpegEncoder::new(&mut buf);
+            if let Some(icc) = icc_profile {
+                if let Err(e) = encoder.set_icc_profile(icc.to_vec()) {
+                    error!("failed to set ICC profile on JPEG encoder: {}", e);
+                }
+            }
+            let (w, h) = (image.width(), image.height());
+            match image {
+                DynamicImage::ImageRgb8(ref rgb) => {
+                    encoder
+                        .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
+                        .expect("can't write JPEG image");
+                }
+                DynamicImage::ImageLuma8(ref luma) => {
+                    encoder
+                        .write_image(luma.as_raw(), w, h, ExtendedColorType::L8)
+                        .expect("can't write JPEG image");
+                }
+                _ => {
+                    let rgb = image.to_rgb8();
+                    encoder
+                        .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
+                        .expect("can't write JPEG image");
+                }
+            }
+        }
+        other => {
+            image.write_to(&mut buf, other).expect("can't write image");
+        }
+    }
+    Bytes::from(buf.into_inner())
 }
 
 pub trait Upscaler: Send {
@@ -29,14 +98,37 @@ pub trait Upscaler: Send {
             }
         }
 
-        let mut reader = ImageReader::new(Cursor::new(input.clone()));
-        reader.set_format(image_format);
-        let image = match reader.decode().or_else(|_| {
-            ImageReader::new(Cursor::new(input.clone()))
-                .with_guessed_format()
-                .unwrap()
-                .decode()
-        }) {
+        let mut reader = match ImageReader::new(Cursor::new(input.clone())).with_guessed_format() {
+            Ok(r) => r,
+            Err(e) => {
+                info!("failed to guess format: {}. Returning original", e);
+                return (input, image_format);
+            }
+        };
+        if reader.format().is_none() {
+            reader.set_format(image_format);
+        }
+        let mut decoder = match reader.into_decoder() {
+            Ok(d) => d,
+            Err(_) => {
+                let mut fallback_reader = ImageReader::new(Cursor::new(input.clone()));
+                fallback_reader.set_format(image_format);
+                match fallback_reader.into_decoder() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        info!("failed to create decoder for image: {}. Returning original", e);
+                        return (input, image_format);
+                    }
+                }
+            }
+        };
+
+        let icc_profile = decoder.icc_profile().ok().flatten();
+        if let Some(ref icc) = icc_profile {
+            info!("detected embedded ICC color profile ({} bytes), preserving in output", icc.len());
+        }
+
+        let image = match DynamicImage::from_decoder(decoder) {
             Ok(img) => img,
             Err(e) => {
                 info!("failed to decode image: {}. Returning original", e);
@@ -45,39 +137,27 @@ pub trait Upscaler: Send {
         };
 
         let upscaled = self.upscale_image(image);
-        let mut buf = Cursor::new(Vec::new());
 
-        match config.return_format {
-            Format::LosslessWebP => {
-                let encoder = WebPEncoder::new_lossless(&mut buf);
-                let (w, h) = (upscaled.width(), upscaled.height());
-                let color_type: ExtendedColorType = upscaled.color().into();
-                encoder
-                    .write_image(upscaled.as_bytes(), w, h, color_type)
-                    .expect("can't write lossless WebP image");
-                (Bytes::from(buf.into_inner()), ImageFormat::WebP)
+        let (output_bytes, final_format) = match config.return_format {
+            Format::LosslessWebP | Format::WebP => {
+                (encode_image(&upscaled, ImageFormat::WebP, icc_profile.as_deref()), ImageFormat::WebP)
             }
             Format::Png => {
-                upscaled.write_to(&mut buf, ImageFormat::Png).expect("can't write image");
-                (Bytes::from(buf.into_inner()), ImageFormat::Png)
+                (encode_image(&upscaled, ImageFormat::Png, icc_profile.as_deref()), ImageFormat::Png)
             }
             Format::Jpeg => {
-                upscaled.write_to(&mut buf, ImageFormat::Jpeg).expect("can't write image");
-                (Bytes::from(buf.into_inner()), ImageFormat::Jpeg)
-            }
-            Format::WebP => {
-                upscaled.write_to(&mut buf, ImageFormat::WebP).expect("can't write image");
-                (Bytes::from(buf.into_inner()), ImageFormat::WebP)
+                (encode_image(&upscaled, ImageFormat::Jpeg, icc_profile.as_deref()), ImageFormat::Jpeg)
             }
             Format::Original => {
                 let target_format = match image_format {
                     ImageFormat::Avif => ImageFormat::WebP,
                     other => other,
                 };
-                upscaled.write_to(&mut buf, target_format).expect("can't write image");
-                (Bytes::from(buf.into_inner()), target_format)
+                (encode_image(&upscaled, target_format, icc_profile.as_deref()), target_format)
             }
-        }
+        };
+
+        (output_bytes, final_format)
     }
 
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
