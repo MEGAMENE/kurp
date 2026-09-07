@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "kurp"
 version = "0.1.0"
 edition = "2021"
@@ -37,4 +37,4 @@ sync_wrapper = { version = "1.0", features = ["futures"] }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-strip = true
+strip = true
