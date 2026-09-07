@@ -108,6 +108,15 @@ pub trait Upscaler: Send {
         if reader.format().is_none() {
             reader.set_format(image_format);
         }
+        let detected_format = reader.format().unwrap_or(image_format);
+
+        let is_avif = detected_format == ImageFormat::Avif || image_format == ImageFormat::Avif;
+        let avif_color_info = if is_avif {
+            crate::upscaler::avif::parse_avif_color_info(&input)
+        } else {
+            None
+        };
+
         let mut decoder = match reader.into_decoder() {
             Ok(d) => d,
             Err(_) => {
@@ -123,18 +132,27 @@ pub trait Upscaler: Send {
             }
         };
 
-        let icc_profile = decoder.icc_profile().ok().flatten();
+        let icc_profile = decoder.icc_profile().ok().flatten().or_else(|| {
+            avif_color_info.as_ref().and_then(|info| info.icc_profile.clone())
+        });
         if let Some(ref icc) = icc_profile {
-            info!("detected embedded ICC color profile ({} bytes), preserving in output", icc.len());
+            info!("detected embedded/synthesized ICC color profile ({} bytes), preserving in output", icc.len());
         }
 
-        let image = match DynamicImage::from_decoder(decoder) {
+        let mut image = match DynamicImage::from_decoder(decoder) {
             Ok(img) => img,
             Err(e) => {
                 info!("failed to decode image: {}. Returning original", e);
                 return (input, image_format);
             }
         };
+
+        if let Some(ref info) = avif_color_info {
+            if info.should_correct_matrix() {
+                info!("applying BT.601 matrix correction for AVIF image (fixing SMPTE 170M bug)");
+                crate::upscaler::avif::correct_avif_matrix(&mut image);
+            }
+        }
 
         let upscaled = self.upscale_image(image);
 
