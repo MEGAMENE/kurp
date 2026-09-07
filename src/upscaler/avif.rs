@@ -1,4 +1,3 @@
-﻿use image::DynamicImage;
 
 /// Standard compact Display P3 ICC v2 profile (456 bytes)
 pub const DISPLAY_P3_ICC: &[u8] = &[
@@ -20,12 +19,6 @@ pub struct AvifColorInfo {
 }
 
 impl AvifColorInfo {
-    pub fn should_correct_matrix(&self) -> bool {
-        // Matrix 6 is ST 170M (standard BT.601 NTSC).
-        // image crate 0.25 maps ST170M to Smpte240 with inverted kr/kb coefficients,
-        // causing a +30.2% red chroma factor error and green channel distortion.
-        self.matrix == Some(6)
-    }
 }
 
 /// Parses an ISOBMFF/AVIF byte buffer to extract color metadata from the `colr` box.
@@ -123,88 +116,5 @@ fn scan_boxes(
         }
 
         pos = box_end;
-    }
-}
-
-/// Applies linear matrix correction to fix image crate 0.25's SMPTE 170M bug.
-///
-/// In image crate 0.25 (codecs/avif/decoder.rs & yuv.rs), MatrixCoefficients::ST170M
-/// is mapped to Smpte240 with inverted kr/kb coefficients (kr=0.087, kb=0.212).
-///
-/// The correction matrix T = M_bt601 * M_buggy^-1:
-///   R' =  0.788000 * R + 0.162773 * G + 0.049227 * B
-///   G' = -0.251071 * R + 1.128227 * G + 0.122844 * B
-///   B' = -0.010820 * R - 0.087180 * G + 1.098000 * B
-///
-/// Each row sums exactly to 1.0, preserving neutral grays (R=G=B) with zero shift.
-#[inline(always)]
-fn correct_rgb(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-    let rf = r as f32;
-    let gf = g as f32;
-    let bf = b as f32;
-
-    let r_out = 0.788000 * rf + 0.162773 * gf + 0.049227 * bf;
-    let g_out = -0.251071 * rf + 1.128227 * gf + 0.122844 * bf;
-    let b_out = -0.010820 * rf - 0.087180 * gf + 1.098000 * bf;
-
-    (
-        r_out.clamp(0.0, 255.0).round() as u8,
-        g_out.clamp(0.0, 255.0).round() as u8,
-        b_out.clamp(0.0, 255.0).round() as u8,
-    )
-}
-
-#[inline(always)]
-fn correct_rgb16(r: u16, g: u16, b: u16) -> (u16, u16, u16) {
-    let rf = r as f32;
-    let gf = g as f32;
-    let bf = b as f32;
-
-    let r_out = 0.788000 * rf + 0.162773 * gf + 0.049227 * bf;
-    let g_out = -0.251071 * rf + 1.128227 * gf + 0.122844 * bf;
-    let b_out = -0.010820 * rf - 0.087180 * gf + 1.098000 * bf;
-
-    (
-        r_out.clamp(0.0, 65535.0).round() as u16,
-        g_out.clamp(0.0, 65535.0).round() as u16,
-        b_out.clamp(0.0, 65535.0).round() as u16,
-    )
-}
-
-pub fn correct_avif_matrix(image: &mut DynamicImage) {
-    match image {
-        DynamicImage::ImageRgb8(img) => {
-            for pixel in img.pixels_mut() {
-                let (r, g, b) = correct_rgb(pixel[0], pixel[1], pixel[2]);
-                pixel[0] = r;
-                pixel[1] = g;
-                pixel[2] = b;
-            }
-        }
-        DynamicImage::ImageRgba8(img) => {
-            for pixel in img.pixels_mut() {
-                let (r, g, b) = correct_rgb(pixel[0], pixel[1], pixel[2]);
-                pixel[0] = r;
-                pixel[1] = g;
-                pixel[2] = b;
-            }
-        }
-        DynamicImage::ImageRgb16(img) => {
-            for pixel in img.pixels_mut() {
-                let (r, g, b) = correct_rgb16(pixel[0], pixel[1], pixel[2]);
-                pixel[0] = r;
-                pixel[1] = g;
-                pixel[2] = b;
-            }
-        }
-        DynamicImage::ImageRgba16(img) => {
-            for pixel in img.pixels_mut() {
-                let (r, g, b) = correct_rgb16(pixel[0], pixel[1], pixel[2]);
-                pixel[0] = r;
-                pixel[1] = g;
-                pixel[2] = b;
-            }
-        }
-        _ => {}
     }
 }

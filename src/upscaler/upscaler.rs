@@ -147,13 +147,6 @@ pub trait Upscaler: Send {
             }
         };
 
-        if let Some(ref info) = avif_color_info {
-            if info.should_correct_matrix() {
-                info!("applying BT.601 matrix correction for AVIF image (fixing SMPTE 170M bug)");
-                crate::upscaler::avif::correct_avif_matrix(&mut image);
-            }
-        }
-
         let upscaled = self.upscale_image(image);
 
         let (output_bytes, final_format) = match config.return_format {
