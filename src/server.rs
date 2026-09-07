@@ -11,8 +11,8 @@ use tokio::time::sleep;
 use crate::app_state::AppState;
 use crate::handlers::config::{get_config, update_config};
 use crate::handlers::komga::{check_tags_on_book_metadata_update, check_tags_on_series_metadata_update};
-use crate::handlers::proxy::{kavita_ws_proxy_handler, proxy_handler};
-use crate::handlers::upscale::{upscale_kavita, upscale_komga};
+use crate::handlers::proxy::proxy_handler;
+use crate::handlers::upscale::upscale_komga;
 
 pub async fn start(state: AppState, mut shutdown_rx: Receiver<()>) {
     let config = state.config.clone();
@@ -39,8 +39,6 @@ fn make_routes(state: AppState) -> Router {
 
     let mut routes = Router::new()
         .route("/api/v1/books/{book_id}/pages/{page_number}", get(upscale_komga))
-        .route("/api/reader/image", get(upscale_kavita))
-        .route("/hubs/messages", get(kavita_ws_proxy_handler))
         .route("/", any(proxy_handler))
         .route("/{*any}", any(proxy_handler));
 

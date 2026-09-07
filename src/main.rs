@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use axum::http::Uri;
 use log::LevelFilter;
 use moka::future::Cache;
@@ -8,10 +9,8 @@ use reqwest::redirect::Policy;
 use tokio::sync::broadcast;
 
 use crate::app_state::AppState;
-use crate::clients::kavita_client::KavitaClient;
 use crate::clients::komga_client::KomgaClient;
 use crate::clients::proxy_client::ProxyClient;
-use crate::clients::websocket_proxy_client::WebsocketProxyClient;
 use crate::config::app_config::AppConfig;
 use crate::tags_provider::UpscaleTagChecker;
 use crate::upscaler::upscale_actor::{UpscaleSupervisorActor, UpscaleSupervisorMessage};
@@ -26,6 +25,8 @@ mod tags_provider;
 mod app_state;
 mod server;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() {
@@ -67,6 +68,10 @@ async fn main() {
 
         let reqwest_client = reqwest::Client::builder()
             .redirect(Policy::none())
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .expect("Reqwest client couldn't build");
 
@@ -80,35 +85,19 @@ async fn main() {
         let upstream_url_raw = upstream_url.to_string();
         let upstream_url_str = upstream_url_raw.strip_suffix('/').unwrap_or(&upstream_url_raw).to_string();
         let komga_client = Arc::new(KomgaClient::new(reqwest_client.clone(), upstream_url_str.clone()));
-        let kavita_client = Arc::new(KavitaClient::new(reqwest_client.clone(), upstream_url_str.clone()));
 
         let tag_provider = Arc::new(UpscaleTagChecker::new(
             config.upscale_tag.clone(),
             komga_client,
-            kavita_client,
         ));
 
         let upscale_call_cache = Cache::new(1_000);
         let proxy_client = ProxyClient::new(reqwest_client, upstream_url_str);
 
-        let ws_scheme = if upstream_url.scheme_str() == Some("https") { "wss" } else { "ws" };
-        let ws_authority = upstream_url.authority().map(|a| a.as_str()).unwrap_or("localhost:8080");
-        let ws_path = upstream_url.path();
-        let ws_url = Uri::builder()
-            .scheme(ws_scheme)
-            .authority(ws_authority)
-            .path_and_query(ws_path)
-            .build()
-            .unwrap_or_else(|_| Uri::from_static("ws://localhost:8080"));
-        let ws_url_raw = ws_url.to_string();
-        let ws_url_str = ws_url_raw.strip_suffix('/').unwrap_or(&ws_url_raw).to_string();
-        let websocket_proxy_client = WebsocketProxyClient::new(ws_url_str);
-
         let state = AppState {
             config,
             upscaler: upscale_actor.clone(),
             proxy_client: Arc::new(proxy_client),
-            websocket_proxy_client: Arc::new(websocket_proxy_client),
             upscale_call_history_cache: Arc::new(upscale_call_cache),
             upscale_tag_checker: tag_provider,
             shutdown_tx: tx,

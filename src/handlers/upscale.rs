@@ -46,13 +46,6 @@ pub async fn upscale_komga(
     upscale(state, req, upscale_condition).await
 }
 
-pub async fn upscale_kavita(
-    State(state): State<AppState>,
-    req: Request,
-) -> Result<Response, StatusCode> {
-    upscale(state, req, || async { Ok(true) }).await
-}
-
 pub async fn upscale<F, Fut>(
     state: AppState,
     request: Request,

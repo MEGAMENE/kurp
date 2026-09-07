@@ -88,20 +88,21 @@ impl AppConfig {
         config.build()?.try_deserialize()
     }
 
-    pub fn write_config(config: AppConfig) {
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let config_path = AppConfig::get_config_directory().join("config.yml");
-        fs::write(config_path, yaml).expect("Unable to write file");
+    pub fn write_config(config: AppConfig) -> std::io::Result<()> {
+        let yaml = serde_yaml::to_string(&config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let config_path = AppConfig::get_config_directory()?.join("config.yml");
+        fs::write(config_path, yaml)
     }
 
-    fn get_config_directory() -> PathBuf {
-        let current_dir = env::current_dir().expect("can't read current dir");
+    fn get_config_directory() -> std::io::Result<PathBuf> {
+        let current_dir = env::current_dir()?;
         let dir_env = env::var("KURP_CONF_DIR");
-        let config_dir: PathBuf = dir_env.map(|path| { PathBuf::from(path) })
-            .unwrap_or_else(|_| { current_dir.clone() });
+        let config_dir: PathBuf = dir_env.map(|path| PathBuf::from(path))
+            .unwrap_or_else(|_| current_dir);
 
-        fs::create_dir_all(&config_dir).expect("can't create config directory");
+        fs::create_dir_all(&config_dir)?;
 
-        config_dir
+        Ok(config_dir)
     }
 }

@@ -12,8 +12,13 @@ pub async fn update_config(
     State(state): State<AppState>,
     Json(new_config): Json<AppConfig>,
 ) -> impl IntoResponse {
-    AppConfig::write_config(new_config);
-    state.shutdown_tx.send(()).unwrap();
+    if let Err(e) = AppConfig::write_config(new_config) {
+        log::error!("Failed to write configuration file: {}", e);
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    if let Err(e) = state.shutdown_tx.send(()) {
+        log::warn!("Failed to signal server reload: {}", e);
+    }
 
     StatusCode::OK
 }
