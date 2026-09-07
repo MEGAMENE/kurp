@@ -9,7 +9,7 @@ use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageFo
 use log::{error, info};
 use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganError};
 
-use crate::config::app_config::{AppConfig, Format};
+use crate::config::app_config::{AppConfig, AutoLevelsConfig, Format};
 
 #[derive(Copy, Clone)]
 pub struct UpscalerConfig {
@@ -19,6 +19,7 @@ pub struct UpscalerConfig {
     max_upscale_dimension: u32,
     jpeg_quality: u8,
     return_format: Format,
+    auto_levels: AutoLevelsConfig,
 }
 
 fn encode_image(
@@ -37,10 +38,26 @@ fn encode_image(
                 }
             }
             let (w, h) = (image.width(), image.height());
-            let color_type: ExtendedColorType = image.color().into();
-            encoder
-                .write_image(image.as_bytes(), w, h, color_type)
-                .expect("can't write lossless WebP image");
+            match image {
+                DynamicImage::ImageLuma8(_) => {
+                    let rgb = image.to_rgb8();
+                    encoder
+                        .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
+                        .expect("can't write lossless WebP image");
+                }
+                DynamicImage::ImageLumaA8(_) => {
+                    let rgba = image.to_rgba8();
+                    encoder
+                        .write_image(rgba.as_raw(), w, h, ExtendedColorType::Rgba8)
+                        .expect("can't write lossless WebP image");
+                }
+                _ => {
+                    let color_type: ExtendedColorType = image.color().into();
+                    encoder
+                        .write_image(image.as_bytes(), w, h, color_type)
+                        .expect("can't write lossless WebP image");
+                }
+            }
         }
         ImageFormat::Png => {
             let mut encoder = PngEncoder::new_with_quality(
@@ -168,24 +185,36 @@ pub trait Upscaler: Send {
             image.apply_orientation(orientation);
         }
 
-        let upscaled = self.upscale_image(image);
+        let (processed_image, level_info) = if config.auto_levels.enabled {
+            crate::upscaler::auto_levels::analyze_and_level_image(image, &config.auto_levels)
+        } else {
+            (image, crate::upscaler::auto_levels::LevelInfo::default())
+        };
+
+        let upscaled = self.upscale_image(processed_image);
+
+        let final_image = if config.auto_levels.output_grayscale_for_monochrome && level_info.is_monochrome {
+            DynamicImage::ImageLuma8(upscaled.to_luma8())
+        } else {
+            upscaled
+        };
 
         let (output_bytes, final_format) = match config.return_format {
             Format::WebP => {
-                (encode_image(&upscaled, ImageFormat::WebP, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::WebP)
+                (encode_image(&final_image, ImageFormat::WebP, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::WebP)
             }
             Format::Png => {
-                (encode_image(&upscaled, ImageFormat::Png, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Png)
+                (encode_image(&final_image, ImageFormat::Png, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Png)
             }
             Format::Jpeg => {
-                (encode_image(&upscaled, ImageFormat::Jpeg, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Jpeg)
+                (encode_image(&final_image, ImageFormat::Jpeg, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Jpeg)
             }
             Format::Original => {
                 let target_format = match image_format {
                     ImageFormat::Avif => ImageFormat::WebP,
                     other => other,
                 };
-                (encode_image(&upscaled, target_format, icc_profile.as_deref(), config.jpeg_quality), target_format)
+                (encode_image(&final_image, target_format, icc_profile.as_deref(), config.jpeg_quality), target_format)
             }
         };
 
@@ -223,6 +252,7 @@ impl RealCuganUpscaler {
             max_upscale_dimension: config.max_upscale_dimension,
             jpeg_quality: config.jpeg_quality,
             return_format: config.return_format,
+            auto_levels: config.auto_levels,
         };
 
         Ok(Self {

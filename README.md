@@ -36,9 +36,8 @@ size_threshold_enabled: true # enables content size check
 size_threshold: 500 # in KB. will not upscale if image size is bigger than specified size
 size_threshold_png: 1000 # in KB. will not upscale if image size is bigger than specified size. PNG only
 
-# return format of the upscaled image. If the original image was png then converting for example to webp 
-# will result in significantly smaller image size
-# available options are "WebP", "LosslessWebP", "Jpeg", "Png" and "Original"
+# return format of the upscaled image. WebP is lossless.
+# available options are "WebP", "Jpeg", "Png" and "Original"
 return_format: WebP
 
 realcugan:
@@ -51,6 +50,17 @@ realcugan:
   tta_mode: false # enable tta mode
   num_threads: 2 # thread count for upscaling
   models_path: "./models" # path to directory with models
+
+auto_levels:
+  enabled: true # enable intelligent black/white level correction and tone adjustment
+  mode: "All" # processing mode: "All" (manga + comics), "Manga" (B&W only), "Off"
+  black_clip_percent: 0.5 # percentile for ink black point (0.5% preserves fine lines)
+  white_clip_percent: 0.5 # percentile for paper white point
+  max_black_shift: 50 # maximum black point shift (safeguard against over-darkening)
+  min_white_threshold: 200 # minimum white point (safeguard against blowing out dark scenes)
+  correct_paper_cast: true # correct paper yellowing/scanner cast on color comics
+  gamma: 1.0 # midtone gamma adjustment (1.0 = linear, 1.05 = slight lift for text readability)
+  output_grayscale_for_monochrome: true # encode pure monochrome manga as 1-channel grayscale (saves 20-40% size)
 ```
 
 ## Docker Compose

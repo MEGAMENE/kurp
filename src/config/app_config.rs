@@ -19,8 +19,46 @@ pub struct AppConfig {
     pub max_upscale_dimension: u32,
     pub jpeg_quality: u8,
     pub realcugan: RealCuganConfig,
+    #[serde(default)]
+    pub auto_levels: AutoLevelsConfig,
     pub upscale_tag: Option<String>,
     pub allow_config_updates: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
+pub enum AutoLevelsMode {
+    All,
+    Manga,
+    Off,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq)]
+pub struct AutoLevelsConfig {
+    pub enabled: bool,
+    pub mode: AutoLevelsMode,
+    pub black_clip_percent: f32,
+    pub white_clip_percent: f32,
+    pub max_black_shift: u8,
+    pub min_white_threshold: u8,
+    pub correct_paper_cast: bool,
+    pub gamma: f32,
+    pub output_grayscale_for_monochrome: bool,
+}
+
+impl Default for AutoLevelsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: AutoLevelsMode::All,
+            black_clip_percent: 0.5,
+            white_clip_percent: 0.5,
+            max_black_shift: 50,
+            min_white_threshold: 200,
+            correct_paper_cast: true,
+            gamma: 1.0,
+            output_grayscale_for_monochrome: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
@@ -84,6 +122,15 @@ impl AppConfig {
             .set_default("realcugan.tta_mode", false)?
             .set_default("realcugan.num_threads", 2)?
             .set_default("realcugan.models_path", models_default_dir.to_str().unwrap())?
+            .set_default("auto_levels.enabled", true)?
+            .set_default("auto_levels.mode", "All")?
+            .set_default("auto_levels.black_clip_percent", 0.5)?
+            .set_default("auto_levels.white_clip_percent", 0.5)?
+            .set_default("auto_levels.max_black_shift", 50)?
+            .set_default("auto_levels.min_white_threshold", 200)?
+            .set_default("auto_levels.correct_paper_cast", true)?
+            .set_default("auto_levels.gamma", 1.0)?
+            .set_default("auto_levels.output_grayscale_for_monochrome", true)?
             .set_default("allow_config_updates", false)?;
 
         config.build()?.try_deserialize()
