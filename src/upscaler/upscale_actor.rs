@@ -113,7 +113,8 @@ impl Actor for UpscaleActor {
     async fn handle(&self, _myself: ActorRef<Self::Msg>, message: Self::Msg, state: &mut Self::State) -> Result<(), ActorProcessingErr> {
         match message {
             UpscaleMessage::Upscale(image, format, reply_to) => {
-                let _ = reply_to.send(state.upscale(image, format));
+                let result = tokio::task::block_in_place(|| state.upscale(image, format));
+                let _ = reply_to.send(result);
             }
         }
 

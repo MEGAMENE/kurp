@@ -36,11 +36,14 @@ pub async fn upscale_komga(
     let auth = authorization.map(|a| a.0);
 
     let upscale_condition = || async {
-        let book_id = uri.path().split("/").collect::<Vec<&str>>().windows(2)
+        let book_id = uri.path().split('/').collect::<Vec<&str>>().windows(2)
             .find(|path| path[0] == "books")
-            .map(|path| path[1])
-            .unwrap();
-        tag_checker.komga_contains_upscale_tag(book_id, cookie, auth).await
+            .map(|path| path[1]);
+        if let Some(id) = book_id {
+            tag_checker.komga_contains_upscale_tag(id, cookie, auth).await
+        } else {
+            Ok(false)
+        }
     };
 
     upscale(state, req, upscale_condition).await
@@ -96,7 +99,7 @@ async fn upscale_response(
     };
 
     let encoding = headers.get("content-encoding");
-    let response_bytes = match to_bytes(response.into_body(), usize::MAX).await {
+    let response_bytes = match to_bytes(response.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             log::error!("failed to read response body: {}", e);

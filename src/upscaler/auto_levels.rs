@@ -180,7 +180,10 @@ pub fn analyze_and_level_image(
     let classification = if is_already_luma {
         PageClassification::Monochrome
     } else if neutral_ratio >= 0.85 {
-        if max_chroma <= 35 && high_chroma_count < 50 {
+        if max_chroma <= 35
+            || high_chroma_count <= 50
+            || ((high_chroma_count as f32 / total_valid_pixels as f32) <= 0.00005)
+        {
             PageClassification::Monochrome
         } else {
             PageClassification::Mixed
@@ -311,7 +314,7 @@ pub fn analyze_and_level_image(
             w_point = 255;
         }
     } else {
-        if b_point <= 4 {
+        if b_point <= 1 {
             b_point = 0;
         } else if b_point > config.max_black_shift.max(45) {
             b_point = 0;
@@ -319,7 +322,7 @@ pub fn analyze_and_level_image(
             b_point = config.max_black_shift;
         }
 
-        if w_point >= 252 {
+        if w_point >= 254 {
             w_point = 255;
         } else if w_point < config.min_white_threshold {
             w_point = 255; // Don't blow out dark/night scenes
@@ -354,7 +357,7 @@ pub fn analyze_and_level_image(
     // Skip if already pristine
     if b_point == 0 && w_point == 255 && !apply_paper_cast {
         info!(
-            "[AutoLevels] Skipped (already pristine: black <= 4, white >= 252, classification: {:?})",
+            "[AutoLevels] Skipped (already pristine: black <= 1, white >= 254, classification: {:?})",
             classification
         );
         return (
@@ -401,7 +404,9 @@ pub fn analyze_and_level_image(
         }
         DynamicImage::ImageLumaA8(luma_a) => {
             for chunk in (&mut **luma_a).chunks_exact_mut(2) {
-                chunk[0] = lut[chunk[0] as usize];
+                if chunk[1] >= 128 {
+                    chunk[0] = lut[chunk[0] as usize];
+                }
             }
         }
         DynamicImage::ImageRgb8(rgb) => {
@@ -422,12 +427,38 @@ pub fn analyze_and_level_image(
                         chunk[2] = lut[b as usize];
                         continue;
                     }
-                    if chroma >= 35 {
+                    if classification != PageClassification::Color && chroma >= 35 {
                         continue;
                     }
                 }
 
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
+
+                if classification == PageClassification::Color {
+                    let y_lev = lut[y] as f32;
+                    let (mut r_lev, mut g_lev, mut b_lev) = if y == 0 {
+                        (0.0f32, 0.0f32, 0.0f32)
+                    } else {
+                        let scale = y_lev / (y as f32);
+                        (
+                            (r as f32 * scale).clamp(0.0, 255.0),
+                            (g as f32 * scale).clamp(0.0, 255.0),
+                            (b as f32 * scale).clamp(0.0, 255.0),
+                        )
+                    };
+
+                    if apply_paper_cast && y >= 180 {
+                        let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
+                        r_lev = (r_lev * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                        g_lev = (g_lev * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                        b_lev = (b_lev * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                    }
+
+                    chunk[0] = r_lev.round() as u8;
+                    chunk[1] = g_lev.round() as u8;
+                    chunk[2] = b_lev.round() as u8;
+                    continue;
+                }
 
                 let low_thresh = if y <= 50 { 20 } else { 12 };
                 let high_thresh = 35;
@@ -475,8 +506,8 @@ pub fn analyze_and_level_image(
         }
         DynamicImage::ImageRgba8(rgba) => {
             for chunk in (&mut **rgba).chunks_exact_mut(4) {
-                if chunk[3] == 0 {
-                    continue; // Skip fully transparent pixels
+                if chunk[3] < 128 {
+                    continue; // Skip transparent and semi-transparent pixels
                 }
 
                 let r = chunk[0];
@@ -495,12 +526,38 @@ pub fn analyze_and_level_image(
                         chunk[2] = lut[b as usize];
                         continue;
                     }
-                    if chroma >= 35 {
+                    if classification != PageClassification::Color && chroma >= 35 {
                         continue;
                     }
                 }
 
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
+
+                if classification == PageClassification::Color {
+                    let y_lev = lut[y] as f32;
+                    let (mut r_lev, mut g_lev, mut b_lev) = if y == 0 {
+                        (0.0f32, 0.0f32, 0.0f32)
+                    } else {
+                        let scale = y_lev / (y as f32);
+                        (
+                            (r as f32 * scale).clamp(0.0, 255.0),
+                            (g as f32 * scale).clamp(0.0, 255.0),
+                            (b as f32 * scale).clamp(0.0, 255.0),
+                        )
+                    };
+
+                    if apply_paper_cast && y >= 180 {
+                        let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
+                        r_lev = (r_lev * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                        g_lev = (g_lev * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                        b_lev = (b_lev * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                    }
+
+                    chunk[0] = r_lev.round() as u8;
+                    chunk[1] = g_lev.round() as u8;
+                    chunk[2] = b_lev.round() as u8;
+                    continue;
+                }
 
                 let low_thresh = if y <= 50 { 20 } else { 12 };
                 let high_thresh = 35;

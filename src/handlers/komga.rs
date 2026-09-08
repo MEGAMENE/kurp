@@ -11,7 +11,7 @@ pub async fn check_tags_on_series_metadata_update(
     request: Request,
 ) -> Result<Response, StatusCode> {
     let (parts, body) = request.into_parts();
-    let bytes = to_bytes(body, usize::MAX).await
+    let bytes = to_bytes(body, 50 * 1024 * 1024).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let json: KomgaSeriesMetadataUpdate = serde_json::from_slice(&bytes)
@@ -33,7 +33,7 @@ pub async fn check_tags_on_book_metadata_update(
     request: Request,
 ) -> Result<Response, StatusCode> {
     let (parts, body) = request.into_parts();
-    let bytes = to_bytes(body, usize::MAX).await
+    let bytes = to_bytes(body, 50 * 1024 * 1024).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let json: KomgaBookMetadataUpdate = serde_json::from_slice(&bytes)

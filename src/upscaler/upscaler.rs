@@ -95,6 +95,30 @@ fn encode_image(
                         .write_image(luma.as_raw(), w, h, ExtendedColorType::L8)
                         .expect("can't write JPEG image");
                 }
+                DynamicImage::ImageRgba8(ref rgba) => {
+                    let mut rgb = image::RgbImage::new(w, h);
+                    for (x, y, pixel) in rgba.enumerate_pixels() {
+                        let a = pixel[3] as u32;
+                        let r = ((pixel[0] as u32 * a + 255 * (255 - a)) / 255) as u8;
+                        let g = ((pixel[1] as u32 * a + 255 * (255 - a)) / 255) as u8;
+                        let b = ((pixel[2] as u32 * a + 255 * (255 - a)) / 255) as u8;
+                        rgb.put_pixel(x, y, image::Rgb([r, g, b]));
+                    }
+                    encoder
+                        .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
+                        .expect("can't write JPEG image");
+                }
+                DynamicImage::ImageLumaA8(ref luma_a) => {
+                    let mut rgb = image::RgbImage::new(w, h);
+                    for (x, y, pixel) in luma_a.enumerate_pixels() {
+                        let a = pixel[1] as u32;
+                        let l = ((pixel[0] as u32 * a + 255 * (255 - a)) / 255) as u8;
+                        rgb.put_pixel(x, y, image::Rgb([l, l, l]));
+                    }
+                    encoder
+                        .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
+                        .expect("can't write JPEG image");
+                }
                 _ => {
                     let rgb = image.to_rgb8();
                     encoder
@@ -193,28 +217,28 @@ pub trait Upscaler: Send {
 
         let upscaled = self.upscale_image(processed_image);
 
-        let final_image = if config.auto_levels.output_grayscale_for_monochrome && level_info.is_monochrome {
-            DynamicImage::ImageLuma8(upscaled.to_luma8())
+        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && level_info.is_monochrome {
+            (DynamicImage::ImageLuma8(upscaled.to_luma8()), None)
         } else {
-            upscaled
+            (upscaled, icc_profile.as_deref())
         };
 
         let (output_bytes, final_format) = match config.return_format {
             Format::WebP => {
-                (encode_image(&final_image, ImageFormat::WebP, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::WebP)
+                (encode_image(&final_image, ImageFormat::WebP, final_icc, config.jpeg_quality), ImageFormat::WebP)
             }
             Format::Png => {
-                (encode_image(&final_image, ImageFormat::Png, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Png)
+                (encode_image(&final_image, ImageFormat::Png, final_icc, config.jpeg_quality), ImageFormat::Png)
             }
             Format::Jpeg => {
-                (encode_image(&final_image, ImageFormat::Jpeg, icc_profile.as_deref(), config.jpeg_quality), ImageFormat::Jpeg)
+                (encode_image(&final_image, ImageFormat::Jpeg, final_icc, config.jpeg_quality), ImageFormat::Jpeg)
             }
             Format::Original => {
                 let target_format = match image_format {
                     ImageFormat::Avif => ImageFormat::WebP,
                     other => other,
                 };
-                (encode_image(&final_image, target_format, icc_profile.as_deref(), config.jpeg_quality), target_format)
+                (encode_image(&final_image, target_format, final_icc, config.jpeg_quality), target_format)
             }
         };
 
