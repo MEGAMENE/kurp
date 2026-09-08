@@ -313,6 +313,26 @@ pub fn analyze_and_level_image(
         if w_point < 250 {
             w_point = 255;
         }
+    } else if classification == PageClassification::Mixed {
+        // Mixed content (manga with color elements or atmospheric scenes):
+        // If no scanner shelf is confirmed, treat as atmospheric artwork and protect midtones.
+        if !is_shelf && b_point > 12 {
+            b_point = 0;
+        } else {
+            if b_point <= 1 {
+                b_point = 0;
+            } else if b_point > config.max_black_shift.max(45) {
+                b_point = 0;
+            } else if b_point > config.max_black_shift {
+                b_point = config.max_black_shift;
+            }
+        }
+
+        if w_point >= 254 {
+            w_point = 255;
+        } else if w_point < config.min_white_threshold {
+            w_point = 255; // Don't blow out dark/night scenes
+        }
     } else {
         if b_point <= 1 {
             b_point = 0;
