@@ -51,6 +51,8 @@ pub fn analyze_and_level_image(
     let mut hist_y_neutral = [0u32; 256];
     let mut neutral_count: usize = 0;
     let mut total_valid_pixels: usize = 0;
+    let mut max_chroma: u8 = 0;
+    let mut high_chroma_count: usize = 0;
 
     let mut highlight_count: usize = 0;
     let mut sum_r_high: u64 = 0;
@@ -96,6 +98,12 @@ pub fn analyze_and_level_image(
                 let max_c = r.max(g).max(b);
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
+                if chroma > max_chroma {
+                    max_chroma = chroma;
+                }
+                if chroma > 35 {
+                    high_chroma_count += 1;
+                }
 
                 // Ink luma (y <= 50) commonly has subtle scanner sensor noise or JPEG chroma ringing (up to ~25).
                 // Midtones & highlights use strict neutral threshold (<= 12) to exclude colored artwork.
@@ -105,7 +113,8 @@ pub fn analyze_and_level_image(
                     hist_y_neutral[y] += 1;
                 }
 
-                if y >= 220 && chroma <= 25 {
+                // Genuine neutral paper highlights (chroma <= 10)
+                if y >= 220 && chroma <= 10 {
                     highlight_count += 1;
                     sum_r_high += r as u64;
                     sum_g_high += g as u64;
@@ -129,6 +138,12 @@ pub fn analyze_and_level_image(
                 let max_c = r.max(g).max(b);
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
+                if chroma > max_chroma {
+                    max_chroma = chroma;
+                }
+                if chroma > 35 {
+                    high_chroma_count += 1;
+                }
 
                 let is_neutral = if y <= 50 { chroma <= 25 } else { chroma <= 12 };
                 if is_neutral {
@@ -136,7 +151,7 @@ pub fn analyze_and_level_image(
                     hist_y_neutral[y] += 1;
                 }
 
-                if y >= 220 && chroma <= 25 {
+                if y >= 220 && chroma <= 10 {
                     highlight_count += 1;
                     sum_r_high += r as u64;
                     sum_g_high += g as u64;
@@ -155,10 +170,21 @@ pub fn analyze_and_level_image(
     }
 
     let neutral_ratio = neutral_count as f32 / total_valid_pixels as f32;
-    let classification = if is_already_luma || neutral_ratio >= 0.995 {
+
+    // Content classification:
+    // - Monochrome: B&W scans without genuine color (scanner/JPEG noise chroma <= 35, high_chroma_count < 50).
+    //   Only Monochrome pages are converted to 1-channel grayscale post-upscale.
+    // - Mixed: B&W manga containing color titles, watermarks, scanlator stamps, or chapter splash art.
+    //   Never converted to grayscale, preserving all color elements.
+    // - Color: Full-color comics and Western graphic novels (neutral_ratio < 0.85).
+    let classification = if is_already_luma {
         PageClassification::Monochrome
-    } else if neutral_ratio >= 0.70 {
-        PageClassification::Mixed
+    } else if neutral_ratio >= 0.85 {
+        if max_chroma <= 35 && high_chroma_count < 50 {
+            PageClassification::Monochrome
+        } else {
+            PageClassification::Mixed
+        }
     } else {
         PageClassification::Color
     };
@@ -171,6 +197,19 @@ pub fn analyze_and_level_image(
             LevelInfo {
                 was_leveled: false,
                 is_monochrome: false,
+                classification,
+                black_point: 0,
+                white_point: 255,
+            },
+        );
+    }
+
+    if config.mode == AutoLevelsMode::Color && classification != PageClassification::Color {
+        return (
+            image,
+            LevelInfo {
+                was_leveled: false,
+                is_monochrome,
                 classification,
                 black_point: 0,
                 white_point: 255,
@@ -194,30 +233,25 @@ pub fn analyze_and_level_image(
         (n_samples as f64 * (config.white_clip_percent.max(0.0) as f64 / 100.0)).round() as u64;
 
     // --- Ink Shelf / Surge Detection ---
-    // When manga or comics are scanned with elevated black levels and later typeset with
-    // digital text (speech bubbles, credits headers), bin 0 has a small spike of digital font pixels,
-    // followed by an empty valley (bins 2..=14), followed by a massive surge/cliff at the true ink floor
-    // (bins 8..=35). A naive percentile stops at bin 0 and incorrectly classifies the page as pristine.
-    // Here we detect this signature ink shelf and anchor the black point to the true artwork floor.
+    // When manga or comics are scanned with elevated black levels (e.g. limited video range 16-235
+    // or CMYK prepress mapping), linework is elevated to bins 12..=24. If digital vector text or headers
+    // were typeset, bin 0 has a small spike followed by an empty valley (bins 2..=14) before the true ink floor.
+    // We restrict peak detection strictly to [12..=24] to avoid catching dark gray screentones / halftones (30+).
 
-    // 1. Check if the page is already rich in true pristine blacks:
-    // If bins 0..=3 already contain >= 5.0% of the samples, the page has rich, calibrated black linework.
     let dark_0_3: u64 = hist[0..=3].iter().map(|&c| c as u64).sum();
     let dark_0_3_pct = (dark_0_3 as f64 / n_samples as f64) * 100.0;
 
-    // 2. Search for ink shelf / surge peak in bins [8..=35]:
     let mut max_peak_count = 0u32;
     let mut max_peak_bin = 0usize;
-    for bin in 8..=35 {
+    for bin in 12..=24 {
         if hist[bin] > max_peak_count {
             max_peak_count = hist[bin];
             max_peak_bin = bin;
         }
     }
 
-    // 3. Search for minimum valley count between bin 2 and max_peak_bin:
     let mut min_valley_count = u32::MAX;
-    if max_peak_bin >= 8 {
+    if max_peak_bin >= 12 {
         for bin in 2..max_peak_bin {
             if hist[bin] < min_valley_count {
                 min_valley_count = hist[bin];
@@ -225,20 +259,17 @@ pub fn analyze_and_level_image(
         }
     }
 
-    // 4. Shelf criteria:
+    // Shelf criteria:
     // - Applied only to Monochrome and Mixed content (scanned ink with digital typesetting).
-    //   On full-color comics, dark clusters (e.g. slate walls, night skies) are the colorist's
-    //   intentional artistic palette and must NOT be mistaken for a scanning defect.
-    // - Peak is at or above bin 8 (meaning ink was lifted by at least 8 levels)
-    // - Peak contains significant ink density: >= 0.5% (0.005) of samples in this single bin
+    // - Peak in [12..=24] contains significant ink density: >= 0.5% of samples in this single bin
     // - Peak surges by at least 3.0x over the valley floor preceding it
-    // - The page is not already pristine dark (dark_0_3_pct < 5.0%)
+    // - Linework is not already pristine dark (dark_0_3_pct < 3.0%)
     let is_shelf = classification != PageClassification::Color
-        && max_peak_bin >= 8
+        && max_peak_bin >= 12
         && (max_peak_count as f64) >= (n_samples as f64 * 0.005)
         && min_valley_count > 0
         && ((max_peak_count as f32) / (min_valley_count as f32) >= 3.0)
-        && dark_0_3_pct < 5.0;
+        && dark_0_3_pct < 3.0;
 
     let mut b_point = if is_shelf {
         max_peak_bin as u8
@@ -266,20 +297,28 @@ pub fn analyze_and_level_image(
     }
 
     // Safeguards
-    if b_point <= 4 {
-        b_point = 0;
-    } else if b_point > 45 {
-        // If the black point would exceed 45 (e.g. high-key pastel art, blank white endpapers),
-        // there is no black ink intended on this page; do not crush midtones!
-        b_point = 0;
-    } else if b_point > config.max_black_shift {
-        b_point = config.max_black_shift;
-    }
+    if classification == PageClassification::Color {
+        // Color comics: protect intentional shadow palettes and low-contrast pastel scenes
+        if b_point > 12 {
+            b_point = 0;
+        }
+        if w_point < 250 {
+            w_point = 255;
+        }
+    } else {
+        if b_point <= 4 {
+            b_point = 0;
+        } else if b_point > 45 {
+            b_point = 0;
+        } else if b_point > config.max_black_shift {
+            b_point = config.max_black_shift;
+        }
 
-    if w_point >= 252 {
-        w_point = 255;
-    } else if w_point < config.min_white_threshold {
-        w_point = 255; // Don't blow out dark/night scenes
+        if w_point >= 252 {
+            w_point = 255;
+        } else if w_point < config.min_white_threshold {
+            w_point = 255; // Don't blow out dark/night scenes
+        }
     }
 
     // Paper cast detection for color comic pages
@@ -294,13 +333,10 @@ pub fn analyze_and_level_image(
         let avg_g = (sum_g_high as f32) / (highlight_count as f32);
         let avg_b = (sum_b_high as f32) / (highlight_count as f32);
 
-        let max_dev = (avg_r - avg_g)
-            .abs()
-            .max((avg_g - avg_b).abs())
-            .max((avg_b - avg_r).abs());
+        // Paper aging is warm yellow/sepia: R >= G > B (depressed blue)
+        let is_yellow_paper = avg_r >= avg_g && avg_g > avg_b && (avg_r - avg_b) > 6.0;
 
-        // Significant highlight paper cast (e.g. oxidized newsprint yellowing)
-        if max_dev > 5.0 && avg_r >= 190.0 && avg_g >= 190.0 && avg_b >= 170.0 {
+        if is_yellow_paper && avg_r >= 210.0 && avg_g >= 200.0 && avg_b >= 170.0 {
             let max_val = avg_r.max(avg_g).max(avg_b);
             paper_cast_gains[0] = max_val / avg_r;
             paper_cast_gains[1] = max_val / avg_g;
@@ -367,32 +403,53 @@ pub fn analyze_and_level_image(
                 let r = chunk[0];
                 let g = chunk[1];
                 let b = chunk[2];
+
+                let max_c = r.max(g).max(b);
+                let min_c = r.min(g).min(b);
+                let chroma = max_c - min_c;
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
-                let y_new = lut[y] as f32;
 
-                if y == 0 {
-                    chunk[0] = 0;
-                    chunk[1] = 0;
-                    chunk[2] = 0;
+                let low_thresh = if y <= 50 { 20 } else { 12 };
+                let high_thresh = 35;
+
+                let w_neutral = if chroma <= low_thresh {
+                    1.0f32
+                } else if chroma >= high_thresh {
+                    0.0f32
                 } else {
-                    let gain = y_new / (y as f32);
-                    let mut r_out = (r as f32 * gain).round().clamp(0.0, 255.0);
-                    let mut g_out = (g as f32 * gain).round().clamp(0.0, 255.0);
-                    let mut b_out = (b as f32 * gain).round().clamp(0.0, 255.0);
+                    (high_thresh - chroma) as f32 / (high_thresh - low_thresh) as f32
+                };
 
-                    if apply_paper_cast && y >= 180 {
-                        let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
-                        r_out = (r_out * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor))
-                            .clamp(0.0, 255.0);
-                        g_out = (g_out * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor))
-                            .clamp(0.0, 255.0);
-                        b_out = (b_out * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor))
-                            .clamp(0.0, 255.0);
-                    }
+                if w_neutral <= 0.001 {
+                    // Pure colorful pixel (red title, watermark, colored art) - 100% untouched!
+                    continue;
+                }
 
-                    chunk[0] = r_out as u8;
-                    chunk[1] = g_out as u8;
-                    chunk[2] = b_out as u8;
+                let mut r_lev = lut[r as usize] as f32;
+                let mut g_lev = lut[g as usize] as f32;
+                let mut b_lev = lut[b as usize] as f32;
+
+                if apply_paper_cast && y >= 180 {
+                    let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
+                    r_lev = (r_lev * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                    g_lev = (g_lev * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                    b_lev = (b_lev * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                }
+
+                if w_neutral >= 0.999 {
+                    chunk[0] = r_lev.round() as u8;
+                    chunk[1] = g_lev.round() as u8;
+                    chunk[2] = b_lev.round() as u8;
+                } else {
+                    chunk[0] = (w_neutral * r_lev + (1.0 - w_neutral) * (r as f32))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    chunk[1] = (w_neutral * g_lev + (1.0 - w_neutral) * (g as f32))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    chunk[2] = (w_neutral * b_lev + (1.0 - w_neutral) * (b as f32))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -401,32 +458,52 @@ pub fn analyze_and_level_image(
                 let r = chunk[0];
                 let g = chunk[1];
                 let b = chunk[2];
+
+                let max_c = r.max(g).max(b);
+                let min_c = r.min(g).min(b);
+                let chroma = max_c - min_c;
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
-                let y_new = lut[y] as f32;
 
-                if y == 0 {
-                    chunk[0] = 0;
-                    chunk[1] = 0;
-                    chunk[2] = 0;
+                let low_thresh = if y <= 50 { 20 } else { 12 };
+                let high_thresh = 35;
+
+                let w_neutral = if chroma <= low_thresh {
+                    1.0f32
+                } else if chroma >= high_thresh {
+                    0.0f32
                 } else {
-                    let gain = y_new / (y as f32);
-                    let mut r_out = (r as f32 * gain).round().clamp(0.0, 255.0);
-                    let mut g_out = (g as f32 * gain).round().clamp(0.0, 255.0);
-                    let mut b_out = (b as f32 * gain).round().clamp(0.0, 255.0);
+                    (high_thresh - chroma) as f32 / (high_thresh - low_thresh) as f32
+                };
 
-                    if apply_paper_cast && y >= 180 {
-                        let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
-                        r_out = (r_out * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor))
-                            .clamp(0.0, 255.0);
-                        g_out = (g_out * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor))
-                            .clamp(0.0, 255.0);
-                        b_out = (b_out * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor))
-                            .clamp(0.0, 255.0);
-                    }
+                if w_neutral <= 0.001 {
+                    continue;
+                }
 
-                    chunk[0] = r_out as u8;
-                    chunk[1] = g_out as u8;
-                    chunk[2] = b_out as u8;
+                let mut r_lev = lut[r as usize] as f32;
+                let mut g_lev = lut[g as usize] as f32;
+                let mut b_lev = lut[b as usize] as f32;
+
+                if apply_paper_cast && y >= 180 {
+                    let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
+                    r_lev = (r_lev * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                    g_lev = (g_lev * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                    b_lev = (b_lev * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor)).clamp(0.0, 255.0);
+                }
+
+                if w_neutral >= 0.999 {
+                    chunk[0] = r_lev.round() as u8;
+                    chunk[1] = g_lev.round() as u8;
+                    chunk[2] = b_lev.round() as u8;
+                } else {
+                    chunk[0] = (w_neutral * r_lev + (1.0 - w_neutral) * (r as f32))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    chunk[1] = (w_neutral * g_lev + (1.0 - w_neutral) * (g as f32))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    chunk[2] = (w_neutral * b_lev + (1.0 - w_neutral) * (b as f32))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                 }
             }
         }

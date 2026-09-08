@@ -54,12 +54,12 @@ realcugan:
 auto_levels:
   enabled: true # enable intelligent black/white level correction and tone adjustment
   mode: "All" # processing mode: "All" (manga + comics), "Manga" (B&W only), "Off"
-  black_clip_percent: 0.5 # percentile for ink black point (0.5% preserves fine lines)
-  white_clip_percent: 0.5 # percentile for paper white point
-  max_black_shift: 50 # maximum black point shift (safeguard against over-darkening)
+  black_clip_percent: 0.1 # percentile for ink black point (0.1% preserves subtle shadow artwork)
+  white_clip_percent: 0.1 # percentile for paper white point (0.1% protects soft highlights)
+  max_black_shift: 30 # maximum black point shift (safeguard against crushing halftones)
   min_white_threshold: 200 # minimum white point (safeguard against blowing out dark scenes)
-  correct_paper_cast: true # correct paper yellowing/scanner cast on color comics
-  gamma: 1.0 # midtone gamma adjustment (1.0 = linear, 1.05 = slight lift for text readability)
+  correct_paper_cast: false # correct paper yellowing on vintage scans (disabled by default to preserve tinted art)
+  gamma: 1.0 # midtone gamma adjustment (1.0 = linear)
   output_grayscale_for_monochrome: true # encode pure monochrome manga as 1-channel grayscale (saves 20-40% size)
 ```
 

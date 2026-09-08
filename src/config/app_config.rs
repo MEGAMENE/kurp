@@ -50,11 +50,11 @@ impl Default for AutoLevelsConfig {
         Self {
             enabled: true,
             mode: AutoLevelsMode::All,
-            black_clip_percent: 0.5,
-            white_clip_percent: 0.5,
-            max_black_shift: 50,
+            black_clip_percent: 0.1,
+            white_clip_percent: 0.1,
+            max_black_shift: 30,
             min_white_threshold: 200,
-            correct_paper_cast: true,
+            correct_paper_cast: false,
             gamma: 1.0,
             output_grayscale_for_monochrome: true,
         }
@@ -124,11 +124,11 @@ impl AppConfig {
             .set_default("realcugan.models_path", models_default_dir.to_str().unwrap())?
             .set_default("auto_levels.enabled", true)?
             .set_default("auto_levels.mode", "All")?
-            .set_default("auto_levels.black_clip_percent", 0.5)?
-            .set_default("auto_levels.white_clip_percent", 0.5)?
-            .set_default("auto_levels.max_black_shift", 50)?
+            .set_default("auto_levels.black_clip_percent", 0.1)?
+            .set_default("auto_levels.white_clip_percent", 0.1)?
+            .set_default("auto_levels.max_black_shift", 30)?
             .set_default("auto_levels.min_white_threshold", 200)?
-            .set_default("auto_levels.correct_paper_cast", true)?
+            .set_default("auto_levels.correct_paper_cast", false)?
             .set_default("auto_levels.gamma", 1.0)?
             .set_default("auto_levels.output_grayscale_for_monochrome", true)?
             .set_default("allow_config_updates", false)?;
