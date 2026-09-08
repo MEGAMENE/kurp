@@ -444,7 +444,7 @@ pub fn analyze_and_level_image(
                 // Dark pedestal floor clamping:
                 // For non-color pages with an elevated black shelf (e.g. CMYK-to-sRGB mastering offset or dark floor pedestal R=25, G=15, B=3),
                 // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
-                if b_point > 0 && classification != PageClassification::Color && y <= b_point && chroma <= 25 {
+                if b_point > 0 && classification != PageClassification::Color && y <= b_point as usize && chroma <= 25 {
                     chunk[0] = 0;
                     chunk[1] = 0;
                     chunk[2] = 0;
@@ -553,7 +553,7 @@ pub fn analyze_and_level_image(
                 // Dark pedestal floor clamping:
                 // For non-color pages with an elevated black shelf (e.g. CMYK-to-sRGB mastering offset or dark floor pedestal R=25, G=15, B=3),
                 // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
-                if b_point > 0 && classification != PageClassification::Color && y <= b_point && chroma <= 25 {
+                if b_point > 0 && classification != PageClassification::Color && y <= b_point as usize && chroma <= 25 {
                     chunk[0] = 0;
                     chunk[1] = 0;
                     chunk[2] = 0;
