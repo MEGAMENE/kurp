@@ -439,6 +439,18 @@ pub fn analyze_and_level_image(
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
 
+                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
+
+                // Scanner dark pedestal floor clamping:
+                // For non-color pages with an elevated black shelf (e.g. CCD scanner offset R=25, G=15, B=3),
+                // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
+                if b_point > 0 && classification != PageClassification::Color && y <= b_point && chroma <= 25 {
+                    chunk[0] = 0;
+                    chunk[1] = 0;
+                    chunk[2] = 0;
+                    continue;
+                }
+
                 // Microsecond fast-path for pure neutral pixels and pure color pixels
                 if !apply_paper_cast {
                     if chroma <= 12 {
@@ -451,8 +463,6 @@ pub fn analyze_and_level_image(
                         continue;
                     }
                 }
-
-                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
 
                 if classification == PageClassification::Color {
                     let y_lev = lut[y] as f32;
@@ -538,6 +548,18 @@ pub fn analyze_and_level_image(
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
 
+                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
+
+                // Scanner dark pedestal floor clamping:
+                // For non-color pages with an elevated black shelf (e.g. CCD scanner offset R=25, G=15, B=3),
+                // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
+                if b_point > 0 && classification != PageClassification::Color && y <= b_point && chroma <= 25 {
+                    chunk[0] = 0;
+                    chunk[1] = 0;
+                    chunk[2] = 0;
+                    continue;
+                }
+
                 // Microsecond fast-path for pure neutral pixels and pure color pixels
                 if !apply_paper_cast {
                     if chroma <= 12 {
@@ -550,8 +572,6 @@ pub fn analyze_and_level_image(
                         continue;
                     }
                 }
-
-                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
 
                 if classification == PageClassification::Color {
                     let y_lev = lut[y] as f32;
