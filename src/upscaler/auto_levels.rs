@@ -49,6 +49,9 @@ pub fn analyze_and_level_image(
 
     let mut hist_y = [0u32; 256];
     let mut hist_y_neutral = [0u32; 256];
+    let mut hist_r_neutral = [0u32; 256];
+    let mut hist_g_neutral = [0u32; 256];
+    let mut hist_b_neutral = [0u32; 256];
     let mut neutral_count: usize = 0;
     let mut total_valid_pixels: usize = 0;
     let mut max_chroma: u8 = 0;
@@ -113,6 +116,12 @@ pub fn analyze_and_level_image(
                     hist_y_neutral[y] += 1;
                 }
 
+                if y <= 40 && chroma <= 25 {
+                    hist_r_neutral[r as usize] += 1;
+                    hist_g_neutral[g as usize] += 1;
+                    hist_b_neutral[b as usize] += 1;
+                }
+
                 // Genuine neutral paper highlights (chroma <= 10)
                 if y >= 220 && chroma <= 10 {
                     highlight_count += 1;
@@ -149,6 +158,12 @@ pub fn analyze_and_level_image(
                 if is_neutral {
                     neutral_count += 1;
                     hist_y_neutral[y] += 1;
+                }
+
+                if y <= 40 && chroma <= 25 {
+                    hist_r_neutral[r as usize] += 1;
+                    hist_g_neutral[g as usize] += 1;
+                    hist_b_neutral[b as usize] += 1;
                 }
 
                 if y >= 220 && chroma <= 10 {
@@ -374,8 +389,45 @@ pub fn analyze_and_level_image(
         }
     }
 
+    // Per-channel dark shelf analysis:
+    // When digital manga releases have an elevated dark floor where channels were split
+    // (e.g. CMYK-to-sRGB mastering offset or compression pedestal with Red=25, Green=15, Blue=3),
+    // subtracting a single scalar black point splits the channels and produces a red/maroon cast.
+    // We detect per-channel peaks in the dark region [2..=35] and align each channel's floor independently.
+    let mut peak_r = 0u32;
+    let mut peak_r_bin = b_point;
+    let mut peak_g = 0u32;
+    let mut peak_g_bin = b_point;
+    let mut peak_b = 0u32;
+    let mut peak_b_bin = b_point;
+
+    for bin in 2..=35 {
+        if hist_r_neutral[bin] > peak_r {
+            peak_r = hist_r_neutral[bin];
+            peak_r_bin = bin as u8;
+        }
+        if hist_g_neutral[bin] > peak_g {
+            peak_g = hist_g_neutral[bin];
+            peak_g_bin = bin as u8;
+        }
+        if hist_b_neutral[bin] > peak_b {
+            peak_b = hist_b_neutral[bin];
+            peak_b_bin = bin as u8;
+        }
+    }
+
+    let channel_spread = peak_r_bin.max(peak_g_bin).max(peak_b_bin) - peak_r_bin.min(peak_g_bin).min(peak_b_bin);
+    let use_per_channel_shelf = is_shelf
+        && classification != PageClassification::Color
+        && channel_spread >= 4
+        && w_point >= 250;
+
+    let bp_r = if use_per_channel_shelf { peak_r_bin } else { b_point };
+    let bp_g = if use_per_channel_shelf { peak_g_bin } else { b_point };
+    let bp_b = if use_per_channel_shelf { peak_b_bin } else { b_point };
+
     // Skip if already pristine
-    if b_point == 0 && w_point == 255 && !apply_paper_cast {
+    if b_point == 0 && w_point == 255 && !apply_paper_cast && !use_per_channel_shelf {
         info!(
             "[AutoLevels] Skipped (already pristine: black <= 1, white >= 254, classification: {:?})",
             classification
@@ -392,40 +444,47 @@ pub fn analyze_and_level_image(
         );
     }
 
-    let range = (w_point as f32 - b_point as f32).max(1.0);
     let inv_gamma = if (config.gamma - 1.0).abs() > 0.001 && config.gamma > 0.1 {
         1.0 / config.gamma
     } else {
         1.0
     };
 
-    let mut lut = [0u8; 256];
-    for y in 0..=255 {
-        if (y as u8) <= b_point {
-            lut[y] = 0;
-        } else if (y as u8) >= w_point {
-            lut[y] = 255;
-        } else {
-            let norm = (y as f32 - b_point as f32) / range;
-            let mapped = if inv_gamma != 1.0 {
-                norm.powf(inv_gamma)
+    let build_lut = |bp: u8, wp: u8| -> [u8; 256] {
+        let range = (wp as f32 - bp as f32).max(1.0);
+        let mut res = [0u8; 256];
+        for y in 0..=255 {
+            if (y as u8) <= bp {
+                res[y] = 0;
+            } else if (y as u8) >= wp {
+                res[y] = 255;
             } else {
-                norm
-            };
-            lut[y] = (mapped * 255.0).round().clamp(0.0, 255.0) as u8;
+                let norm = (y as f32 - bp as f32) / range;
+                let mapped = if inv_gamma != 1.0 {
+                    norm.powf(inv_gamma)
+                } else {
+                    norm
+                };
+                res[y] = (mapped * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
         }
-    }
+        res
+    };
+
+    let lut_r = build_lut(bp_r, w_point);
+    let lut_g = build_lut(bp_g, w_point);
+    let lut_b = build_lut(bp_b, w_point);
 
     match &mut image {
         DynamicImage::ImageLuma8(luma) => {
             for p in &mut **luma {
-                *p = lut[*p as usize];
+                *p = lut_r[*p as usize];
             }
         }
         DynamicImage::ImageLumaA8(luma_a) => {
             for chunk in (&mut **luma_a).chunks_exact_mut(2) {
                 if chunk[1] >= 128 {
-                    chunk[0] = lut[chunk[0] as usize];
+                    chunk[0] = lut_r[chunk[0] as usize];
                 }
             }
         }
@@ -439,33 +498,14 @@ pub fn analyze_and_level_image(
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
 
-                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
-
-                // Dark pedestal floor clamping:
-                // For non-color pages with an elevated black shelf (e.g. CMYK-to-sRGB mastering offset or dark floor pedestal R=25, G=15, B=3),
-                // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
-                if b_point > 0 && classification != PageClassification::Color && y <= b_point as usize && chroma <= 25 {
-                    chunk[0] = 0;
-                    chunk[1] = 0;
-                    chunk[2] = 0;
+                // Non-color pages: if chroma >= 35, completely preserve color elements / logos
+                if classification != PageClassification::Color && chroma >= 35 {
                     continue;
                 }
 
-                // Microsecond fast-path for pure neutral pixels and pure color pixels
-                if !apply_paper_cast {
-                    if chroma <= 12 {
-                        chunk[0] = lut[r as usize];
-                        chunk[1] = lut[g as usize];
-                        chunk[2] = lut[b as usize];
-                        continue;
-                    }
-                    if classification != PageClassification::Color && chroma >= 35 {
-                        continue;
-                    }
-                }
-
                 if classification == PageClassification::Color {
-                    let y_lev = lut[y] as f32;
+                    let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
+                    let y_lev = lut_r[y] as f32;
                     let (mut r_lev, mut g_lev, mut b_lev) = if y == 0 {
                         (0.0f32, 0.0f32, 0.0f32)
                     } else {
@@ -490,47 +530,21 @@ pub fn analyze_and_level_image(
                     continue;
                 }
 
-                let low_thresh = if y <= 50 { 20 } else { 12 };
-                let high_thresh = 35;
+                let r_lev = lut_r[r as usize];
+                let g_lev = lut_g[g as usize];
+                let b_lev = lut_b[b as usize];
 
-                let w_neutral = if chroma <= low_thresh {
-                    1.0f32
-                } else if chroma >= high_thresh {
-                    0.0f32
+                let low_thresh = if y <= 50 { 25 } else { 12 };
+                if chroma <= low_thresh {
+                    chunk[0] = r_lev;
+                    chunk[1] = g_lev;
+                    chunk[2] = b_lev;
                 } else {
-                    (high_thresh - chroma) as f32 / (high_thresh - low_thresh) as f32
-                };
-
-                if w_neutral <= 0.001 {
-                    // Pure colorful pixel (red title, watermark, colored art) - 100% untouched!
-                    continue;
-                }
-
-                let mut r_lev = lut[r as usize] as f32;
-                let mut g_lev = lut[g as usize] as f32;
-                let mut b_lev = lut[b as usize] as f32;
-
-                if apply_paper_cast && y >= 180 {
-                    let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
-                    r_lev = (r_lev * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor)).clamp(0.0, 255.0);
-                    g_lev = (g_lev * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor)).clamp(0.0, 255.0);
-                    b_lev = (b_lev * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor)).clamp(0.0, 255.0);
-                }
-
-                if w_neutral >= 0.999 {
-                    chunk[0] = r_lev.round() as u8;
-                    chunk[1] = g_lev.round() as u8;
-                    chunk[2] = b_lev.round() as u8;
-                } else {
-                    chunk[0] = (w_neutral * r_lev + (1.0 - w_neutral) * (r as f32))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                    chunk[1] = (w_neutral * g_lev + (1.0 - w_neutral) * (g as f32))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                    chunk[2] = (w_neutral * b_lev + (1.0 - w_neutral) * (b as f32))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
+                    let w_neut = (35.0 - chroma as f32) / (35.0 - low_thresh as f32);
+                    let w_s = w_neut * w_neut * (3.0 - 2.0 * w_neut);
+                    chunk[0] = (w_s * r_lev as f32 + (1.0 - w_s) * (r as f32)).round().clamp(0.0, 255.0) as u8;
+                    chunk[1] = (w_s * g_lev as f32 + (1.0 - w_s) * (g as f32)).round().clamp(0.0, 255.0) as u8;
+                    chunk[2] = (w_s * b_lev as f32 + (1.0 - w_s) * (b as f32)).round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -548,33 +562,15 @@ pub fn analyze_and_level_image(
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
 
-                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
-
-                // Dark pedestal floor clamping:
-                // For non-color pages with an elevated black shelf (e.g. CMYK-to-sRGB mastering offset or dark floor pedestal R=25, G=15, B=3),
-                // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
-                if b_point > 0 && classification != PageClassification::Color && y <= b_point as usize && chroma <= 25 {
-                    chunk[0] = 0;
-                    chunk[1] = 0;
-                    chunk[2] = 0;
+                // Non-color pages: if chroma >= 35, completely preserve color elements / logos
+                if classification != PageClassification::Color && chroma >= 35 {
                     continue;
                 }
 
-                // Microsecond fast-path for pure neutral pixels and pure color pixels
-                if !apply_paper_cast {
-                    if chroma <= 12 {
-                        chunk[0] = lut[r as usize];
-                        chunk[1] = lut[g as usize];
-                        chunk[2] = lut[b as usize];
-                        continue;
-                    }
-                    if classification != PageClassification::Color && chroma >= 35 {
-                        continue;
-                    }
-                }
+                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
 
                 if classification == PageClassification::Color {
-                    let y_lev = lut[y] as f32;
+                    let y_lev = lut_r[y] as f32;
                     let (mut r_lev, mut g_lev, mut b_lev) = if y == 0 {
                         (0.0f32, 0.0f32, 0.0f32)
                     } else {
@@ -599,65 +595,52 @@ pub fn analyze_and_level_image(
                     continue;
                 }
 
-                let low_thresh = if y <= 50 { 20 } else { 12 };
-                let high_thresh = 35;
+                let r_lev = lut_r[r as usize];
+                let g_lev = lut_g[g as usize];
+                let b_lev = lut_b[b as usize];
 
-                let w_neutral = if chroma <= low_thresh {
-                    1.0f32
-                } else if chroma >= high_thresh {
-                    0.0f32
+                let low_thresh = if y <= 50 { 25 } else { 12 };
+                if chroma <= low_thresh {
+                    chunk[0] = r_lev;
+                    chunk[1] = g_lev;
+                    chunk[2] = b_lev;
                 } else {
-                    (high_thresh - chroma) as f32 / (high_thresh - low_thresh) as f32
-                };
-
-                if w_neutral <= 0.001 {
-                    continue;
-                }
-
-                let mut r_lev = lut[r as usize] as f32;
-                let mut g_lev = lut[g as usize] as f32;
-                let mut b_lev = lut[b as usize] as f32;
-
-                if apply_paper_cast && y >= 180 {
-                    let cast_factor = ((y as f32 - 180.0) / 55.0).clamp(0.0, 1.0);
-                    r_lev = (r_lev * (1.0 + (paper_cast_gains[0] - 1.0) * cast_factor)).clamp(0.0, 255.0);
-                    g_lev = (g_lev * (1.0 + (paper_cast_gains[1] - 1.0) * cast_factor)).clamp(0.0, 255.0);
-                    b_lev = (b_lev * (1.0 + (paper_cast_gains[2] - 1.0) * cast_factor)).clamp(0.0, 255.0);
-                }
-
-                if w_neutral >= 0.999 {
-                    chunk[0] = r_lev.round() as u8;
-                    chunk[1] = g_lev.round() as u8;
-                    chunk[2] = b_lev.round() as u8;
-                } else {
-                    chunk[0] = (w_neutral * r_lev + (1.0 - w_neutral) * (r as f32))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                    chunk[1] = (w_neutral * g_lev + (1.0 - w_neutral) * (g as f32))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                    chunk[2] = (w_neutral * b_lev + (1.0 - w_neutral) * (b as f32))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
+                    let w_neut = (35.0 - chroma as f32) / (35.0 - low_thresh as f32);
+                    let w_s = w_neut * w_neut * (3.0 - 2.0 * w_neut);
+                    chunk[0] = (w_s * r_lev as f32 + (1.0 - w_s) * (r as f32)).round().clamp(0.0, 255.0) as u8;
+                    chunk[1] = (w_s * g_lev as f32 + (1.0 - w_s) * (g as f32)).round().clamp(0.0, 255.0) as u8;
+                    chunk[2] = (w_s * b_lev as f32 + (1.0 - w_s) * (b as f32)).round().clamp(0.0, 255.0) as u8;
                 }
             }
         }
         _ => unreachable!(),
     }
 
-    info!(
-        "[AutoLevels] Leveled ({:?}): black {}->0{}, white {}->255, gamma={:.2}{}",
-        classification,
-        b_point,
-        if is_shelf { " (ink shelf detected)" } else { "" },
-        w_point,
-        config.gamma,
-        if apply_paper_cast {
-            " [paper cast corrected]"
-        } else {
-            ""
-        }
-    );
+    if use_per_channel_shelf {
+        info!(
+            "[AutoLevels] Leveled ({:?} with per-channel shelf alignment): R {}->0, G {}->0, B {}->0, white {}->255, gamma={:.2}",
+            classification,
+            bp_r,
+            bp_g,
+            bp_b,
+            w_point,
+            config.gamma,
+        );
+    } else {
+        info!(
+            "[AutoLevels] Leveled ({:?}): black {}->0{}, white {}->255, gamma={:.2}{}",
+            classification,
+            b_point,
+            if is_shelf { " (ink shelf detected)" } else { "" },
+            w_point,
+            config.gamma,
+            if apply_paper_cast {
+                " [paper cast corrected]"
+            } else {
+                ""
+            }
+        );
+    }
 
     (
         image,
