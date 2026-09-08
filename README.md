@@ -53,7 +53,7 @@ realcugan:
 
 auto_levels:
   enabled: true # enable intelligent black/white level correction and tone adjustment
-  mode: "All" # processing mode: "All" (manga + comics), "Manga" (B&W only), "Off"
+  mode: "All" # processing mode: "All" (manga + comics), "Manga" (B&W only), "Color" (color only), "Off"
   black_clip_percent: 0.1 # percentile for ink black point (0.1% preserves subtle shadow artwork)
   white_clip_percent: 0.1 # percentile for paper white point (0.1% protects soft highlights)
   max_black_shift: 30 # maximum black point shift (safeguard against crushing halftones)

@@ -29,6 +29,7 @@ pub struct AppConfig {
 pub enum AutoLevelsMode {
     All,
     Manga,
+    Color,
     Off,
 }
 
