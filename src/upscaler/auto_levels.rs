@@ -105,7 +105,7 @@ pub fn analyze_and_level_image(
                     high_chroma_count += 1;
                 }
 
-                // Ink luma (y <= 50) commonly has subtle scanner sensor noise or JPEG chroma ringing (up to ~25).
+                // Ink luma (y <= 50) commonly has subtle compression/quantization noise or JPEG chroma ringing (up to ~25).
                 // Midtones & highlights use strict neutral threshold (<= 12) to exclude colored artwork.
                 let is_neutral = if y <= 50 { chroma <= 25 } else { chroma <= 12 };
                 if is_neutral {
@@ -172,7 +172,7 @@ pub fn analyze_and_level_image(
     let neutral_ratio = neutral_count as f32 / total_valid_pixels as f32;
 
     // Content classification:
-    // - Monochrome: B&W scans without genuine color (scanner/JPEG noise chroma <= 35, high_chroma_count < 50).
+    // - Monochrome: B&W pages without genuine color (compression/quantization noise chroma <= 35, high_chroma_count < 50).
     //   Only Monochrome pages are converted to 1-channel grayscale post-upscale.
     // - Mixed: B&W manga containing color titles, watermarks, scanlator stamps, or chapter splash art.
     //   Never converted to grayscale, preserving all color elements.
@@ -236,8 +236,8 @@ pub fn analyze_and_level_image(
         (n_samples as f64 * (config.white_clip_percent.max(0.0) as f64 / 100.0)).round() as u64;
 
     // --- Ink Shelf / Surge Detection ---
-    // When manga or comics are scanned with elevated black levels (e.g. limited video range 16-235
-    // or CMYK prepress mapping), linework is elevated to bins 12..=24. If digital vector text or headers
+    // When manga or comic pages have elevated black levels (e.g. CMYK-to-sRGB mastering offsets,
+    // limited range 16-235, or prepress mapping), linework is elevated to bins 12..=24. If digital vector text or headers
     // were typeset, bin 0 has a small spike followed by an empty valley (bins 2..=14) before the true ink floor.
     // We restrict peak detection strictly to [12..=24] to avoid catching dark gray screentones / halftones (30+).
 
@@ -263,7 +263,7 @@ pub fn analyze_and_level_image(
     }
 
     // Shelf criteria:
-    // - Applied only to Monochrome and Mixed content (scanned ink with digital typesetting).
+    // - Applied only to Monochrome and Mixed content (dark ink/line art with digital typesetting).
     // - Peak in [10..=25] contains significant ink density: >= 0.5% of samples in this single bin
     // - Peak surges by at least 3.0x over the valley floor preceding it (or infinite surge if clean empty valley)
     // - Linework is not already pristine dark (dark_0_3_pct < 3.0%)
@@ -315,7 +315,7 @@ pub fn analyze_and_level_image(
         }
     } else if classification == PageClassification::Mixed {
         // Mixed content (manga with color elements or atmospheric scenes):
-        // If no scanner shelf is confirmed, treat as atmospheric artwork and protect midtones.
+        // If no ink shelf is confirmed, treat as atmospheric artwork and protect midtones.
         if !is_shelf && b_point > 12 {
             b_point = 0;
         } else {
@@ -441,8 +441,8 @@ pub fn analyze_and_level_image(
 
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
 
-                // Scanner dark pedestal floor clamping:
-                // For non-color pages with an elevated black shelf (e.g. CCD scanner offset R=25, G=15, B=3),
+                // Dark pedestal floor clamping:
+                // For non-color pages with an elevated black shelf (e.g. CMYK-to-sRGB mastering offset or dark floor pedestal R=25, G=15, B=3),
                 // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
                 if b_point > 0 && classification != PageClassification::Color && y <= b_point && chroma <= 25 {
                     chunk[0] = 0;
@@ -550,8 +550,8 @@ pub fn analyze_and_level_image(
 
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
 
-                // Scanner dark pedestal floor clamping:
-                // For non-color pages with an elevated black shelf (e.g. CCD scanner offset R=25, G=15, B=3),
+                // Dark pedestal floor clamping:
+                // For non-color pages with an elevated black shelf (e.g. CMYK-to-sRGB mastering offset or dark floor pedestal R=25, G=15, B=3),
                 // clamp dark ink pixels (lum <= b_point, chroma <= 25) directly to pitch black (0, 0, 0).
                 if b_point > 0 && classification != PageClassification::Color && y <= b_point && chroma <= 25 {
                     chunk[0] = 0;
