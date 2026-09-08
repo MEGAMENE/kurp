@@ -243,7 +243,7 @@ pub fn analyze_and_level_image(
 
     let mut max_peak_count = 0u32;
     let mut max_peak_bin = 0usize;
-    for bin in 12..=24 {
+    for bin in 10..=25 {
         if hist[bin] > max_peak_count {
             max_peak_count = hist[bin];
             max_peak_bin = bin;
@@ -251,7 +251,7 @@ pub fn analyze_and_level_image(
     }
 
     let mut min_valley_count = u32::MAX;
-    if max_peak_bin >= 12 {
+    if max_peak_bin >= 10 {
         for bin in 2..max_peak_bin {
             if hist[bin] < min_valley_count {
                 min_valley_count = hist[bin];
@@ -261,14 +261,19 @@ pub fn analyze_and_level_image(
 
     // Shelf criteria:
     // - Applied only to Monochrome and Mixed content (scanned ink with digital typesetting).
-    // - Peak in [12..=24] contains significant ink density: >= 0.5% of samples in this single bin
-    // - Peak surges by at least 3.0x over the valley floor preceding it
+    // - Peak in [10..=25] contains significant ink density: >= 0.5% of samples in this single bin
+    // - Peak surges by at least 3.0x over the valley floor preceding it (or infinite surge if clean empty valley)
     // - Linework is not already pristine dark (dark_0_3_pct < 3.0%)
+    let surge = if min_valley_count == 0 {
+        f32::INFINITY
+    } else {
+        (max_peak_count as f32) / (min_valley_count as f32)
+    };
+
     let is_shelf = classification != PageClassification::Color
-        && max_peak_bin >= 12
+        && max_peak_bin >= 10
         && (max_peak_count as f64) >= (n_samples as f64 * 0.005)
-        && min_valley_count > 0
-        && ((max_peak_count as f32) / (min_valley_count as f32) >= 3.0)
+        && surge >= 3.0
         && dark_0_3_pct < 3.0;
 
     let mut b_point = if is_shelf {
@@ -308,7 +313,7 @@ pub fn analyze_and_level_image(
     } else {
         if b_point <= 4 {
             b_point = 0;
-        } else if b_point > 45 {
+        } else if b_point > config.max_black_shift.max(45) {
             b_point = 0;
         } else if b_point > config.max_black_shift {
             b_point = config.max_black_shift;
@@ -327,6 +332,7 @@ pub fn analyze_and_level_image(
 
     if classification == PageClassification::Color
         && config.correct_paper_cast
+        && highlight_count > 0
         && highlight_count >= (total_valid_pixels / 100)
     {
         let avg_r = (sum_r_high as f32) / (highlight_count as f32);
@@ -407,6 +413,20 @@ pub fn analyze_and_level_image(
                 let max_c = r.max(g).max(b);
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
+
+                // Microsecond fast-path for pure neutral pixels and pure color pixels
+                if !apply_paper_cast {
+                    if chroma <= 12 {
+                        chunk[0] = lut[r as usize];
+                        chunk[1] = lut[g as usize];
+                        chunk[2] = lut[b as usize];
+                        continue;
+                    }
+                    if chroma >= 35 {
+                        continue;
+                    }
+                }
+
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
 
                 let low_thresh = if y <= 50 { 20 } else { 12 };
@@ -455,6 +475,10 @@ pub fn analyze_and_level_image(
         }
         DynamicImage::ImageRgba8(rgba) => {
             for chunk in (&mut **rgba).chunks_exact_mut(4) {
+                if chunk[3] == 0 {
+                    continue; // Skip fully transparent pixels
+                }
+
                 let r = chunk[0];
                 let g = chunk[1];
                 let b = chunk[2];
@@ -462,6 +486,20 @@ pub fn analyze_and_level_image(
                 let max_c = r.max(g).max(b);
                 let min_c = r.min(g).min(b);
                 let chroma = max_c - min_c;
+
+                // Microsecond fast-path for pure neutral pixels and pure color pixels
+                if !apply_paper_cast {
+                    if chroma <= 12 {
+                        chunk[0] = lut[r as usize];
+                        chunk[1] = lut[g as usize];
+                        chunk[2] = lut[b as usize];
+                        continue;
+                    }
+                    if chroma >= 35 {
+                        continue;
+                    }
+                }
+
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
 
                 let low_thresh = if y <= 50 { 20 } else { 12 };
