@@ -503,8 +503,9 @@ pub fn analyze_and_level_image(
                     continue;
                 }
 
+                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
+
                 if classification == PageClassification::Color {
-                    let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
                     let y_lev = lut_r[y] as f32;
                     let (mut r_lev, mut g_lev, mut b_lev) = if y == 0 {
                         (0.0f32, 0.0f32, 0.0f32)
