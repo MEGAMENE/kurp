@@ -16,6 +16,7 @@ pub struct LevelInfo {
     pub classification: PageClassification,
     pub black_point: u8,
     pub white_point: u8,
+    pub channel_black_points: Option<[u8; 3]>,
 }
 
 impl Default for LevelInfo {
@@ -26,6 +27,7 @@ impl Default for LevelInfo {
             classification: PageClassification::Color,
             black_point: 0,
             white_point: 255,
+            channel_black_points: None,
         }
     }
 }
@@ -218,6 +220,7 @@ pub fn analyze_and_level_image(
                 classification,
                 black_point: 0,
                 white_point: 255,
+                channel_black_points: None,
             },
         );
     }
@@ -231,6 +234,7 @@ pub fn analyze_and_level_image(
                 classification,
                 black_point: 0,
                 white_point: 255,
+                channel_black_points: None,
             },
         );
     }
@@ -322,10 +326,10 @@ pub fn analyze_and_level_image(
     // Safeguards
     if classification == PageClassification::Color {
         // Color comics: protect intentional shadow palettes and low-contrast pastel scenes
-        if b_point > 12 {
+        if b_point <= 1 || b_point > 12 {
             b_point = 0;
         }
-        if w_point < 250 {
+        if w_point >= 254 || w_point < 250 {
             w_point = 255;
         }
     } else if classification == PageClassification::Mixed {
@@ -440,6 +444,7 @@ pub fn analyze_and_level_image(
                 classification,
                 black_point: 0,
                 white_point: 255,
+                channel_black_points: None,
             },
         );
     }
@@ -500,6 +505,15 @@ pub fn analyze_and_level_image(
 
                 // Non-color pages: if chroma >= 35, completely preserve color elements / logos
                 if classification != PageClassification::Color && chroma >= 35 {
+                    continue;
+                }
+
+                // Ultra-fast path: pure neutral pixels (majority of B&W manga)
+                // Because low_thresh is either 12 or 25, chroma <= 12 is unconditionally guaranteed to receive full LUT
+                if classification != PageClassification::Color && chroma <= 12 {
+                    chunk[0] = lut_r[r as usize];
+                    chunk[1] = lut_g[g as usize];
+                    chunk[2] = lut_b[b as usize];
                     continue;
                 }
 
@@ -565,6 +579,15 @@ pub fn analyze_and_level_image(
 
                 // Non-color pages: if chroma >= 35, completely preserve color elements / logos
                 if classification != PageClassification::Color && chroma >= 35 {
+                    continue;
+                }
+
+                // Ultra-fast path: pure neutral pixels (majority of B&W manga)
+                // Because low_thresh is either 12 or 25, chroma <= 12 is unconditionally guaranteed to receive full LUT
+                if classification != PageClassification::Color && chroma <= 12 {
+                    chunk[0] = lut_r[r as usize];
+                    chunk[1] = lut_g[g as usize];
+                    chunk[2] = lut_b[b as usize];
                     continue;
                 }
 
@@ -651,6 +674,11 @@ pub fn analyze_and_level_image(
             classification,
             black_point: b_point,
             white_point: w_point,
+            channel_black_points: if use_per_channel_shelf {
+                Some([bp_r, bp_g, bp_b])
+            } else {
+                None
+            },
         },
     )
 }
