@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - development
+      - feat/auto-leveling-overhaul
   workflow_dispatch:
 
 permissions:
@@ -205,7 +206,7 @@ jobs:
           $tag = "dev-$buildDate-$shortSha"
           $title = "Kurp Windows x64 - $buildDate ($shortSha)"
           $notes = @"
-          Automated Windows x64 build from commit $env:GITHUB_SHA on branch development.
+          Automated Windows x64 build from commit $env:GITHUB_SHA on branch $env:GITHUB_REF_NAME.
           Build date: $((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'"))
 
           Includes bundled Real-CUGAN models and ncnn Vulkan runtime.
