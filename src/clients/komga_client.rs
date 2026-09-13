@@ -1,9 +1,10 @@
 use headers::{Authorization, Cookie, HeaderMap, HeaderMapExt};
 use headers::authorization::Basic;
 use log::info;
+use bytes::Bytes;
 
 use crate::models::errors::HttpError;
-use crate::models::komga::{KomgaBook, KomgaSeries};
+use crate::models::komga::{KomgaBook, KomgaPageInfo, KomgaSeries};
 
 pub struct KomgaClient {
     client: reqwest::Client,
@@ -56,6 +57,51 @@ impl KomgaClient {
             .map_err(|err| HttpError { message: err.to_string() })?;
 
         Ok(json)
+    }
+
+    pub async fn get_book_pages(
+        &self,
+        book_id: &str,
+        cookie: Option<Cookie>,
+        auth: Option<Authorization<Basic>>,
+    ) -> Result<Vec<KomgaPageInfo>, HttpError> {
+        let result = self.client.get(format!("{}/api/v1/books/{}/pages", &self.base_uri, book_id))
+            .headers(self.auth_header(cookie, auth)?)
+            .send().await
+            .map_err(|err| HttpError { message: err.to_string() })?;
+
+        info!("GET {} {}", result.url(), result.status());
+        if !result.status().is_success() {
+            return Err(HttpError { message: format!("{}, {}", result.status(), result.url()) });
+        }
+
+        let json = result.json::<Vec<KomgaPageInfo>>().await
+            .map_err(|err| HttpError { message: err.to_string() })?;
+
+        Ok(json)
+    }
+
+    pub async fn get_page_image(
+        &self,
+        book_id: &str,
+        page_number: usize,
+        cookie: Option<Cookie>,
+        auth: Option<Authorization<Basic>>,
+    ) -> Result<Bytes, HttpError> {
+        let result = self.client.get(format!("{}/api/v1/books/{}/pages/{}", &self.base_uri, book_id, page_number))
+            .headers(self.auth_header(cookie, auth)?)
+            .send().await
+            .map_err(|err| HttpError { message: err.to_string() })?;
+
+        info!("GET {} {}", result.url(), result.status());
+        if !result.status().is_success() {
+            return Err(HttpError { message: format!("{}, {}", result.status(), result.url()) });
+        }
+
+        let bytes = result.bytes().await
+            .map_err(|err| HttpError { message: err.to_string() })?;
+
+        Ok(bytes)
     }
 
     fn auth_header(

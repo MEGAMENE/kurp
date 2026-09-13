@@ -8,22 +8,13 @@ use ractor::Actor;
 use reqwest::redirect::Policy;
 use tokio::sync::broadcast;
 
-use crate::app_state::AppState;
-use crate::clients::komga_client::KomgaClient;
-use crate::clients::proxy_client::ProxyClient;
-use crate::config::app_config::AppConfig;
-use crate::tags_provider::UpscaleTagChecker;
-use crate::upscaler::upscale_actor::{UpscaleSupervisorActor, UpscaleSupervisorMessage};
-
-mod config;
-mod upscaler;
-mod http_compression;
-mod models;
-mod handlers;
-mod clients;
-mod tags_provider;
-mod app_state;
-mod server;
+use kurp::app_state::AppState;
+use kurp::clients::komga_client::KomgaClient;
+use kurp::clients::proxy_client::ProxyClient;
+use kurp::config::app_config::AppConfig;
+use kurp::server;
+use kurp::tags_provider::UpscaleTagChecker;
+use kurp::upscaler::upscale_actor::{UpscaleSupervisorActor, UpscaleSupervisorMessage};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -88,11 +79,18 @@ async fn main() {
 
         let tag_provider = Arc::new(UpscaleTagChecker::new(
             config.upscale_tag.clone(),
-            komga_client,
+            komga_client.clone(),
         ));
 
         let upscale_call_cache = Cache::new(1_000);
         let proxy_client = ProxyClient::new(reqwest_client, upstream_url_str);
+
+        let book_profile_manager = Arc::new(kurp::upscaler::book_profile::BookProfileManager::new(
+            komga_client.clone(),
+            config.auto_levels.book_profile.cache_size,
+            config.auto_levels.book_profile.parallel_page_fetches,
+            config.auto_levels.book_profile.timeout_seconds,
+        ));
 
         let state = AppState {
             config,
@@ -100,6 +98,7 @@ async fn main() {
             proxy_client: Arc::new(proxy_client),
             upscale_call_history_cache: Arc::new(upscale_call_cache),
             upscale_tag_checker: tag_provider,
+            book_profile_manager,
             shutdown_tx: tx,
         };
         server::start(state, graceful_shutdown_rx).await;

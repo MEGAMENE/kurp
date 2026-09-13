@@ -245,6 +245,53 @@ pub trait Upscaler: Send {
         (output_bytes, final_format)
     }
 
+    fn upscale_preprocessed(
+        &self,
+        image: DynamicImage,
+        image_format: ImageFormat,
+        level_info: crate::upscaler::auto_levels::LevelInfo,
+        icc_profile: Option<Vec<u8>>,
+    ) -> (Bytes, ImageFormat) {
+        let config = self.get_config();
+        let (dim_w, dim_h) = (image.width(), image.height());
+        if config.max_upscale_dimension > 0 && (dim_w > config.max_upscale_dimension || dim_h > config.max_upscale_dimension) {
+            info!(
+                "image dimensions ({}x{}) exceed max_upscale_dimension ({}). Returning original without upscaling",
+                dim_w, dim_h, config.max_upscale_dimension
+            );
+            return (encode_image(&image, image_format, icc_profile.as_deref(), config.jpeg_quality), image_format);
+        }
+
+        let upscaled = self.upscale_image(image);
+
+        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && level_info.is_monochrome {
+            (DynamicImage::ImageLuma8(upscaled.to_luma8()), None)
+        } else {
+            (upscaled, icc_profile.as_deref())
+        };
+
+        let (output_bytes, final_format) = match config.return_format {
+            Format::WebP => {
+                (encode_image(&final_image, ImageFormat::WebP, final_icc, config.jpeg_quality), ImageFormat::WebP)
+            }
+            Format::Png => {
+                (encode_image(&final_image, ImageFormat::Png, final_icc, config.jpeg_quality), ImageFormat::Png)
+            }
+            Format::Jpeg => {
+                (encode_image(&final_image, ImageFormat::Jpeg, final_icc, config.jpeg_quality), ImageFormat::Jpeg)
+            }
+            Format::Original => {
+                let target_format = match image_format {
+                    ImageFormat::Avif => ImageFormat::WebP,
+                    other => other,
+                };
+                (encode_image(&final_image, target_format, final_icc, config.jpeg_quality), target_format)
+            }
+        };
+
+        (output_bytes, final_format)
+    }
+
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
 
     fn get_config(&self) -> UpscalerConfig;

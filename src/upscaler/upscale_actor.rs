@@ -1,21 +1,24 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use image::ImageFormat;
+use image::{DynamicImage, ImageFormat};
 use log::{error, info};
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 
 use crate::config::app_config::AppConfig;
+use crate::upscaler::auto_levels::LevelInfo;
 use crate::upscaler::upscaler::{RealCuganUpscaler, Upscaler};
 
 pub enum UpscaleSupervisorMessage {
     Upscale(Bytes, ImageFormat, RpcReplyPort<(Bytes, ImageFormat)>),
+    UpscalePreprocessed(DynamicImage, ImageFormat, LevelInfo, Option<Vec<u8>>, RpcReplyPort<(Bytes, ImageFormat)>),
     Init(Arc<AppConfig>),
     Destroy,
 }
 
 pub enum UpscaleMessage {
     Upscale(Bytes, ImageFormat, RpcReplyPort<(Bytes, ImageFormat)>),
+    UpscalePreprocessed(DynamicImage, ImageFormat, LevelInfo, Option<Vec<u8>>, RpcReplyPort<(Bytes, ImageFormat)>),
 }
 
 pub struct UpscaleSupervisorActor;
@@ -42,6 +45,16 @@ impl Actor for UpscaleSupervisorActor {
                     Some(upscale_actor) => {
                         let _ = upscale_actor
                             .send_message(UpscaleMessage::Upscale(image, format, reply_to));
+                    }
+                }
+            }
+
+            UpscaleSupervisorMessage::UpscalePreprocessed(image, format, level_info, icc, reply_to) => {
+                match &state.upscale_actor {
+                    None => { return Err(From::from("Upscale Actor is not Initialized")); }
+                    Some(upscale_actor) => {
+                        let _ = upscale_actor
+                            .send_message(UpscaleMessage::UpscalePreprocessed(image, format, level_info, icc, reply_to));
                     }
                 }
             }
@@ -114,6 +127,10 @@ impl Actor for UpscaleActor {
         match message {
             UpscaleMessage::Upscale(image, format, reply_to) => {
                 let result = tokio::task::block_in_place(|| state.upscale(image, format));
+                let _ = reply_to.send(result);
+            }
+            UpscaleMessage::UpscalePreprocessed(image, format, level_info, icc, reply_to) => {
+                let result = tokio::task::block_in_place(|| state.upscale_preprocessed(image, format, level_info, icc));
                 let _ = reply_to.send(result);
             }
         }

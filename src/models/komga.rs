@@ -33,3 +33,18 @@ pub struct KomgaBookMetadata {
 pub struct KomgaBookMetadataUpdate {
     pub tags: Option<Vec<String>>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KomgaPageInfo {
+    pub number: usize,
+    #[serde(rename = "fileName", default)]
+    pub file_name: String,
+    #[serde(rename = "mediaType", default)]
+    pub media_type: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(rename = "sizeBytes", default)]
+    pub size_bytes: Option<u64>,
+}

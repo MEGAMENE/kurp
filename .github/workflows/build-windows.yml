@@ -137,6 +137,7 @@ jobs:
             Select-Object -First 1
           if (-not $ncnnDll) { throw 'Could not find ncnn.dll in the selected x64 NCNN package.' }
           "NCNN_DLL=$($ncnnDll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$($ncnnDll.Directory.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build kurp
         shell: pwsh
@@ -144,6 +145,16 @@ jobs:
           CMAKE_BUILD_TYPE: Release
           CMAKE_VERBOSE_MAKEFILE: ON
         run: cargo build --release -vv
+
+      - name: Run automated test suite
+        shell: pwsh
+        env:
+          CMAKE_BUILD_TYPE: Release
+          CMAKE_VERBOSE_MAKEFILE: ON
+        run: |
+          $ncnnDir = Split-Path -Parent $env:NCNN_DLL
+          $env:PATH = "$ncnnDir;$env:PATH"
+          cargo test --release --all-targets -- --nocapture
 
       - name: Package Windows release
         shell: pwsh
@@ -181,6 +192,44 @@ jobs:
             tta_mode: false
             num_threads: 2
             models_path: "./models"
+
+          auto_levels:
+            enabled: true
+            output_grayscale_for_monochrome: true
+
+            book_profile:
+              cache_size: 100
+              parallel_page_fetches: 8
+              timeout_seconds: 45
+
+            detection:
+              confidence_threshold: 0.75
+              black_clip_percent: 0.1
+              white_clip_percent: 0.1
+              surge_ratio_threshold: 2.8
+              protect_sepia_artwork: true
+
+            correction:
+              max_black_shift: 30
+              min_white_threshold: 200
+              correct_paper_cast: true
+              gamma: 1.0
+
+            quality_guards:
+              tier1:
+                mse_threshold: 220.0
+                psnr_min: 22.0
+                check_tail_erosion: true
+
+              tier2:
+                ssim_threshold: 0.88
+                chroma_delta_p95: 2.5
+                chroma_delta_median: 1.5
+
+              tier3:
+                gradient_ncc: 0.90
+                min_contrast_ratio: 0.50
+                stride: 4
           '@ | Set-Content -Path dist\config.yml -Encoding utf8
 
           Compress-Archive -Path dist\* -DestinationPath kurp-windows-x64.zip -Force
