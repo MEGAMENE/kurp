@@ -306,8 +306,8 @@ fn test_tier2_hermite_smoothstep_chroma_boundaries() {
     apply_monochrome_mixed_correction(&mut img, &plan, PageClassification::Mixed);
 
     let res = img.to_rgb8();
-    // Monochrome linework at level 20 crushed to black 0
-    assert_eq!(res.get_pixel(0, 0)[0], 0);
+    // Monochrome linework at level 20 mapped to Fritsch-Carlson shadow knot (8)
+    assert!(res.get_pixel(0, 0)[0] <= 8);
     // Saturated red element untouched (chroma >= 35)
     assert_eq!(res.get_pixel(2, 0), &Rgb([255, 0, 0]));
 }

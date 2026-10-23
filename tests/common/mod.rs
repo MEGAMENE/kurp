@@ -236,7 +236,7 @@ impl Default for TestAutoLevelsConfig {
             black_clip_percent: 0.1,
             white_clip_percent: 0.1,
             surge_ratio_threshold: 2.8,
-            max_black_shift: 30,
+            max_black_shift: 85,
             min_white_threshold: 200,
             correct_paper_cast: true,
             gamma: 1.0,

@@ -217,8 +217,10 @@ pub trait Upscaler: Send {
 
         let upscaled = self.upscale_image(processed_image);
 
-        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && level_info.is_monochrome {
-            (DynamicImage::ImageLuma8(upscaled.to_luma8()), None)
+        let is_mono = level_info.is_monochrome
+            || level_info.classification == crate::upscaler::auto_levels::PageClassification::Monochrome;
+        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && is_mono {
+            (fold_monochrome_post_upscale(upscaled, &level_info, config.auto_levels.output_grayscale_for_monochrome), None)
         } else {
             (upscaled, icc_profile.as_deref())
         };
@@ -264,8 +266,10 @@ pub trait Upscaler: Send {
 
         let upscaled = self.upscale_image(image);
 
-        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && level_info.is_monochrome {
-            (DynamicImage::ImageLuma8(upscaled.to_luma8()), None)
+        let is_mono = level_info.is_monochrome
+            || level_info.classification == crate::upscaler::auto_levels::PageClassification::Monochrome;
+        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && is_mono {
+            (fold_monochrome_post_upscale(upscaled, &level_info, config.auto_levels.output_grayscale_for_monochrome), None)
         } else {
             (upscaled, icc_profile.as_deref())
         };
@@ -346,5 +350,27 @@ impl Upscaler for RealCuganUpscaler {
 
     fn get_config(&self) -> UpscalerConfig {
         self.config
+    }
+}
+
+/// Folds `PageClassification::Monochrome` images to 1-channel `DynamicImage::ImageLuma8`
+/// after Real-CUGAN upscaling when `output_grayscale_for_monochrome` is enabled, while
+/// strictly preserving 3-channel RGB for `Mixed` and `Color` pages.
+pub fn fold_monochrome_post_upscale(
+    upscaled: DynamicImage,
+    level_info: &crate::upscaler::auto_levels::LevelInfo,
+    output_grayscale_for_monochrome: bool,
+) -> DynamicImage {
+    let is_mono = (level_info.is_monochrome
+        || level_info.classification == crate::upscaler::auto_levels::PageClassification::Monochrome)
+        && level_info.classification != crate::upscaler::auto_levels::PageClassification::Mixed
+        && level_info.classification != crate::upscaler::auto_levels::PageClassification::Color;
+    if output_grayscale_for_monochrome && is_mono {
+        match upscaled {
+            DynamicImage::ImageLuma8(_) => upscaled,
+            other => DynamicImage::ImageLuma8(other.to_luma8()),
+        }
+    } else {
+        upscaled
     }
 }

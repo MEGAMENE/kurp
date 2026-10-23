@@ -2,13 +2,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use headers::{Authorization, Cookie};
 use headers::authorization::Basic;
-use image::{DynamicImage, GenericImageView};
+use image::DynamicImage;
 use log::{info, warn};
 use moka::future::Cache;
 use tokio::sync::Semaphore;
 
 use crate::clients::komga_client::KomgaClient;
-use crate::upscaler::auto_levels::PageClassification;
+use crate::upscaler::auto_levels::{analyze_page, DefectType, PageClassification};
 
 #[derive(Debug, Clone)]
 pub struct ClassificationGroupStats {
@@ -168,237 +168,18 @@ impl BookProfile {
 }
 
 pub fn analyze_page_lightweight(image: &DynamicImage, page_number: usize) -> PageAnalysisSummary {
-    let (width, height) = image.dimensions();
-    if width == 0 || height == 0 {
-        return PageAnalysisSummary {
-            page_number,
-            classification: PageClassification::Color,
-            black_floor: 0,
-            white_ceiling: 255,
-            dynamic_range: 255,
-            paper_cast_detected: false,
-            noise_floor: None,
-        };
-    }
-
-    let is_already_luma = matches!(
-        image,
-        DynamicImage::ImageLuma8(_) | DynamicImage::ImageLumaA8(_)
-    );
-
-    let mut hist_y = [0u32; 256];
-    let mut hist_y_neutral = [0u32; 256];
-    let mut neutral_count: usize = 0;
-    let mut total_valid_pixels: usize = 0;
-    let mut max_chroma: u8 = 0;
-    let mut high_chroma_count: usize = 0;
-
-    let mut highlight_count: usize = 0;
-    let mut sum_r_high: u64 = 0;
-    let mut _sum_g_high: u64 = 0;
-    let mut sum_b_high: u64 = 0;
-
-    match image {
-        DynamicImage::ImageLuma8(luma) => {
-            for &p in luma.as_raw() {
-                hist_y[p as usize] += 1;
-                hist_y_neutral[p as usize] += 1;
-            }
-            total_valid_pixels = luma.len();
-            neutral_count = total_valid_pixels;
-        }
-        DynamicImage::ImageLumaA8(luma_a) => {
-            for chunk in luma_a.as_raw().chunks_exact(2) {
-                if chunk[1] >= 128 {
-                    let p = chunk[0];
-                    hist_y[p as usize] += 1;
-                    hist_y_neutral[p as usize] += 1;
-                    total_valid_pixels += 1;
-                    neutral_count += 1;
-                }
-            }
-        }
-        DynamicImage::ImageRgb8(rgb) => {
-            for chunk in rgb.as_raw().chunks_exact(3) {
-                let r = chunk[0];
-                let g = chunk[1];
-                let b = chunk[2];
-                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
-                hist_y[y] += 1;
-                total_valid_pixels += 1;
-
-                let max_c = r.max(g).max(b);
-                let min_c = r.min(g).min(b);
-                let chroma = max_c - min_c;
-                if chroma > max_chroma {
-                    max_chroma = chroma;
-                }
-                if chroma > 35 {
-                    high_chroma_count += 1;
-                }
-
-                let is_neutral = if y <= 50 { chroma <= 25 } else { chroma <= 12 };
-                if is_neutral {
-                    neutral_count += 1;
-                    hist_y_neutral[y] += 1;
-                }
-
-                if y >= 205 && r >= g && g > b && chroma <= 55 {
-                    highlight_count += 1;
-                    sum_r_high += r as u64;
-                    _sum_g_high += g as u64;
-                    sum_b_high += b as u64;
-                }
-            }
-        }
-        DynamicImage::ImageRgba8(rgba) => {
-            for chunk in rgba.as_raw().chunks_exact(4) {
-                if chunk[3] < 128 {
-                    continue;
-                }
-                let r = chunk[0];
-                let g = chunk[1];
-                let b = chunk[2];
-                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as usize;
-                hist_y[y] += 1;
-                total_valid_pixels += 1;
-
-                let max_c = r.max(g).max(b);
-                let min_c = r.min(g).min(b);
-                let chroma = max_c - min_c;
-                if chroma > max_chroma {
-                    max_chroma = chroma;
-                }
-                if chroma > 35 {
-                    high_chroma_count += 1;
-                }
-
-                let is_neutral = if y <= 50 { chroma <= 25 } else { chroma <= 12 };
-                if is_neutral {
-                    neutral_count += 1;
-                    hist_y_neutral[y] += 1;
-                }
-
-                if y >= 205 && r >= g && g > b && chroma <= 55 {
-                    highlight_count += 1;
-                    sum_r_high += r as u64;
-                    _sum_g_high += g as u64;
-                    sum_b_high += b as u64;
-                }
-            }
-        }
-        _ => {
-            let rgb = image.to_rgb8();
-            return analyze_page_lightweight(&DynamicImage::ImageRgb8(rgb), page_number);
-        }
-    }
-
-    if total_valid_pixels == 0 {
-        return PageAnalysisSummary {
-            page_number,
-            classification: PageClassification::Color,
-            black_floor: 0,
-            white_ceiling: 255,
-            dynamic_range: 255,
-            paper_cast_detected: false,
-            noise_floor: None,
-        };
-    }
-
-    let neutral_ratio = neutral_count as f32 / total_valid_pixels as f32;
-    let classification = if is_already_luma {
-        PageClassification::Monochrome
-    } else if neutral_ratio >= 0.85 {
-        if max_chroma <= 35
-            || high_chroma_count <= 50
-            || ((high_chroma_count as f32 / total_valid_pixels as f32) <= 0.00005)
-        {
-            PageClassification::Monochrome
-        } else {
-            PageClassification::Mixed
-        }
-    } else {
-        PageClassification::Color
-    };
-
-    let hist = match classification {
-        PageClassification::Monochrome => &hist_y,
-        PageClassification::Mixed => &hist_y_neutral,
-        PageClassification::Color => &hist_y,
-    };
-
-    // Bimodal shelf detection in [10..=28]
-    let mut max_peak_count = 0u32;
-    let mut max_peak_bin = 0usize;
-    for bin in 10..=28 {
-        if hist[bin] > max_peak_count {
-            max_peak_count = hist[bin];
-            max_peak_bin = bin;
-        }
-    }
-
-    let mut min_valley_count = u32::MAX;
-    if max_peak_bin >= 10 {
-        for bin in 3..max_peak_bin {
-            if hist[bin] < min_valley_count {
-                min_valley_count = hist[bin];
-            }
-        }
-    }
-
-    let surge_ratio = if min_valley_count == 0 {
-        50.0
-    } else {
-        (max_peak_count as f32) / (min_valley_count as f32)
-    };
-
-    let is_shelf = classification != PageClassification::Color
-        && max_peak_bin >= 10
-        && (max_peak_count as f64) >= (total_valid_pixels as f64 * 0.004)
-        && surge_ratio >= 2.8;
-
-    let black_floor = if is_shelf {
-        max_peak_bin as u8
-    } else {
-        let clip_target = (total_valid_pixels as f64 * 0.001).round() as u64;
-        let mut bp = 0u8;
-        let mut acc = 0u64;
-        for (level, &count) in hist.iter().enumerate() {
-            acc += count as u64;
-            if acc >= clip_target {
-                bp = level as u8;
-                break;
-            }
-        }
-        bp
-    };
-
-    let white_clip_target = (total_valid_pixels as f64 * 0.001).round() as u64;
-    let mut white_ceiling = 255u8;
-    let mut acc_h = 0u64;
-    for (level, &count) in hist.iter().enumerate().rev() {
-        acc_h += count as u64;
-        if acc_h >= white_clip_target {
-            white_ceiling = level as u8;
-            break;
-        }
-    }
-
-    let dynamic_range = white_ceiling.saturating_sub(black_floor);
-
-    let paper_cast_detected = if highlight_count >= (total_valid_pixels / 200) && highlight_count > 0 {
-        let avg_r = sum_r_high as f32 / highlight_count as f32;
-        let avg_b = sum_b_high as f32 / highlight_count as f32;
-        (avg_r - avg_b) >= 6.0
-    } else {
-        false
-    };
-
+    let config = crate::config::app_config::AutoLevelsConfig::default();
+    let analysis = analyze_page(image, page_number, &config);
+    let dynamic_range = analysis.white_ceiling.saturating_sub(analysis.black_floor);
+    let paper_cast_detected = analysis
+        .defects
+        .iter()
+        .any(|d| matches!(d.defect_type, DefectType::PaperYellowing { .. }));
     PageAnalysisSummary {
         page_number,
-        classification,
-        black_floor,
-        white_ceiling,
+        classification: analysis.classification,
+        black_floor: analysis.black_floor,
+        white_ceiling: analysis.white_ceiling,
         dynamic_range,
         paper_cast_detected,
         noise_floor: None,

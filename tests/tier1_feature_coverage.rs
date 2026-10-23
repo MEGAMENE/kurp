@@ -673,7 +673,7 @@ fn test_tier1_r7_test_auto_levels_config_defaults() {
     assert_eq!(config.black_clip_percent, 0.1);
     assert_eq!(config.white_clip_percent, 0.1);
     assert_eq!(config.surge_ratio_threshold, 2.8);
-    assert_eq!(config.max_black_shift, 30);
+    assert_eq!(config.max_black_shift, 85);
     assert_eq!(config.min_white_threshold, 200);
     assert!(config.correct_paper_cast);
     assert!(config.protect_sepia_artwork);

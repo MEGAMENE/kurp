@@ -138,7 +138,7 @@ impl Default for DetectionConfig {
 #[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct CorrectionConfig {
-    /// Maximum black point shift allowed, safeguarding against crushing halftones (default: 30).
+    /// Maximum black point shift allowed, safeguarding against crushing halftones (default: 85).
     pub max_black_shift: u8,
     /// Lower bound on white point calculation, protecting dark scenes from blowout (default: 200).
     pub min_white_threshold: u8,
@@ -151,7 +151,7 @@ pub struct CorrectionConfig {
 impl Default for CorrectionConfig {
     fn default() -> Self {
         Self {
-            max_black_shift: 30,
+            max_black_shift: 85,
             min_white_threshold: 200,
             correct_paper_cast: true,
             gamma: 1.0,
@@ -335,7 +335,7 @@ impl AppConfig {
             .set_default("auto_levels.detection.white_clip_percent", 0.1)?
             .set_default("auto_levels.detection.surge_ratio_threshold", 2.8)?
             .set_default("auto_levels.detection.protect_sepia_artwork", true)?
-            .set_default("auto_levels.correction.max_black_shift", 30)?
+            .set_default("auto_levels.correction.max_black_shift", 85)?
             .set_default("auto_levels.correction.min_white_threshold", 200)?
             .set_default("auto_levels.correction.correct_paper_cast", true)?
             .set_default("auto_levels.correction.gamma", 1.0)?
@@ -396,8 +396,8 @@ mod tests {
         assert!(cfg.detection.protect_sepia_artwork);
 
         // Correction defaults
-        assert_eq!(cfg.correction.max_black_shift, 30);
-        assert_eq!(cfg.correction.min_white_threshold, 200);
+        assert_eq!(cfg.correction.max_black_shift, 85);
+        assert_eq!(cfg.min_white_threshold(), 200);
         assert!(cfg.correction.correct_paper_cast);
         assert!((cfg.correction.gamma - 1.0).abs() < f32::EPSILON);
 
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(cfg.book_profile.cache_size, 100); // Inherited default
         assert!((cfg.detection.surge_ratio_threshold - 3.5).abs() < f32::EPSILON); // Overridden
         assert!((cfg.detection.confidence_threshold - 0.75).abs() < f32::EPSILON); // Inherited default
-        assert_eq!(cfg.correction.max_black_shift, 30); // Inherited default
+        assert_eq!(cfg.correction.max_black_shift, 85); // Inherited default
         assert_eq!(cfg.quality_guards.tier3.stride, 4); // Inherited default
     }
 
@@ -517,7 +517,7 @@ mod tests {
         let cfg: AutoLevelsConfig = serde_yaml::from_str(yaml).expect("Failed to deserialize legacy YAML");
         assert!(cfg.enabled);
         assert_eq!(cfg.mode, AutoLevelsMode::Manga);
-        assert_eq!(cfg.correction.max_black_shift, 30); // Defaults still intact
+        assert_eq!(cfg.correction.max_black_shift, 85); // Defaults still intact
     }
 
     #[test]
