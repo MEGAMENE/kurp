@@ -11,6 +11,8 @@ mod common;
 use common::*;
 
 use image::{DynamicImage, GenericImageView};
+use kurp::config::app_config::AutoLevelsConfig;
+use kurp::upscaler::auto_levels::{analyze_page, PageClassification};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -180,39 +182,22 @@ fn test_tier4_scenario3_mixed_color_bw_chapter() {
     let logo_page = generate_hermite_mixed_page(400, 600);
     let mono_page = generate_bimodal_ink_shelf_page(400, 600, 18);
 
-    let classify = |img: &DynamicImage| -> &'static str {
-        let rgb = img.to_rgb8();
-        let total = (rgb.width() * rgb.height()) as f32;
-        let mut neutral = 0f32;
-        let mut high_chroma = 0usize;
-
-        for p in rgb.pixels() {
-            let (r, g, b) = (p[0], p[1], p[2]);
-            let lum = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
-            let chroma = r.max(g).max(b) - r.min(g).min(b);
-            let is_neut = if lum <= 50 { chroma <= 25 } else { chroma <= 12 };
-            if is_neut {
-                neutral += 1.0;
-            }
-            if chroma > 35 {
-                high_chroma += 1;
-            }
-        }
-
-        if (neutral / total) >= 0.85 {
-            if high_chroma <= 50 || (high_chroma as f32 / total) <= 0.00005 {
-                "Monochrome"
-            } else {
-                "Mixed"
-            }
-        } else {
-            "Color"
-        }
-    };
-
-    assert_eq!(classify(&cover_page), "Color", "Page 1 cover must be Color");
-    assert_eq!(classify(&logo_page), "Mixed", "Page 2 with chapter logo must be Mixed");
-    assert_eq!(classify(&mono_page), "Monochrome", "Pages 3+ must be Monochrome");
+    let config = AutoLevelsConfig::default();
+    assert_eq!(
+        analyze_page(&cover_page, 1, &config).classification,
+        PageClassification::Color,
+        "Page 1 cover must be Color"
+    );
+    assert_eq!(
+        analyze_page(&logo_page, 2, &config).classification,
+        PageClassification::Mixed,
+        "Page 2 with chapter logo must be Mixed"
+    );
+    assert_eq!(
+        analyze_page(&mono_page, 3, &config).classification,
+        PageClassification::Monochrome,
+        "Pages 3+ must be Monochrome"
+    );
 }
 
 // ============================================================================

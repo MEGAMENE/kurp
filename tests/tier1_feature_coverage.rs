@@ -16,7 +16,7 @@ use bytes::Bytes;
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use kurp::config::app_config::AutoLevelsConfig;
 use kurp::upscaler::auto_levels::{
-    analyze_page, is_neutral_pixel, level_and_verify, Outcome, PageClassification,
+    analyze_page, level_and_verify, rgb_to_lab_fast, Outcome, PageClassification,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -266,19 +266,25 @@ fn test_tier1_r3_rec709_integer_luminance_precision() {
 }
 
 #[test]
-fn test_tier1_r3_dual_threshold_neutral_filtering() {
-    let check = |r: u8, g: u8, b: u8| -> bool {
-        let y = ((54 * (r as u32) + 183 * (g as u32) + 19 * (b as u32) + 128) >> 8) as u8;
-        is_neutral_pixel(r, g, b, y)
+fn test_tier1_r3_cielab_euclidean_chroma_neutral_filtering() {
+    let is_neutral = |r: u8, g: u8, b: u8| -> bool {
+        let (l, a, b_val) = rgb_to_lab_fast(r, g, b);
+        let c_star = (a * a + b_val * b_val).sqrt();
+        !(c_star >= 6.0 && l >= 2.0)
     };
 
-    // Dark ink with slight compression ringing
-    assert!(check(25, 20, 10)); // y <= 50, chroma = 15 <= 25 -> true
-    assert!(!check(40, 10, 0)); // y <= 50, chroma = 40 > 25 -> false
+    // Dark ink with 1-bit JPEG compression noise (e.g. [5, 4, 3]) must remain neutral
+    assert!(is_neutral(5, 4, 3));
+    assert!(is_neutral(15, 15, 14));
 
-    // Highlight / paper
-    assert!(check(245, 245, 240)); // y > 50, chroma = 5 <= 12 -> true
-    assert!(!check(245, 230, 200)); // y > 50, chroma = 45 > 12 -> false (warm sepia / color)
+    // Clean or slightly aged paper highlights
+    assert!(is_neutral(245, 245, 244));
+    assert!(is_neutral(246, 245, 240));
+
+    // Intentional chromatic pixels (C* >= 6.0)
+    assert!(!is_neutral(245, 230, 195)); // Warm sepia / yellowed tone (C* > 10.0)
+    assert!(!is_neutral(220, 235, 245)); // Pastel blue sky (L*=92.1, C*=7.17 >= 6.0)
+    assert!(!is_neutral(210, 25, 25));   // Vibrant red logo
 }
 
 #[test]
@@ -324,11 +330,11 @@ fn test_tier1_r3_zero_ink_page_guard() {
 #[test]
 fn test_tier1_r3_authentic_black_linework_discriminator() {
     // True deep black manga ink fill (>3.0% in bins 0-2) does NOT disqualify the shelf!
-    let mut img = generate_bimodal_ink_shelf_page(200, 200, 18);
+    let mut img = generate_bimodal_ink_shelf_page(400, 400, 18);
     let rgb = img.as_mut_rgb8().unwrap();
-    // Add 5% level-0 authentic black text/borders (2000 pixels)
-    for i in 0..2000 {
-        rgb.put_pixel(i % 200, i / 200, Rgb([0, 0, 0]));
+    // Add 3% additional level-0 authentic black text/borders (4800 pixels)
+    for i in 0..4800 {
+        rgb.put_pixel(i % 400, i / 400, Rgb([0, 0, 0]));
     }
 
     let config = AutoLevelsConfig::default();

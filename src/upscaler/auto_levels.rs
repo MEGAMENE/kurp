@@ -653,16 +653,6 @@ pub fn build_monotonic_tone_lut(lo: f32, hi: f32) -> [u8; 256] {
 // ============================================================================
 
 
-#[allow(dead_code)]
-#[inline]
-pub fn is_neutral_pixel(r: u8, g: u8, b: u8, y: u8) -> bool {
-    let chroma = r.max(g).max(b) - r.min(g).min(b);
-    if y <= 50 {
-        chroma <= 25
-    } else {
-        chroma <= 12
-    }
-}
 
 pub fn analyze_page(
     image: &DynamicImage,
