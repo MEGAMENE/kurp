@@ -172,65 +172,7 @@ jobs:
           git clone --depth 1 https://github.com/nihui/realcugan-ncnn-vulkan.git "$env:RUNNER_TEMP\realcugan-models"
           Copy-Item "$env:RUNNER_TEMP\realcugan-models\models\*" dist\models\ -Recurse -Force
 
-          @'
-          port: 3030
-          upstream_url: "http://localhost:8080"
-          allow_config_updates: false
-          upscale: true
-          size_threshold_enabled: true
-          size_threshold: 500
-          size_threshold_png: 1000
-          return_format: WebP
-
-          realcugan:
-            gpuid: 0
-            scale: 2
-            noise: -1
-            model: Se
-            tile_size: 0
-            sync_gap: 3
-            tta_mode: false
-            num_threads: 2
-            models_path: "./models"
-
-          auto_levels:
-            enabled: true
-            output_grayscale_for_monochrome: true
-
-            book_profile:
-              cache_size: 100
-              parallel_page_fetches: 8
-              timeout_seconds: 45
-
-            detection:
-              confidence_threshold: 0.75
-              black_clip_percent: 0.1
-              white_clip_percent: 0.1
-              surge_ratio_threshold: 2.8
-              protect_sepia_artwork: true
-
-            correction:
-              max_black_shift: 30
-              min_white_threshold: 200
-              correct_paper_cast: true
-              gamma: 1.0
-
-            quality_guards:
-              tier1:
-                mse_threshold: 220.0
-                psnr_min: 22.0
-                check_tail_erosion: true
-
-              tier2:
-                ssim_threshold: 0.88
-                chroma_delta_p95: 2.5
-                chroma_delta_median: 1.5
-
-              tier3:
-                gradient_ncc: 0.90
-                min_contrast_ratio: 0.50
-                stride: 4
-          '@ | Set-Content -Path dist\config.yml -Encoding utf8
+          Copy-Item config.yml dist\config.yml
 
           Compress-Archive -Path dist\* -DestinationPath kurp-windows-x64.zip -Force
           (Get-FileHash kurp-windows-x64.zip -Algorithm SHA256).Hash | Out-File kurp-windows-x64.sha256 -Encoding ascii
@@ -267,4 +209,12 @@ jobs:
           } else {
             gh release edit $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $title --notes $notes --prerelease
             gh release upload $tag kurp-windows-x64.zip kurp-windows-x64.sha256 --repo $env:GITHUB_REPOSITORY --clobber
+          }
+
+          # Also update rolling windows-latest release
+          gh release view windows-latest --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create windows-latest kurp-windows-x64.zip kurp-windows-x64.sha256 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Windows Latest" --notes "Latest automated build from commit $shortSha ($buildDate)" --prerelease
+          } else {
+            gh release upload windows-latest kurp-windows-x64.zip kurp-windows-x64.sha256 --repo $env:GITHUB_REPOSITORY --clobber
           }

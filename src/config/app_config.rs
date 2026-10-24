@@ -25,18 +25,13 @@ pub struct AppConfig {
     pub allow_config_updates: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum AutoLevelsMode {
+    #[default]
     All,
     Manga,
     Color,
     Off,
-}
-
-impl Default for AutoLevelsMode {
-    fn default() -> Self {
-        AutoLevelsMode::All
-    }
 }
 
 /// Production Hierarchical Configuration for Kurp Auto-Leveling System Overhaul.
@@ -160,7 +155,7 @@ impl Default for CorrectionConfig {
 }
 
 /// Multi-Tier Quality Guard verification container.
-#[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct QualityGuardsConfig {
     /// Tier 1: Fast mathematical bounds (<1ms: MSE, PSNR, tail slope erosion).
@@ -172,16 +167,6 @@ pub struct QualityGuardsConfig {
     /// Tier 3: Structural fidelity (<8ms: strided Sobel NCC, activity-gated block Michelson contrast).
     #[serde(default)]
     pub tier3: Tier3Config,
-}
-
-impl Default for QualityGuardsConfig {
-    fn default() -> Self {
-        Self {
-            tier1: Tier1Config::default(),
-            tier2: Tier2Config::default(),
-            tier3: Tier3Config::default(),
-        }
-    }
 }
 
 /// Tier 1 Quality Guard configuration: Fast sub-millisecond mathematical sanity checks.

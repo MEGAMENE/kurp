@@ -190,12 +190,9 @@ pub enum DefectType {
         highlight_rgb: (f32, f32, f32),
         is_differential: bool,
     },
-    ClippedHighlights {
+    DullHighlights {
         white_point: u8,
         has_plateau: bool,
-    },
-    ElevatedNoiseFloor {
-        noise_sigma: f32,
     },
 }
 
@@ -214,7 +211,6 @@ pub struct CorrectionPlan {
     pub white_point: u8,
     pub correction_fraction: f32,
     pub gamma: f32,
-    pub per_channel_black: Option<(u8, u8, u8)>,
     pub paper_cast_gains: Option<(f32, f32, f32)>,
     pub paper_cast_ramp_start: u8,
     pub use_oklab: bool,
@@ -228,7 +224,6 @@ impl Default for CorrectionPlan {
             white_point: 255,
             correction_fraction: 1.0,
             gamma: 1.0,
-            per_channel_black: None,
             paper_cast_gains: None,
             paper_cast_ramp_start: 180,
             use_oklab: false,
@@ -299,11 +294,12 @@ impl QualityVerdict {
 #[derive(Debug, Clone)]
 pub struct LevelInfo {
     pub was_leveled: bool,
+    #[allow(dead_code)]
     pub is_monochrome: bool,
     pub classification: PageClassification,
     pub black_point: u8,
     pub white_point: u8,
-    pub channel_black_points: Option<[u8; 3]>,
+    #[allow(dead_code)]
     pub quality_verdict: Option<QualityVerdict>,
 }
 
@@ -315,7 +311,6 @@ impl Default for LevelInfo {
             classification: PageClassification::Color,
             black_point: 0,
             white_point: 255,
-            channel_black_points: None,
             quality_verdict: None,
         }
     }
@@ -330,27 +325,19 @@ pub struct DualZoneSample {
 
 #[derive(Debug, Clone)]
 pub struct PageAnalysis {
-    pub page_number: usize,
     pub classification: PageClassification,
     pub luminance_histogram: [u32; 256],
-    pub neutral_luminance_histogram: [u32; 256],
-    pub neutral_channel_histograms: ([u32; 256], [u32; 256], [u32; 256]),
     pub total_pixels: usize,
-    pub neutral_pixel_count: usize,
-    pub neutral_ratio: f32,
-    pub max_chroma: u8,
-    pub high_chroma_count: usize,
     pub highlight_sample: DualZoneSample,
     pub shadow_sample: DualZoneSample,
     pub defects: Vec<DefectDetection>,
     pub black_floor: u8,
     pub white_ceiling: u8,
     pub is_shelf_detected: bool,
-    pub per_channel_black: Option<(u8, u8, u8)>,
 }
 
 // ============================================================================
-// Histogram Percentiles, Effective Black/White & Valley Validation (Upgrade B)
+// Histogram Percentiles, Effective Black/White & Valley Validation
 // ============================================================================
 
 #[inline]
@@ -422,11 +409,11 @@ pub fn find_effective_white(hist_y: &[u32; 256], p99: f32) -> f32 {
     if total == 0 {
         return p99;
     }
-    let hi_mass = (hist_y[253] as u64 + hist_y[254] as u64 + hist_y[255] as u64) as f64 / total as f64;
-    if hi_mass > 0.0005 && hi_mass < 0.25 {
+    let digital_white_mass = (hist_y[253] as u64 + hist_y[254] as u64 + hist_y[255] as u64) as f64 / total as f64;
+    if digital_white_mass > 0.0005 && digital_white_mass < 0.25 {
         let paper_total: u64 = hist_y[160..253].iter().map(|&c| c as u64).sum();
         let paper_mass = paper_total as f64 / total as f64;
-        if paper_mass >= 0.15 && paper_mass > hi_mass {
+        if paper_mass >= 0.15 && paper_mass > digital_white_mass {
             let target = ((paper_total as f64) * 0.98).ceil().max(1.0) as u64;
             let mut acc = 0u64;
             let mut idx_p98 = 252usize;
@@ -517,6 +504,18 @@ fn validate_bimodal_valley_only(
         return 0.0;
     }
 
+    // Digital Spike Guard: require candidate drawing-ink peak mass to exceed digital black spike mass
+    let zero_count = hist_y[0] as u64 + hist_y[1] as u64 + hist_y[2] as u64;
+    let m_zero = zero_count as f64 / total_pixels as f64;
+    if m_zero >= 0.002 {
+        let p_lo = peak_idx.saturating_sub(2);
+        let p_hi = (peak_idx + 2).min(255);
+        let peak_mass: u64 = hist_y[p_lo..=p_hi].iter().map(|&c| c as u64).sum();
+        if peak_mass < (zero_count as f64 * 1.25).round() as u64 {
+            return 0.0;
+        }
+    }
+
     let search_valley_hi = (hi.floor() as usize).min(140);
     let start_valley = lo_idx.max(peak_idx);
     if start_valley >= search_valley_hi {
@@ -540,7 +539,7 @@ fn validate_bimodal_valley_only(
 }
 
 // ============================================================================
-// Fritsch-Carlson Monotonic Cubic Spline 256-Entry Luminance LUT (Upgrade C)
+// Fritsch-Carlson Monotonic Cubic Spline 256-Entry Luminance LUT
 // ============================================================================
 
 /// Builds a strictly monotonic 256-element tone curve lookup table (LUT) using
@@ -557,25 +556,30 @@ pub fn build_monotonic_tone_lut(lo: f32, hi: f32) -> [u8; 256] {
         return identity;
     }
 
-    let mut knots: Vec<(f64, f64)> = Vec::with_capacity(5);
-    knots.push((0.0, 0.0));
+    let mut knots = [(0.0f64, 0.0f64); 5];
+    let mut n = 0usize;
+    knots[n] = (0.0, 0.0);
+    n += 1;
     if lo_c >= 2.0 {
-        knots.push((lo_c, 8.0));
+        knots[n] = (lo_c, 8.0);
+        n += 1;
     }
-    knots.push(((lo_c + hi_c) * 0.5, 128.0));
+    knots[n] = ((lo_c + hi_c) * 0.5, 128.0);
+    n += 1;
     if hi_c <= 253.0 {
-        knots.push((hi_c, 248.0));
+        knots[n] = (hi_c, 248.0);
+        n += 1;
     }
-    knots.push((255.0, 255.0));
+    knots[n] = (255.0, 255.0);
+    n += 1;
 
-    let n = knots.len();
-    let mut deltas = vec![0.0f64; n - 1];
+    let mut deltas = [0.0f64; 4];
     for k in 0..(n - 1) {
         let dx = (knots[k + 1].0 - knots[k].0).max(1e-6);
         deltas[k] = (knots[k + 1].1 - knots[k].1) / dx;
     }
 
-    let mut d = vec![0.0f64; n];
+    let mut d = [0.0f64; 5];
     d[0] = deltas[0];
     d[n - 1] = deltas[n - 2];
 
@@ -645,44 +649,27 @@ pub fn build_monotonic_tone_lut(lo: f32, hi: f32) -> [u8; 256] {
 }
 
 // ============================================================================
-// Page Analysis & Stride-4 CIELAB Pre-Flight (Upgrade A)
+// Page Analysis & Stride-4/12 CIELAB Pre-Flight
 // ============================================================================
 
-#[inline]
-pub fn is_neutral_pixel(r: u8, g: u8, b: u8, y: u8) -> bool {
-    let chroma = r.max(g).max(b) - r.min(g).min(b);
-    if y <= 50 {
-        chroma <= 25 // Dark ink region: accommodates JPEG chroma ringing & subsampling
-    } else {
-        chroma <= 12 // Midtones & highlights: strict neutrality
-    }
-}
 
 pub fn analyze_page(
     image: &DynamicImage,
-    page_number: usize,
+    _page_number: usize,
     config: &AutoLevelsConfig,
 ) -> PageAnalysis {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
         return PageAnalysis {
-            page_number,
             classification: PageClassification::Color,
             luminance_histogram: [0; 256],
-            neutral_luminance_histogram: [0; 256],
-            neutral_channel_histograms: ([0; 256], [0; 256], [0; 256]),
             total_pixels: 0,
-            neutral_pixel_count: 0,
-            neutral_ratio: 0.0,
-            max_chroma: 0,
-            high_chroma_count: 0,
             highlight_sample: DualZoneSample::default(),
             shadow_sample: DualZoneSample::default(),
             defects: Vec::new(),
             black_floor: 0,
             white_ceiling: 255,
             is_shelf_detected: false,
-            per_channel_black: None,
         };
     }
 
@@ -692,10 +679,6 @@ pub fn analyze_page(
     );
 
     let mut hist_y = [0u32; 256];
-    let mut hist_y_neutral = [0u32; 256];
-    let mut hist_r_neutral = [0u32; 256];
-    let mut hist_g_neutral = [0u32; 256];
-    let mut hist_b_neutral = [0u32; 256];
     let mut total_valid_pixels: usize = 0;
 
     // 58-bin modal paper peak histogram for L* in [70.0, 99.0)
@@ -716,8 +699,6 @@ pub fn analyze_page(
     let mut yellow_paper_colored_count = 0usize;
     let mut muddy_shadow_colored_count = 0usize;
     let mut high_chroma_accent_count = 0usize;
-    let mut max_chroma: u8 = 0;
-
     let mut hl_count: usize = 0;
     let mut hl_sum_r: u64 = 0;
     let mut hl_sum_g: u64 = 0;
@@ -759,7 +740,6 @@ pub fn analyze_page(
                     hist_y[p as usize] += 1;
                 }
             }
-            hist_y_neutral = hist_y;
             sampled_pixels = total_valid_pixels;
             max_observed_l = 100.0;
         }
@@ -768,7 +748,6 @@ pub fn analyze_page(
                 if chunk[1] >= 128 {
                     let p = chunk[0];
                     hist_y[p as usize] += 1;
-                    hist_y_neutral[p as usize] += 1;
                     total_valid_pixels += 1;
                 }
             }
@@ -816,9 +795,6 @@ pub fn analyze_page(
                     };
 
                     hist_y[y_lum as usize] += scale_weight;
-                    if rgb_diff > max_chroma {
-                        max_chroma = rgb_diff;
-                    }
                     if l_star > max_observed_l {
                         max_observed_l = l_star;
                     }
@@ -837,15 +813,9 @@ pub fn analyze_page(
                         if c_star >= 20.0 && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0) {
                             high_chroma_accent_count += 1;
                         }
-                    } else {
-                        hist_y_neutral[y_lum as usize] += scale_weight;
                     }
 
-                    if y_lum <= 40 && rgb_diff <= 25 {
-                        hist_r_neutral[r as usize] += scale_weight;
-                        hist_g_neutral[g as usize] += scale_weight;
-                        hist_b_neutral[b as usize] += scale_weight;
-                    }
+                    
 
                     // Paper candidate filter: (L* >= 65.0) & (C* < 42.0) & (|a*| < 12.0)
                     if l_star >= 65.0 && c_star < 42.0 && a_star.abs() < 12.0 {
@@ -939,9 +909,6 @@ pub fn analyze_page(
                     total_valid_pixels += scale_weight as usize;
                     sampled_pixels += 1;
 
-                    if rgb_diff > max_chroma {
-                        max_chroma = rgb_diff;
-                    }
                     if l_star > max_observed_l {
                         max_observed_l = l_star;
                     }
@@ -957,15 +924,9 @@ pub fn analyze_page(
                         if c_star >= 20.0 && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0) {
                             high_chroma_accent_count += 1;
                         }
-                    } else {
-                        hist_y_neutral[y_lum as usize] += scale_weight;
                     }
 
-                    if y_lum <= 40 && rgb_diff <= 25 {
-                        hist_r_neutral[r as usize] += scale_weight;
-                        hist_g_neutral[g as usize] += scale_weight;
-                        hist_b_neutral[b as usize] += scale_weight;
-                    }
+                    
 
                     if l_star >= 65.0 && c_star < 42.0 && a_star.abs() < 12.0 {
                         if (70.0..99.0).contains(&l_star) {
@@ -1013,29 +974,21 @@ pub fn analyze_page(
         }
         _ => {
             let rgb = image.to_rgb8();
-            return analyze_page(&DynamicImage::ImageRgb8(rgb), page_number, config);
+            return analyze_page(&DynamicImage::ImageRgb8(rgb), _page_number, config);
         }
     }
 
     if total_valid_pixels == 0 || sampled_pixels == 0 {
         return PageAnalysis {
-            page_number,
             classification: PageClassification::Color,
             luminance_histogram: hist_y,
-            neutral_luminance_histogram: hist_y_neutral,
-            neutral_channel_histograms: (hist_r_neutral, hist_g_neutral, hist_b_neutral),
             total_pixels: 0,
-            neutral_pixel_count: 0,
-            neutral_ratio: 0.0,
-            max_chroma: 0,
-            high_chroma_count: 0,
             highlight_sample: DualZoneSample::default(),
             shadow_sample: DualZoneSample::default(),
             defects: Vec::new(),
             black_floor: 0,
             white_ceiling: 255,
             is_shelf_detected: false,
-            per_channel_black: None,
         };
     }
 
@@ -1088,7 +1041,8 @@ pub fn analyze_page(
 
     // 4x4 Spatial Grid Median b* variation (delta_b_grid)
     let min_cell_samples = ((sampled_pixels / 16) / 25).clamp(5, 25) as u32;
-    let mut cell_medians_b = Vec::with_capacity(16);
+    let mut cell_medians_b = [0.0f32; 16];
+    let mut num_cell_medians = 0usize;
     for c_idx in 0..16 {
         let cnt = cell_b_count[c_idx];
         if cnt >= min_cell_samples {
@@ -1098,17 +1052,18 @@ pub fn analyze_page(
                 acc += bc;
                 if acc >= target {
                     let b_val = (b_bin as i32 - 20) as f32;
-                    cell_medians_b.push(b_val);
+                    cell_medians_b[num_cell_medians] = b_val;
+                    num_cell_medians += 1;
                     break;
                 }
             }
         }
     }
 
-    let (delta_b_grid, max_grid_b) = if cell_medians_b.len() >= 4 {
+    let (delta_b_grid, max_grid_b) = if num_cell_medians >= 4 {
         let mut min_b = f32::MAX;
         let mut max_b = f32::MIN;
-        for &mb in &cell_medians_b {
+        for &mb in &cell_medians_b[..num_cell_medians] {
             if mb < min_b {
                 min_b = mb;
             }
@@ -1125,7 +1080,12 @@ pub fn analyze_page(
         let avg_r = hl_sum_r as f32 / hl_count as f32;
         let avg_g = hl_sum_g as f32 / hl_count as f32;
         let avg_b = hl_sum_b as f32 / hl_count as f32;
-        let chroma = avg_r.max(avg_g).max(avg_b) - avg_r.min(avg_g).min(avg_b);
+        let (_, ha, hb) = rgb_to_lab_fast(
+            avg_r.round() as u8,
+            avg_g.round() as u8,
+            avg_b.round() as u8,
+        );
+        let chroma = (ha * ha + hb * hb).sqrt();
         DualZoneSample {
             count: hl_count,
             avg_rgb: (avg_r, avg_g, avg_b),
@@ -1177,27 +1137,25 @@ pub fn analyze_page(
         && (shadow_sample.avg_rgb.0 > shadow_sample.avg_rgb.2 + 4.0);
     let is_intentional_sepia = shadow_is_warm && delta_b_grid < 12.0 && paper_b >= 5.0;
 
-    let has_paper_or_margin_cast = !is_intentional_sepia
+    let has_true_paper_cast = !is_intentional_sepia
         && paper_l_peak >= 50.0
         && (paper_c > 3.0
             || paper_b >= 5.0
-            || delta_b_grid >= 12.0
-            || (highlight_sample.chroma >= 6.0 && !shadow_is_warm)
-            || (shadow_chroma_lab >= 2.5 && paper_c <= 3.5));
+            || delta_b_grid >= 12.0);
 
-    // Compute intentional color pixel ratio R_color (excluding verified paper yellowing & muddy shadow cast)
-    let effective_colored_count = if has_paper_or_margin_cast {
-        raw_colored_count
-            .saturating_sub(yellow_paper_colored_count)
-            .saturating_sub(muddy_shadow_colored_count)
-    } else {
-        raw_colored_count
-    };
+    // Compute intentional color pixel ratio R_color (excluding verified paper yellowing and muddy shadow ink)
+    let is_muddy_ink_dominant = raw_colored_count > 0
+        && (muddy_shadow_colored_count as f32 / raw_colored_count as f32) >= 0.60;
+    let mut effective_colored_count = raw_colored_count;
+    if has_true_paper_cast {
+        effective_colored_count = effective_colored_count.saturating_sub(yellow_paper_colored_count);
+    }
+    if is_muddy_ink_dominant || has_true_paper_cast {
+        effective_colored_count = effective_colored_count.saturating_sub(muddy_shadow_colored_count);
+    }
 
     let r_color = effective_colored_count as f32 / sampled_pixels as f32;
     let r_accent = high_chroma_accent_count as f32 / sampled_pixels as f32;
-    let neutral_ratio = (1.0 - r_color).clamp(0.0, 1.0);
-    let neutral_pixel_count = ((total_valid_pixels as f32) * neutral_ratio).round() as usize;
 
     let classification = if is_already_luma {
         PageClassification::Monochrome
@@ -1209,32 +1167,20 @@ pub fn analyze_page(
         PageClassification::Mixed
     };
 
-    if has_paper_or_margin_cast && classification != PageClassification::Color {
-        hist_y_neutral = hist_y;
-    }
-
     let min_y = hist_y.iter().position(|&c| c > 0).unwrap_or(0) as u8;
     let max_y = hist_y.iter().rposition(|&c| c > 0).unwrap_or(255) as u8;
     let dynamic_range = max_y.saturating_sub(min_y);
 
     let mut analysis = PageAnalysis {
-        page_number,
         classification,
         luminance_histogram: hist_y,
-        neutral_luminance_histogram: hist_y_neutral,
-        neutral_channel_histograms: (hist_r_neutral, hist_g_neutral, hist_b_neutral),
         total_pixels: total_valid_pixels,
-        neutral_pixel_count,
-        neutral_ratio,
-        max_chroma,
-        high_chroma_count: high_chroma_accent_count,
         highlight_sample,
         shadow_sample,
         defects: Vec::new(),
         black_floor: 0,
         white_ceiling: 255,
         is_shelf_detected: false,
-        per_channel_black: None,
     };
 
     if dynamic_range < 10
@@ -1278,13 +1224,22 @@ pub fn analyze_page(
         }
     }
 
+    // Shadow chroma >= 2.5 only flags a cast when an elevated drawing-ink shelf is actually present
+    let has_muddy_shadow_cast = !is_intentional_sepia
+        && paper_l_peak >= 50.0
+        && shadow_chroma_lab >= 2.5
+        && paper_c <= 3.5
+        && (analysis.is_shelf_detected || analysis.black_floor >= 8);
+    let has_paper_or_margin_cast = has_true_paper_cast || has_muddy_shadow_cast;
+
     // Already-Optimal Dynamic Range Veto:
     // If p1 <= 1.0 && p99 >= 254.0 && C*_paper <= 3.0 && delta_b*_grid < 12.0
     // and no validated bimodal drawing-ink shelf exists above bin 2, return immediately with zero defects.
     let eff_white = find_effective_white(&hist_y, p99_y);
+    let paper_is_optimal = paper_c <= 3.0 && paper_b < 5.0 && delta_b_grid < 12.0;
     if p1_y <= 1.0
         && eff_white >= 254.0
-        && !has_paper_or_margin_cast
+        && paper_is_optimal
         && !analysis.is_shelf_detected
     {
         analysis.black_floor = 0;
@@ -1302,7 +1257,7 @@ pub fn analyze_page(
         if let Some(d) = detect_paper_yellowing(&analysis, classification, config) {
             defects.push(d);
         } else if has_paper_or_margin_cast {
-            let cast_mag = paper_c.max(delta_b_grid).max(shadow_chroma_lab).max(6.0);
+            let cast_mag = paper_c.max(delta_b_grid).max(if has_muddy_shadow_cast { shadow_chroma_lab } else { 0.0 }).max(6.0);
             defects.push(DefectDetection {
                 defect_type: DefectType::PaperYellowing {
                     cast_magnitude: cast_mag,
@@ -1319,29 +1274,29 @@ pub fn analyze_page(
             });
         }
 
-        if let Some(d) = detect_clipped_highlights(
-            &analysis.luminance_histogram,
-            classification,
-            total_valid_pixels,
-            config,
-        ) {
-            if let DefectType::ClippedHighlights { white_point, .. } = d.defect_type {
-                analysis.white_ceiling = white_point;
+        if !high_key_veto {
+            if let Some(d) = detect_dull_highlights(
+                &analysis.luminance_histogram,
+                classification,
+                total_valid_pixels,
+                config,
+            ) {
+                if let DefectType::DullHighlights { white_point, .. } = d.defect_type {
+                    analysis.white_ceiling = white_point;
+                }
+                defects.push(d);
             }
-            defects.push(d);
         }
     }
 
-    if let Some(d) = detect_elevated_noise_floor(image, classification) {
-        defects.push(d);
-    }
+    // Note: detect_elevated_noise_floor is omitted so halftone screentones aren't tagged with dead noise-floor badges
 
     analysis.defects = defects;
     analysis
 }
 
 // ============================================================================
-// Defect Detection Engine (Section 3c & Upgrade B)
+// Defect Detection Engine
 // ============================================================================
 
 pub fn detect_elevated_black_floor(
@@ -1366,47 +1321,81 @@ pub fn detect_elevated_black_floor(
         return None;
     }
 
-    // 1. Check classic compact bimodal shelf in [10..=28]
-    let mut max_peak_count = 0u32;
+    let zero_count = hist[0] as u64 + hist[1] as u64 + hist[2] as u64;
+    let m_zero = zero_count as f64 / n_samples as f64;
+    let h_smooth = smooth_histogram_binomial_5(hist);
+
+    // 1. Check classic compact bimodal shelf in [10..=28] using smoothed histogram
+    let mut max_peak_val = 0.0f32;
     let mut max_peak_bin = 0usize;
     for bin in 10..=28 {
-        if hist[bin] > max_peak_count {
-            max_peak_count = hist[bin];
+        if h_smooth[bin] > max_peak_val {
+            max_peak_val = h_smooth[bin];
             max_peak_bin = bin;
         }
     }
 
-    let mut min_valley_count = u32::MAX;
-    if max_peak_bin >= 3 {
-        for bin in 3..max_peak_bin {
-            if hist[bin] < min_valley_count {
-                min_valley_count = hist[bin];
+    let start_valley = if zero_count > 0 { 5 } else { 3 };
+    let mut min_valley_before = f32::MAX;
+    if max_peak_bin > start_valley {
+        for bin in start_valley..max_peak_bin {
+            if h_smooth[bin] < min_valley_before {
+                min_valley_before = h_smooth[bin];
             }
         }
     }
 
-    let surge_ratio = if min_valley_count == 0 {
+    let has_trough_before = max_peak_bin > start_valley && min_valley_before < max_peak_val;
+
+    let search_valley_hi = 85;
+    let mut min_valley_after = f32::MAX;
+    if max_peak_bin < search_valley_hi {
+        for bin in (max_peak_bin + 1)..=search_valley_hi {
+            if h_smooth[bin] < min_valley_after {
+                min_valley_after = h_smooth[bin];
+            }
+        }
+    }
+    let has_valley_after = min_valley_after < 0.65 * max_peak_val;
+
+    let surge_ratio = if !has_trough_before {
+        1.0
+    } else if min_valley_before <= 0.0 {
         50.0
     } else {
-        max_peak_count as f32 / min_valley_count as f32
+        max_peak_val / min_valley_before
     };
 
-    let half_max = max_peak_count / 2;
+    let peak_count_raw = hist[max_peak_bin];
+    let half_max_raw = peak_count_raw / 2;
     let mut left_fwhm = max_peak_bin;
-    while left_fwhm > 0 && hist[left_fwhm] >= half_max {
+    while left_fwhm > 0 && hist[left_fwhm] >= half_max_raw {
         left_fwhm -= 1;
     }
     let mut right_fwhm = max_peak_bin;
-    while right_fwhm < 255 && hist[right_fwhm] >= half_max {
+    while right_fwhm < 255 && hist[right_fwhm] >= half_max_raw {
         right_fwhm += 1;
     }
     let fwhm = (right_fwhm.saturating_sub(left_fwhm + 1)).max(1);
 
+    let peak_lo = max_peak_bin.saturating_sub(2);
+    let peak_hi = (max_peak_bin + 2).min(255);
+    let shelf_mass: u64 = hist[peak_lo..=peak_hi].iter().map(|&c| c as u64).sum();
+
+    let passes_digital_spike_guard = if m_zero >= 0.002 {
+        shelf_mass >= (zero_count as f64 * 1.25).round() as u64
+    } else {
+        true
+    };
+
     let is_compact_shelf = classification != PageClassification::Color
         && max_peak_bin >= 10
-        && (max_peak_count as f64) >= (n_samples as f64 * 0.004)
+        && (peak_count_raw as f64) >= (n_samples as f64 * 0.004)
         && surge_ratio >= config.detection.surge_ratio_threshold
-        && fwhm <= 6;
+        && has_trough_before
+        && has_valley_after
+        && fwhm <= 6
+        && passes_digital_spike_guard;
 
     if is_compact_shelf {
         let floor_value = max_peak_bin as u8;
@@ -1438,16 +1427,14 @@ pub fn detect_elevated_black_floor(
     let p99 = histogram_percentile(hist, n_samples, 99.0);
     let hi = find_effective_white(hist, p99);
 
-    let zero_count = hist[0] as u64 + hist[1] as u64 + hist[2] as u64;
-    let m_zero = zero_count as f64 / n_samples as f64;
-    let (nz_count, nz_p3) = nonzero_histogram_percentile(hist, 3.0);
+    let (nz_count, nonzero_p3_luminance) = nonzero_histogram_percentile(hist, 3.0);
 
     let mut lo = p1;
     let mut is_bimodal_valley = false;
 
     if classification != PageClassification::Color {
-        if lo < 3.0 && nz_count > 100 && nz_p3 > 8.0 && m_zero > 0.0005 && m_zero < 0.065 {
-            let mut cand_lo = nz_p3.max(8.0);
+        if lo < 3.0 && nz_count > 100 && nonzero_p3_luminance > 8.0 && m_zero > 0.0005 && m_zero < 0.065 {
+            let mut cand_lo = nonzero_p3_luminance.max(8.0);
             if m_zero < 0.035 {
                 let eff_black = find_effective_black(hist, p1);
                 if eff_black > cand_lo {
@@ -1457,7 +1444,6 @@ pub fn detect_elevated_black_floor(
             // When pure digital black (0..=2) exists on the page, require a separation trough
             // between the digital spike (bins 0..=2, kernel radius 2 -> bin 5+) and `cand_lo`
             // so clean digital pages with flat/monotonic anti-aliased ramps (T1) are never altered.
-            let h_smooth = smooth_histogram_binomial_5(hist);
             let lo_idx = (cand_lo.floor() as usize).clamp(5, 85);
             let search_peak_hi = (lo_idx + 15).min(85);
             let mut h_peak = 0.0f32;
@@ -1476,21 +1462,27 @@ pub fn detect_elevated_black_floor(
             }
             let has_separation_from_zero = peak_idx >= 8 && min_trough_before < 0.65 * h_peak;
             if has_separation_from_zero {
-                let val_lo = validate_black_floor(hist, n_samples as usize, cand_lo, hi);
+                let val_lo = validate_bimodal_valley_only(hist, n_samples as usize, cand_lo, hi);
                 if val_lo >= 8.0 {
                     lo = val_lo;
                     is_bimodal_valley = true;
                 }
             }
         } else if lo >= 3.0 {
-            let eff_black = find_effective_black(hist, p1);
-            let mut cand_lo = lo;
-            if eff_black > cand_lo {
-                cand_lo += (eff_black - cand_lo) * 0.85;
-            }
-            lo = validate_black_floor(hist, n_samples as usize, cand_lo, hi);
-            if lo > 28.0 {
-                is_bimodal_valley = true;
+            if m_zero >= 0.002 {
+                // Real line art is already at pure digital black Y in [0..=2].
+                // Do not elevate black floor to bin 3..5 unless a validated drawing-ink shelf exists.
+                lo = 0.0;
+            } else {
+                let eff_black = find_effective_black(hist, p1);
+                let mut cand_lo = lo;
+                if eff_black > cand_lo {
+                    cand_lo += (eff_black - cand_lo) * 0.85;
+                }
+                lo = validate_black_floor(hist, n_samples as usize, cand_lo, hi);
+                if lo > 28.0 {
+                    is_bimodal_valley = true;
+                }
             }
         }
     }
@@ -1498,6 +1490,8 @@ pub fn detect_elevated_black_floor(
     // Fallback to black_clip_percent if lo <= 1 and no digital spike
     let floor_value = if lo >= 2.0 {
         lo.round() as u8
+    } else if m_zero > 0.0005 {
+        0u8
     } else {
         let clip_target = (n_samples as f64 * (config.detection.black_clip_percent as f64 / 100.0))
             .round() as u64;
@@ -1692,7 +1686,7 @@ pub fn detect_paper_yellowing(
     })
 }
 
-pub fn detect_clipped_highlights(
+pub fn detect_dull_highlights(
     hist: &[u32; 256],
     classification: PageClassification,
     total_pixels: usize,
@@ -1757,7 +1751,7 @@ pub fn detect_clipped_highlights(
     };
 
     Some(DefectDetection {
-        defect_type: DefectType::ClippedHighlights {
+        defect_type: DefectType::DullHighlights {
             white_point,
             has_plateau,
         },
@@ -1768,206 +1762,9 @@ pub fn detect_clipped_highlights(
     })
 }
 
-pub fn detect_elevated_noise_floor(
-    image: &DynamicImage,
-    classification: PageClassification,
-) -> Option<DefectDetection> {
-    let (width, height) = image.dimensions();
-    if width < 3 || height < 3 {
-        return None;
-    }
-
-    // Use a fast strided sample (~2400 points) for noise estimation so 6MP pages take < 0.05ms
-    let step = if (width as usize) * (height as usize) >= 500_000 {
-        ((width.min(height) as usize) / 40).max(8)
-    } else {
-        2usize
-    };
-
-    let mut laplacian_values = Vec::new();
-    match image {
-        DynamicImage::ImageRgb8(rgb) => {
-            let raw = rgb.as_raw();
-            let w = width as usize;
-            let h = height as usize;
-            let luma_at = |x: usize, y: usize| -> i32 {
-                let idx = (y * w + x) * 3;
-                ((54 * raw[idx] as u32 + 183 * raw[idx + 1] as u32 + 19 * raw[idx + 2] as u32 + 128) >> 8) as i32
-            };
-            for y in (1..h - 1).step_by(step) {
-                for x in (1..w - 1).step_by(step) {
-                    let p00 = luma_at(x - 1, y - 1);
-                    let p01 = luma_at(x, y - 1);
-                    let p02 = luma_at(x + 1, y - 1);
-                    let p10 = luma_at(x - 1, y);
-                    let p11 = luma_at(x, y);
-                    let p12 = luma_at(x + 1, y);
-                    let p20 = luma_at(x - 1, y + 1);
-                    let p21 = luma_at(x, y + 1);
-                    let p22 = luma_at(x + 1, y + 1);
-                    let lap = ((p00 + p02 + p20 + p22) - 2 * (p01 + p21 + p10 + p12) + 4 * p11).abs() as f32;
-                    laplacian_values.push(lap);
-                }
-            }
-        }
-        _ => {
-            let luma = image.to_luma8();
-            for y in (1..height - 1).step_by(step) {
-                for x in (1..width - 1).step_by(step) {
-                    let p00 = luma.get_pixel(x - 1, y - 1)[0] as i32;
-                    let p01 = luma.get_pixel(x, y - 1)[0] as i32;
-                    let p02 = luma.get_pixel(x + 1, y - 1)[0] as i32;
-                    let p10 = luma.get_pixel(x - 1, y)[0] as i32;
-                    let p11 = luma.get_pixel(x, y)[0] as i32;
-                    let p12 = luma.get_pixel(x + 1, y)[0] as i32;
-                    let p20 = luma.get_pixel(x - 1, y + 1)[0] as i32;
-                    let p21 = luma.get_pixel(x, y + 1)[0] as i32;
-                    let p22 = luma.get_pixel(x + 1, y + 1)[0] as i32;
-                    let lap = ((p00 + p02 + p20 + p22) - 2 * (p01 + p21 + p10 + p12) + 4 * p11).abs() as f32;
-                    laplacian_values.push(lap);
-                }
-            }
-        }
-    }
-
-    if laplacian_values.is_empty() {
-        return None;
-    }
-
-    laplacian_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_lap = laplacian_values[laplacian_values.len() / 2];
-
-    let mut deviations: Vec<f32> = laplacian_values
-        .iter()
-        .map(|&v| (v - median_lap).abs())
-        .collect();
-    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mad = deviations[deviations.len() / 2];
-    let noise_sigma = 1.4826 * mad;
-
-    if noise_sigma < 4.0 {
-        return None;
-    }
-
-    let severity = if noise_sigma < 8.0 {
-        DefectSeverity::Mild
-    } else if noise_sigma < 15.0 {
-        DefectSeverity::Moderate
-    } else {
-        DefectSeverity::Severe
-    };
-
-    let raw_confidence = if classification == PageClassification::Monochrome {
-        0.30
-    } else {
-        0.40
-    };
-
-    Some(DefectDetection {
-        defect_type: DefectType::ElevatedNoiseFloor { noise_sigma },
-        raw_confidence,
-        adjusted_confidence: raw_confidence,
-        severity,
-        evidence: format!("Noise sigma={:.2} (MAD={:.2})", noise_sigma, mad),
-    })
-}
-
 // ============================================================================
-// Book-Level Confidence Adjustment & Outlier Guard (Section 3c.6 & Upgrade B.5)
+// Correction Engine & Tone Mapping Plan Generation
 // ============================================================================
-
-pub fn adjust_confidence_with_book_context(
-    defects: &mut [DefectDetection],
-    classification: PageClassification,
-    book_profile: &BookProfile,
-) {
-    let group = match classification {
-        PageClassification::Monochrome => &book_profile.monochrome_group,
-        PageClassification::Mixed => &book_profile.mixed_group,
-        PageClassification::Color => &book_profile.color_group,
-    };
-
-    if group.page_count <= 1 {
-        return;
-    }
-
-    for defect in defects.iter_mut() {
-        match defect.defect_type {
-            DefectType::ElevatedBlackFloor { floor_value, .. } => {
-                let low = floor_value.saturating_sub(3) as usize;
-                let high = (floor_value as usize + 3).min(255);
-                let similar_count: u32 = group.black_floor_distribution[low..=high].iter().sum();
-                let freq = similar_count as f32 / group.page_count as f32;
-
-                if freq >= 0.30 {
-                    let boost = ((freq - 0.30) / 0.70) * 0.15;
-                    defect.adjusted_confidence = (defect.raw_confidence + boost).min(0.98);
-                } else if freq < 0.10 {
-                    defect.adjusted_confidence = defect.raw_confidence * 0.60;
-                }
-            }
-            DefectType::CompressedDynamicRange { .. } => {
-                if group.median_dynamic_range < 200 {
-                    defect.adjusted_confidence = (defect.raw_confidence + 0.15).min(0.95);
-                }
-            }
-            DefectType::PaperYellowing { .. } => {
-                let cast_freq = group.paper_cast_detected_count as f32 / group.page_count as f32;
-                if cast_freq >= 0.50 {
-                    defect.adjusted_confidence = (defect.raw_confidence + 0.15).min(0.95);
-                } else if cast_freq < 0.10 {
-                    defect.adjusted_confidence = defect.raw_confidence * 0.50;
-                }
-            }
-            DefectType::ClippedHighlights { white_point, .. } => {
-                let low = white_point.saturating_sub(3) as usize;
-                let high = (white_point as usize + 3).min(255);
-                let similar_count: u32 = group.white_point_distribution[low..=high].iter().sum();
-                let freq = similar_count as f32 / group.page_count as f32;
-
-                if freq >= 0.30 {
-                    let boost = ((freq - 0.30) / 0.70) * 0.15;
-                    defect.adjusted_confidence = (defect.raw_confidence + boost).min(0.98);
-                } else if cast_freq_low(freq) {
-                    defect.adjusted_confidence = defect.raw_confidence * 0.60;
-                }
-            }
-            DefectType::ElevatedNoiseFloor { .. } => {}
-        }
-    }
-}
-
-#[inline]
-fn cast_freq_low(freq: f32) -> bool {
-    freq < 0.10
-}
-
-// ============================================================================
-// Correction Engine (Section 3d & Upgrades B, C, D)
-// ============================================================================
-
-pub fn compute_correction_fraction(
-    confidence: f32,
-    severity: DefectSeverity,
-    config: &AutoLevelsConfig,
-) -> f32 {
-    if confidence < config.detection.confidence_threshold {
-        return 0.0;
-    }
-
-    let severity_multiplier = match severity {
-        DefectSeverity::None => 0.0,
-        DefectSeverity::Mild => 0.40,
-        DefectSeverity::Moderate => 0.75,
-        DefectSeverity::Severe => 1.00,
-    };
-
-    let confidence_scale = ((confidence - config.detection.confidence_threshold)
-        / (1.0 - config.detection.confidence_threshold))
-        .clamp(0.0, 1.0);
-
-    severity_multiplier * confidence_scale
-}
 
 pub fn generate_correction_plan(
     defects: &[DefectDetection],
@@ -1983,7 +1780,7 @@ pub fn generate_correction_plan(
         return plan;
     }
 
-    // Direct Validated Restoration (Upgrade B.5):
+    // Direct Validated Restoration:
     // Apply 100% of validated (lo, hi) directly to the Fritsch-Carlson spline LUT
     // without multiplying `lo` down by `severity_multiplier * confidence_scale`.
     for defect in defects {
@@ -1993,7 +1790,7 @@ pub fn generate_correction_plan(
                 plan.black_point = plan.black_point.max(clamped_floor);
                 plan.correction_fraction = 1.0;
             }
-            DefectType::ClippedHighlights { white_point, .. } => {
+            DefectType::DullHighlights { white_point, .. } => {
                 plan.white_point = plan.white_point.min(white_point);
                 plan.correction_fraction = 1.0;
             }
@@ -2020,8 +1817,7 @@ pub fn generate_correction_plan(
                     }
                 }
             }
-            DefectType::ElevatedNoiseFloor { .. } => {}
-        }
+            }
     }
 
     if plan.black_point <= 1 {
@@ -2045,53 +1841,12 @@ pub fn generate_correction_plan(
     plan.skip_correction = plan.black_point == 0
         && plan.white_point == 255
         && plan.paper_cast_gains.is_none()
-        && plan.per_channel_black.is_none();
+;
     plan.gamma = config.correction.gamma;
 
     plan
 }
 
-pub fn detect_per_channel_shelf(
-    analysis: &PageAnalysis,
-    plan: &CorrectionPlan,
-) -> Option<(u8, u8, u8)> {
-    if !analysis.is_shelf_detected || analysis.classification == PageClassification::Color {
-        return None;
-    }
-
-    let (r_hist, g_hist, b_hist) = &analysis.neutral_channel_histograms;
-
-    let mut peak_r = 0u32;
-    let mut peak_r_bin = 0u8;
-    let mut peak_g = 0u32;
-    let mut peak_g_bin = 0u8;
-    let mut peak_b = 0u32;
-    let mut peak_b_bin = 0u8;
-
-    for bin in 2..=35 {
-        if r_hist[bin] > peak_r {
-            peak_r = r_hist[bin];
-            peak_r_bin = bin as u8;
-        }
-        if g_hist[bin] > peak_g {
-            peak_g = g_hist[bin];
-            peak_g_bin = bin as u8;
-        }
-        if b_hist[bin] > peak_b {
-            peak_b = b_hist[bin];
-            peak_b_bin = bin as u8;
-        }
-    }
-
-    let channel_spread =
-        peak_r_bin.max(peak_g_bin).max(peak_b_bin) - peak_r_bin.min(peak_g_bin).min(peak_b_bin);
-
-    if channel_spread < 4 || plan.white_point < 250 {
-        return None;
-    }
-
-    Some((peak_r_bin, peak_g_bin, peak_b_bin))
-}
 
 // ----------------------------------------------------------------------------
 // Color Page Correction (Oklab with Radial Chord Bisection - Legacy Support)
@@ -2257,13 +2012,13 @@ pub fn apply_color_correction_oklab(image: &mut DynamicImage, plan: &CorrectionP
         _ => {}
     }
 
-    if let Some((gr, gg, gb)) = plan.paper_cast_gains {
-        apply_paper_cast_ramp(image, gr, gg, gb, plan.paper_cast_ramp_start);
+    if let Some((gain_r, gain_g, gain_b)) = plan.paper_cast_gains {
+        apply_paper_cast_ramp(image, gain_r, gain_g, gain_b, plan.paper_cast_ramp_start);
     }
 }
 
 // ----------------------------------------------------------------------------
-// Fused Luminance Stretch + Dual-Boundary Sigmoid Chroma Gating (Upgrade D)
+// Fused Luminance Stretch + Dual-Boundary Sigmoid Chroma Gating
 // ----------------------------------------------------------------------------
 
 /// Builds a 3x3 morphologically dilated boolean mask of high-chroma accents (`C* >= 20.0`,
@@ -2407,7 +2162,7 @@ pub fn apply_monochrome_mixed_correction(
                         // Dual-Boundary Luminance-Adaptive Sigmoid Chroma Gate via 2D fixed-point LUT
                         let l_bin = (l_star.round() as usize).min(100);
                         let c_bin = ((c_star * 4.0).round() as usize).min(255);
-                        let mut taper_q8 = tables.taper_lut[l_bin][c_bin] as i32;
+                        let mut chroma_retention_q8 = tables.taper_lut[l_bin][c_bin] as i32;
 
                         // Neutralize verified lignin / acid paper yellowing & dirty paper tint
                         // while strictly preserving pastel blue skies (b* < 0) and warm skin (a* > 4.5)
@@ -2416,19 +2171,19 @@ pub fn apply_monochrome_mixed_correction(
                         if is_paper_yellow_axis
                             && (has_paper_cast || classification == PageClassification::Monochrome || c_star <= 5.5)
                         {
-                            taper_q8 = 0;
+                            chroma_retention_q8 = 0;
                         }
 
-                        if taper_q8 == 0 {
+                        if chroma_retention_q8 == 0 {
                             let y_u8 = y_new as u8;
                             chunk[0] = y_u8;
                             chunk[1] = y_u8;
                             chunk[2] = y_u8;
                         } else {
                             let y_i32 = y_old as i32;
-                            let r_out = y_new + (((r as i32 - y_i32) * taper_q8 + 128) >> 8);
-                            let g_out = y_new + (((g as i32 - y_i32) * taper_q8 + 128) >> 8);
-                            let b_out = y_new + (((b as i32 - y_i32) * taper_q8 + 128) >> 8);
+                            let r_out = y_new + (((r as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
+                            let g_out = y_new + (((g as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
+                            let b_out = y_new + (((b as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
                             chunk[0] = r_out.clamp(0, 255) as u8;
                             chunk[1] = g_out.clamp(0, 255) as u8;
                             chunk[2] = b_out.clamp(0, 255) as u8;
@@ -2474,26 +2229,26 @@ pub fn apply_monochrome_mixed_correction(
 
                 let l_bin = (l_star.round() as usize).min(100);
                 let c_bin = ((c_star * 4.0).round() as usize).min(255);
-                let mut taper_q8 = tables.taper_lut[l_bin][c_bin] as i32;
+                let mut chroma_retention_q8 = tables.taper_lut[l_bin][c_bin] as i32;
 
                 let is_paper_yellow_axis =
                     l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0;
                 if is_paper_yellow_axis
                     && (has_paper_cast || classification == PageClassification::Monochrome || c_star <= 5.5)
                 {
-                    taper_q8 = 0;
+                    chroma_retention_q8 = 0;
                 }
 
-                if taper_q8 == 0 {
+                if chroma_retention_q8 == 0 {
                     let y_u8 = y_new as u8;
                     chunk[0] = y_u8;
                     chunk[1] = y_u8;
                     chunk[2] = y_u8;
                 } else {
                     let y_i32 = y_old as i32;
-                    let r_out = y_new + (((r as i32 - y_i32) * taper_q8 + 128) >> 8);
-                    let g_out = y_new + (((g as i32 - y_i32) * taper_q8 + 128) >> 8);
-                    let b_out = y_new + (((b as i32 - y_i32) * taper_q8 + 128) >> 8);
+                    let r_out = y_new + (((r as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
+                    let g_out = y_new + (((g as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
+                    let b_out = y_new + (((b as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
                     chunk[0] = r_out.clamp(0, 255) as u8;
                     chunk[1] = g_out.clamp(0, 255) as u8;
                     chunk[2] = b_out.clamp(0, 255) as u8;
@@ -2506,9 +2261,9 @@ pub fn apply_monochrome_mixed_correction(
 
 pub fn apply_paper_cast_ramp(
     image: &mut DynamicImage,
-    gr: f32,
-    gg: f32,
-    gb: f32,
+    gain_r: f32,
+    gain_g: f32,
+    gain_b: f32,
     ramp_start: u8,
 ) {
     let ramp_range = (255.0 - ramp_start as f32).max(1.0);
@@ -2522,13 +2277,13 @@ pub fn apply_paper_cast_ramp(
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
                 if y >= ramp_start {
                     let factor = ((y as f32 - ramp_start as f32) / ramp_range).clamp(0.0, 1.0);
-                    chunk[0] = (r as f32 * (1.0 + (gr - 1.0) * factor))
+                    chunk[0] = (r as f32 * (1.0 + (gain_r - 1.0) * factor))
                         .round()
                         .clamp(0.0, 255.0) as u8;
-                    chunk[1] = (g as f32 * (1.0 + (gg - 1.0) * factor))
+                    chunk[1] = (g as f32 * (1.0 + (gain_g - 1.0) * factor))
                         .round()
                         .clamp(0.0, 255.0) as u8;
-                    chunk[2] = (b as f32 * (1.0 + (gb - 1.0) * factor))
+                    chunk[2] = (b as f32 * (1.0 + (gain_b - 1.0) * factor))
                         .round()
                         .clamp(0.0, 255.0) as u8;
                 }
@@ -2545,13 +2300,13 @@ pub fn apply_paper_cast_ramp(
                 let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
                 if y >= ramp_start {
                     let factor = ((y as f32 - ramp_start as f32) / ramp_range).clamp(0.0, 1.0);
-                    chunk[0] = (r as f32 * (1.0 + (gr - 1.0) * factor))
+                    chunk[0] = (r as f32 * (1.0 + (gain_r - 1.0) * factor))
                         .round()
                         .clamp(0.0, 255.0) as u8;
-                    chunk[1] = (g as f32 * (1.0 + (gg - 1.0) * factor))
+                    chunk[1] = (g as f32 * (1.0 + (gain_g - 1.0) * factor))
                         .round()
                         .clamp(0.0, 255.0) as u8;
-                    chunk[2] = (b as f32 * (1.0 + (gb - 1.0) * factor))
+                    chunk[2] = (b as f32 * (1.0 + (gain_b - 1.0) * factor))
                         .round()
                         .clamp(0.0, 255.0) as u8;
                 }
@@ -2562,7 +2317,7 @@ pub fn apply_paper_cast_ramp(
 }
 
 // ============================================================================
-// Quality Guard Verification Pipeline (Section 3e & Upgrade D.5)
+// Multi-Tier Quality Guard Verification Pipeline
 // ============================================================================
 
 #[inline]
@@ -2766,7 +2521,7 @@ pub fn compute_active_block_contrast_ratios(
         .into_par_iter()
         .flat_map(|by| {
             let y_start = by * bs;
-            let mut row_ratios = Vec::new();
+            let mut row_ratios = Vec::with_capacity(blocks_x);
             for bx in 0..blocks_x {
                 let x_start = bx * bs;
 
@@ -3038,7 +2793,7 @@ pub fn quality_tier_2(
         let total_pixels = (orig_rgb.width() * orig_rgb.height()) as usize;
         let step = (total_pixels / 2000).max(1);
 
-        let mut chroma_deltas = Vec::new();
+        let mut chroma_deltas = Vec::with_capacity(2048);
         let has_paper_cast = plan.paper_cast_gains.is_some();
         let ramp_start = plan.paper_cast_ramp_start;
 
@@ -3058,7 +2813,7 @@ pub fn quality_tier_2(
             let (l_orig, a_orig, b_orig) = rgb_to_lab_fast(or, og, ob);
             let c_orig = (a_orig * a_orig + b_orig * b_orig).sqrt();
 
-            // Quality Guard Exemption Mask (Upgrade D.5):
+            // Quality Guard Exemption Mask:
             // Pixels intentionally neutralized by the Dual-Boundary Sigmoid Chroma Gate (taper < 1.0)
             // or sitting on the yellow paper cast axis are exempted from triggering false color-drift rollbacks.
             let taper = compute_sigmoid_taper_exact(l_orig, c_orig);
@@ -3168,46 +2923,52 @@ pub fn quality_tier_3(
 // Main Level & Verify Pipeline (Pre-Actor / CPU)
 // ============================================================================
 
+#[allow(dead_code)]
 pub fn level_and_verify(
     image: DynamicImage,
     original_bytes: &Bytes,
     book_profile: Option<&BookProfile>,
     config: &AutoLevelsConfig,
 ) -> (DynamicImage, LevelInfo, QualityVerdict) {
-    level_and_verify_with_context(image, original_bytes, None, None, book_profile, config)
+    let (img, info, verdict, _) = level_and_verify_filtered(image, original_bytes, book_profile, config, None);
+    (img, info, verdict)
 }
 
+#[allow(dead_code)]
 pub fn level_and_verify_with_context(
-    mut image: DynamicImage,
-    _original_bytes: &Bytes,
-    book_id: Option<&str>,
-    page_number: Option<usize>,
+    image: DynamicImage,
+    original_bytes: &Bytes,
+    _book_id: Option<&str>,
+    _page_number: Option<usize>,
     book_profile: Option<&BookProfile>,
     config: &AutoLevelsConfig,
 ) -> (DynamicImage, LevelInfo, QualityVerdict) {
-    let b_id = book_id.unwrap_or("-");
-    let p_num = page_number
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "-".to_string());
+    let (img, info, verdict, _) = level_and_verify_filtered(image, original_bytes, book_profile, config, None);
+    (img, info, verdict)
+}
 
-    if !config.enabled || config.mode == AutoLevelsMode::Off {
-        return (image, LevelInfo::default(), QualityVerdict::pass());
-    }
-
+pub fn level_and_verify_filtered(
+    mut image: DynamicImage,
+    _original_bytes: &Bytes,
+    book_profile: Option<&BookProfile>,
+    config: &AutoLevelsConfig,
+    disabled_defects: Option<&[usize]>,
+) -> (DynamicImage, LevelInfo, QualityVerdict, PageAnalysis) {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
-        return (image, LevelInfo::default(), QualityVerdict::pass());
+        let dummy = analyze_page(&image, 0, config);
+        return (image, LevelInfo::default(), QualityVerdict::pass(), dummy);
     }
 
-    // Edge case 6.8: Thumbnail bypass (<400px in both dimensions)
-    if width < 400 && height < 400 {
-        return (image, LevelInfo::default(), QualityVerdict::pass());
-    }
-
+    let b_id = "-";
+    let p_num = "-";
     let start_time = Instant::now();
-    let analysis = analyze_page(&image, page_number.unwrap_or(0), config);
-
+    let analysis = analyze_page(&image, 0, config);
     let is_monochrome = analysis.classification == PageClassification::Monochrome;
+
+    if !config.enabled || config.mode == AutoLevelsMode::Off || (width < 400 && height < 400) {
+        return (image, LevelInfo::default(), QualityVerdict::pass(), analysis);
+    }
 
     // Strict Full-Color Veto or mode filter (Zero-Copy No-Op)
     if analysis.classification == PageClassification::Color
@@ -3222,17 +2983,45 @@ pub fn level_and_verify_with_context(
                 classification: analysis.classification,
                 black_point: 0,
                 white_point: 255,
-                channel_black_points: None,
-                quality_verdict: Some(QualityVerdict::pass()),
+                                quality_verdict: Some(QualityVerdict::pass()),
             },
             QualityVerdict::pass(),
+            analysis,
         );
     }
 
-    // Generate correction plan directly from validated defects
-    let mut plan = generate_correction_plan(&analysis.defects, analysis.classification, config);
+    // Filter active defects based on disabled_defects list
+    let active_defects: Vec<DefectDetection> = match disabled_defects {
+        Some(disabled) if !disabled.is_empty() => analysis
+            .defects
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !disabled.contains(idx))
+            .map(|(_, d)| d.clone())
+            .collect(),
+        _ => analysis.defects.clone(),
+    };
 
-    // BookProfile Outlier Sanity Guard (Upgrade B.5):
+    if active_defects.is_empty() {
+        return (
+            image,
+            LevelInfo {
+                was_leveled: false,
+                is_monochrome,
+                classification: analysis.classification,
+                black_point: 0,
+                white_point: 255,
+                                quality_verdict: Some(QualityVerdict::pass()),
+            },
+            QualityVerdict::pass(),
+            analysis,
+        );
+    }
+
+    // Generate correction plan directly from active validated defects
+    let mut plan = generate_correction_plan(&active_defects, analysis.classification, config);
+
+    // BookProfile Outlier Sanity Guard:
     // If book_profile has >= 5 monochrome/mixed pages, clamp any single page's `lo`
     // so it does not exceed `median_book_black_floor + 20`.
     if let Some(profile) = book_profile {
@@ -3249,16 +3038,11 @@ pub fn level_and_verify_with_context(
         }
     }
 
-    // Per-channel dark shelf alignment check
-    if let Some(pcs) = detect_per_channel_shelf(&analysis, &plan) {
-        plan.per_channel_black = Some(pcs);
-    }
-
     if plan.skip_correction {
         let elapsed_us = start_time.elapsed().as_micros();
         info!(
-            "[AutoLevels] book_id={} page={} class={:?} black={}->{} white={}->{} oklab={} leveled={} time_us={}",
-            b_id, p_num, analysis.classification,
+            "[AutoLevels] class={:?} black={}->{} white={}->{} oklab={} leveled={} time_us={}",
+            analysis.classification,
             analysis.black_floor, plan.black_point,
             analysis.white_ceiling, plan.white_point,
             plan.use_oklab, false, elapsed_us
@@ -3271,10 +3055,10 @@ pub fn level_and_verify_with_context(
                 classification: analysis.classification,
                 black_point: 0,
                 white_point: 255,
-                channel_black_points: None,
-                quality_verdict: Some(QualityVerdict::pass()),
+                                quality_verdict: Some(QualityVerdict::pass()),
             },
             QualityVerdict::pass(),
+            analysis,
         );
     }
 
@@ -3402,10 +3186,10 @@ pub fn level_and_verify_with_context(
                 classification: analysis.classification,
                 black_point: 0,
                 white_point: 255,
-                channel_black_points: None,
-                quality_verdict: Some(verdict.clone()),
+                                quality_verdict: Some(verdict.clone()),
             },
             verdict,
+            analysis,
         );
     }
     tier_results.push(t1);
@@ -3448,18 +3232,11 @@ pub fn level_and_verify_with_context(
         attenuated_plan.black_point = (plan.black_point as f32 * 0.5).round() as u8;
         attenuated_plan.white_point =
             255 - ((255.0 - plan.white_point as f32) * 0.5).round() as u8;
-        if let Some((r, g, b)) = plan.per_channel_black {
-            attenuated_plan.per_channel_black = Some((
-                (r as f32 * 0.5).round() as u8,
-                (g as f32 * 0.5).round() as u8,
-                (b as f32 * 0.5).round() as u8,
-            ));
-        }
-        if let Some((gr, gg, gb)) = plan.paper_cast_gains {
+        if let Some((gain_r, gain_g, gain_b)) = plan.paper_cast_gains {
             attenuated_plan.paper_cast_gains = Some((
-                1.0 + (gr - 1.0) * 0.5,
-                1.0 + (gg - 1.0) * 0.5,
-                1.0 + (gb - 1.0) * 0.5,
+                1.0 + (gain_r - 1.0) * 0.5,
+                1.0 + (gain_g - 1.0) * 0.5,
+                1.0 + (gain_b - 1.0) * 0.5,
             ));
         }
 
@@ -3514,12 +3291,10 @@ pub fn level_and_verify_with_context(
                     classification: analysis.classification,
                     black_point: attenuated_plan.black_point,
                     white_point: attenuated_plan.white_point,
-                    channel_black_points: attenuated_plan
-                        .per_channel_black
-                        .map(|p| [p.0, p.1, p.2]),
                     quality_verdict: Some(verdict.clone()),
                 },
                 verdict,
+                analysis,
             );
         } else {
             let rolled_back = redecode_pristine();
@@ -3536,18 +3311,17 @@ pub fn level_and_verify_with_context(
                     classification: analysis.classification,
                     black_point: 0,
                     white_point: 255,
-                    channel_black_points: None,
-                    quality_verdict: Some(verdict.clone()),
+                                        quality_verdict: Some(verdict.clone()),
                 },
                 verdict,
+                analysis,
             );
         }
     }
 
     let elapsed_us = start_time.elapsed().as_micros();
     info!(
-        "[AutoLevels] book_id={} page={} class={:?} black={}->{} white={}->{} oklab={} leveled=true time_us={}",
-        b_id, p_num,
+        "[AutoLevels] class={:?} black={}->{} white={}->{} oklab={} leveled=true time_us={}",
         analysis.classification,
         analysis.black_floor,
         plan.black_point,
@@ -3571,14 +3345,15 @@ pub fn level_and_verify_with_context(
             classification: analysis.classification,
             black_point: plan.black_point,
             white_point: plan.white_point,
-            channel_black_points: plan.per_channel_black.map(|p| [p.0, p.1, p.2]),
-            quality_verdict: Some(verdict.clone()),
+                        quality_verdict: Some(verdict.clone()),
         },
         verdict,
+        analysis,
     )
 }
 
 /// Legacy / convenience wrapper around `level_and_verify`.
+#[allow(dead_code)]
 pub fn analyze_and_level_image(
     image: DynamicImage,
     config: &AutoLevelsConfig,
@@ -3588,9 +3363,7 @@ pub fn analyze_and_level_image(
     (img, info)
 }
 
-// ============================================================================
-// Ground-Truth Positive (M1-M4) & Adversarial Trap (T1-T7) Regression Suite
-// ============================================================================
+
 
 #[cfg(test)]
 mod tests {

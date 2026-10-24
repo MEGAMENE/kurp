@@ -17,7 +17,6 @@ pub struct ClassificationGroupStats {
     pub black_floor_distribution: [u32; 256],
     pub white_point_distribution: [u32; 256],
     pub paper_cast_detected_count: usize,
-    pub noise_floor_values: Vec<f32>,
     pub median_black_floor: u8,
     pub median_white_point: u8,
     pub median_dynamic_range: u8,
@@ -31,7 +30,6 @@ impl Default for ClassificationGroupStats {
             black_floor_distribution: [0u32; 256],
             white_point_distribution: [0u32; 256],
             paper_cast_detected_count: 0,
-            noise_floor_values: Vec::new(),
             median_black_floor: 0,
             median_white_point: 255,
             median_dynamic_range: 255,
@@ -49,34 +47,35 @@ impl ClassificationGroupStats {
         let mut page_indices = Vec::with_capacity(page_count);
         let mut black_floor_distribution = [0u32; 256];
         let mut white_point_distribution = [0u32; 256];
+        let mut dynamic_range_distribution = [0u32; 256];
         let mut paper_cast_detected_count = 0;
-        let mut noise_floor_values = Vec::new();
-        let mut black_floors = Vec::with_capacity(page_count);
-        let mut white_points = Vec::with_capacity(page_count);
-        let mut dynamic_ranges = Vec::with_capacity(page_count);
 
         for s in summaries {
             page_indices.push(s.page_number);
             black_floor_distribution[s.black_floor as usize] += 1;
             white_point_distribution[s.white_ceiling as usize] += 1;
+            dynamic_range_distribution[s.dynamic_range as usize] += 1;
             if s.paper_cast_detected {
                 paper_cast_detected_count += 1;
             }
-            if let Some(n) = s.noise_floor {
-                noise_floor_values.push(n);
-            }
-            black_floors.push(s.black_floor);
-            white_points.push(s.white_ceiling);
-            dynamic_ranges.push(s.dynamic_range);
         }
 
-        black_floors.sort_unstable();
-        white_points.sort_unstable();
-        dynamic_ranges.sort_unstable();
+        #[inline]
+        fn median_from_dist(dist: &[u32; 256], total: usize) -> u8 {
+            let target = (total / 2) as u32;
+            let mut acc = 0u32;
+            for (bin, &freq) in dist.iter().enumerate() {
+                acc += freq;
+                if acc > target {
+                    return bin as u8;
+                }
+            }
+            255
+        }
 
-        let median_black_floor = black_floors[page_count / 2];
-        let median_white_point = white_points[page_count / 2];
-        let median_dynamic_range = dynamic_ranges[page_count / 2];
+        let median_black_floor = median_from_dist(&black_floor_distribution, page_count);
+        let median_white_point = median_from_dist(&white_point_distribution, page_count);
+        let median_dynamic_range = median_from_dist(&dynamic_range_distribution, page_count);
 
         Self {
             page_count,
@@ -84,7 +83,6 @@ impl ClassificationGroupStats {
             black_floor_distribution,
             white_point_distribution,
             paper_cast_detected_count,
-            noise_floor_values,
             median_black_floor,
             median_white_point,
             median_dynamic_range,
@@ -100,7 +98,6 @@ pub struct PageAnalysisSummary {
     pub white_ceiling: u8,
     pub dynamic_range: u8,
     pub paper_cast_detected: bool,
-    pub noise_floor: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,7 +179,6 @@ pub fn analyze_page_lightweight(image: &DynamicImage, page_number: usize) -> Pag
         white_ceiling: analysis.white_ceiling,
         dynamic_range,
         paper_cast_detected,
-        noise_floor: None,
     }
 }
 
