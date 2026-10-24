@@ -9,7 +9,7 @@ use bytes::Bytes;
 use image::{DynamicImage, Rgb, RgbImage};
 use kurp::config::app_config::AutoLevelsConfig;
 use kurp::upscaler::auto_levels::{
-    apply_monochrome_mixed_correction, detect_clipped_highlights, detect_compressed_dynamic_range,
+    apply_monochrome_mixed_correction, detect_dull_highlights, detect_compressed_dynamic_range,
     detect_elevated_black_floor, detect_paper_yellowing, level_and_verify, quality_tier_1,
     quality_tier_2, quality_tier_3, CorrectionPlan, DefectType, DualZoneSample, Outcome,
     PageAnalysis, PageClassification,
@@ -175,16 +175,9 @@ fn test_tier2_physical_lignin_chroma_bounds() {
 
     let make_analysis = |r: f32, g: f32, b: f32| -> PageAnalysis {
         PageAnalysis {
-            page_number: 1,
             classification: PageClassification::Color,
             luminance_histogram: [0; 256],
-            neutral_luminance_histogram: [0; 256],
-            neutral_channel_histograms: ([0; 256], [0; 256], [0; 256]),
             total_pixels: 10_000,
-            neutral_pixel_count: 9_000,
-            neutral_ratio: 0.9,
-            max_chroma: 20,
-            high_chroma_count: 0,
             highlight_sample: DualZoneSample {
                 count: 500,
                 avg_rgb: (r, g, b),
@@ -199,7 +192,6 @@ fn test_tier2_physical_lignin_chroma_bounds() {
             black_floor: 0,
             white_ceiling: 255,
             is_shelf_detected: false,
-            per_channel_black: None,
         }
     };
 
@@ -226,16 +218,9 @@ fn test_tier2_dual_zone_sepia_shadow_boundary() {
 
     let make_analysis = |sh_r: f32, sh_b: f32| -> PageAnalysis {
         PageAnalysis {
-            page_number: 1,
             classification: PageClassification::Color,
             luminance_histogram: [0; 256],
-            neutral_luminance_histogram: [0; 256],
-            neutral_channel_histograms: ([0; 256], [0; 256], [0; 256]),
             total_pixels: 10_000,
-            neutral_pixel_count: 9_000,
-            neutral_ratio: 0.9,
-            max_chroma: 20,
-            high_chroma_count: 0,
             highlight_sample: DualZoneSample {
                 count: 500,
                 avg_rgb: (245.0, 240.0, 230.0), // R-B = 15.0
@@ -250,7 +235,6 @@ fn test_tier2_dual_zone_sepia_shadow_boundary() {
             black_floor: 0,
             white_ceiling: 255,
             is_shelf_detected: false,
-            per_channel_black: None,
         }
     };
 
@@ -268,7 +252,7 @@ fn test_tier2_dual_zone_sepia_shadow_boundary() {
 // ============================================================================
 
 #[test]
-fn test_tier2_clipped_highlights_white_point_boundary() {
+fn test_tier2_dull_highlights_white_point_boundary() {
     let config = AutoLevelsConfig::default();
     let total = 10_000usize;
 
@@ -276,13 +260,13 @@ fn test_tier2_clipped_highlights_white_point_boundary() {
     let mut hist_healthy = [0u32; 256];
     hist_healthy[254] = 200;
     hist_healthy[100] = 9800;
-    assert!(detect_clipped_highlights(&hist_healthy, PageClassification::Monochrome, total, &config).is_none());
+    assert!(detect_dull_highlights(&hist_healthy, PageClassification::Monochrome, total, &config).is_none());
 
-    // Valid clipped highlight at 240 -> Some
+    // Valid dull highlight at 240 -> Some
     let mut hist_clipped = [0u32; 256];
     hist_clipped[240] = 500;
     hist_clipped[100] = 9500;
-    assert!(detect_clipped_highlights(&hist_clipped, PageClassification::Monochrome, total, &config).is_some());
+    assert!(detect_dull_highlights(&hist_clipped, PageClassification::Monochrome, total, &config).is_some());
 }
 
 // ============================================================================

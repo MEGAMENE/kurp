@@ -16,9 +16,9 @@ use bytes::Bytes;
 use image::GenericImageView;
 use kurp::config::app_config::AutoLevelsConfig;
 use kurp::upscaler::auto_levels::{
-    adjust_confidence_with_book_context, analyze_page, apply_monochrome_mixed_correction,
-    level_and_verify, CorrectionPlan, DefectDetection, DefectSeverity, DefectType, Outcome,
-    PageClassification,
+    analyze_page, apply_monochrome_mixed_correction, level_and_verify,
+    level_and_verify_with_context, CorrectionPlan, DefectDetection, DefectSeverity, DefectType,
+    Outcome, PageClassification,
 };
 use kurp::upscaler::book_profile::BookProfile;
 use std::sync::{
@@ -33,47 +33,44 @@ use tokio::sync::Semaphore;
 
 #[test]
 fn test_tier3_pairwise_defect_and_book_profile_modulation() {
-    let mut defects = vec![DefectDetection {
-        defect_type: DefectType::ElevatedBlackFloor {
-            floor_value: 18,
-            surge_ratio: 3.5,
-            is_bimodal: true,
-        },
-        raw_confidence: 0.88,
-        adjusted_confidence: 0.88,
-        severity: DefectSeverity::Moderate,
-        evidence: "Ink floor=18".into(),
-    }];
-
+    let config = AutoLevelsConfig::default();
     let mut profile = BookProfile::empty("vol-1");
-    profile.total_book_pages = 100;
-    profile.monochrome_group.page_count = 100;
+    profile.total_book_pages = 20;
+    profile.monochrome_group.page_count = 20;
+    profile.monochrome_group.median_black_floor = 18;
 
-    // 1. Systemic defect in 65% of volume pages (common scanner miscalibration)
-    profile.monochrome_group.black_floor_distribution[18] = 65;
-    adjust_confidence_with_book_context(&mut defects, PageClassification::Monochrome, &profile);
-    assert!(
-        defects[0].adjusted_confidence > defects[0].raw_confidence,
-        "Systemic defect must boost confidence above raw (got {:.3})",
-        defects[0].adjusted_confidence
+    // Synthetic test page with elevated drawing ink at Y=48
+    let (w, h) = (200, 200);
+    let mut img = image::DynamicImage::ImageRgb8(image::RgbImage::new(w, h));
+    let rgb = img.as_mut_rgb8().unwrap();
+    for y in 0..h {
+        for x in 0..w {
+            let px = if (x + y) % 5 == 0 {
+                image::Rgb([48, 48, 48])
+            } else {
+                image::Rgb([248, 248, 248])
+            };
+            rgb.put_pixel(x, y, px);
+        }
+    }
+    let raw_bytes = bytes::Bytes::new();
+
+    let (_, info_guarded, _) = level_and_verify_with_context(
+        img,
+        &raw_bytes,
+        Some("vol-1"),
+        Some(1),
+        Some(&profile),
+        &config,
     );
-    assert!(defects[0].adjusted_confidence >= 0.95);
 
-    // 2. Isolated anomaly in only 4% of volume pages (intentional dark chapter scene)
-    profile.monochrome_group.black_floor_distribution[18] = 4;
-    defects[0].adjusted_confidence = defects[0].raw_confidence;
-    adjust_confidence_with_book_context(&mut defects, PageClassification::Monochrome, &profile);
+    let max_allowed = profile.monochrome_group.median_black_floor.saturating_add(20);
     assert!(
-        defects[0].adjusted_confidence < 0.75,
-        "Isolated anomaly must be attenuated below 0.75 threshold (got {:.3})",
-        defects[0].adjusted_confidence
+        info_guarded.black_point <= max_allowed,
+        "BookProfile Outlier Guard must clamp candidate black floor ({}) to <= {} (median 18 + 20)",
+        info_guarded.black_point,
+        max_allowed
     );
-
-    // 3. Normal distribution (20% frequency)
-    profile.monochrome_group.black_floor_distribution[18] = 20;
-    defects[0].adjusted_confidence = defects[0].raw_confidence;
-    adjust_confidence_with_book_context(&mut defects, PageClassification::Monochrome, &profile);
-    assert_eq!(defects[0].adjusted_confidence, defects[0].raw_confidence);
 }
 
 // ============================================================================
