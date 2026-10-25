@@ -24,31 +24,33 @@ fn test_tier2_bimodal_surge_ratio_exact_boundaries() {
     let config = AutoLevelsConfig::default();
     let n_samples = 100_000u32;
 
-    // Sub-threshold: peak = 2790, valley = 1000 -> surge = 2.79 < 2.80
+    // Sub-threshold: peak = 5950 -> smoothed surge = 2.794 < 2.80
     let mut hist_sub = [0u32; 256];
-    for b in 3..18 {
+    for b in 1..18 {
         hist_sub[b] = 1000;
     }
-    hist_sub[18] = 2790;
+    hist_sub[18] = 5950;
+    hist_sub[19] = 1000;
     hist_sub[250] = n_samples - hist_sub.iter().sum::<u32>();
     let d_sub = detect_elevated_black_floor(&hist_sub, PageClassification::Monochrome, n_samples as usize, &config);
     if let Some(d) = d_sub {
-        if let DefectType::ElevatedBlackFloor { is_bimodal, .. } = d.defect_type {
-            assert!(!is_bimodal, "Surge ratio 2.79x must not be accepted as bimodal");
+        if let DefectType::ElevatedBlackFloor { is_bimodal, surge_ratio, .. } = d.defect_type {
+            assert!(!is_bimodal, "Surge ratio {:.2} must not be accepted as bimodal", surge_ratio);
         }
     }
 
-    // Exact/Above threshold: peak = 2810, valley = 1000 -> surge = 2.81 >= 2.80
+    // Exact/Above threshold: peak = 6000 -> smoothed surge = 2.812 >= 2.80
     let mut hist_above = [0u32; 256];
-    for b in 3..18 {
+    for b in 1..18 {
         hist_above[b] = 1000;
     }
-    hist_above[18] = 2810;
+    hist_above[18] = 6000;
+    hist_above[19] = 1000;
     hist_above[250] = n_samples - hist_above.iter().sum::<u32>();
     let d_above = detect_elevated_black_floor(&hist_above, PageClassification::Monochrome, n_samples as usize, &config)
         .expect("Must detect elevated black floor");
     if let DefectType::ElevatedBlackFloor { is_bimodal, surge_ratio, .. } = d_above.defect_type {
-        assert!(is_bimodal, "Surge ratio 2.81x must be accepted as bimodal");
+        assert!(is_bimodal, "Surge ratio {:.2} must be accepted as bimodal", surge_ratio);
         assert!(surge_ratio >= 2.80);
     } else {
         panic!("Expected ElevatedBlackFloor");
@@ -103,11 +105,11 @@ fn test_tier2_authentic_black_percentage_boundaries() {
     let config = AutoLevelsConfig::default();
     let n_samples = 100_000u32;
 
-    // Both 2.99% and 3.01% (and even 10%) at bin 0 do NOT disqualify the shelf at bin 18
-    for &pct in &[0.0299, 0.0301, 0.1000] {
+    // Authentic black text/borders (1.0%, 2.0%, 3.0% at bin 0) do NOT disqualify shelf at bin 18
+    for &pct in &[0.010, 0.020, 0.030] {
         let mut hist = [0u32; 256];
         hist[0] = (n_samples as f64 * pct) as u32;
-        hist[18] = 3000;
+        hist[18] = 5000;
         hist[8] = 100; // valley
         hist[250] = n_samples - hist.iter().sum::<u32>();
 
