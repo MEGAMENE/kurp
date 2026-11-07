@@ -38,26 +38,10 @@ fn encode_image(
                 }
             }
             let (w, h) = (image.width(), image.height());
-            match image {
-                DynamicImage::ImageLuma8(_) => {
-                    let rgb = image.to_rgb8();
-                    encoder
-                        .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
-                        .expect("can't write lossless WebP image");
-                }
-                DynamicImage::ImageLumaA8(_) => {
-                    let rgba = image.to_rgba8();
-                    encoder
-                        .write_image(rgba.as_raw(), w, h, ExtendedColorType::Rgba8)
-                        .expect("can't write lossless WebP image");
-                }
-                _ => {
-                    let color_type: ExtendedColorType = image.color().into();
-                    encoder
-                        .write_image(image.as_bytes(), w, h, color_type)
-                        .expect("can't write lossless WebP image");
-                }
-            }
+            let color_type: ExtendedColorType = image.color().into();
+            encoder
+                .write_image(image.as_bytes(), w, h, color_type)
+                .expect("can't write lossless WebP image");
         }
         ImageFormat::Png => {
             let mut encoder = PngEncoder::new_with_quality(
