@@ -305,7 +305,7 @@ impl AppConfig {
             .set_default("realcugan.noise", -1)?
             .set_default("realcugan.model", "Se")?
             .set_default("realcugan.tile_size", 0)?
-            .set_default("realcugan.sync_gap", 3)?
+            .set_default("realcugan.sync_gap", 2)?
             .set_default("realcugan.tta_mode", false)?
             .set_default("realcugan.num_threads", 2)?
             .set_default("realcugan.models_path", models_default_dir.to_str().unwrap())?

@@ -12,6 +12,7 @@ use crate::upscaler::upscaler::{RealCuganUpscaler, Upscaler};
 pub enum UpscaleSupervisorMessage {
     Upscale(Bytes, ImageFormat, RpcReplyPort<(Bytes, ImageFormat)>),
     UpscalePreprocessed(DynamicImage, ImageFormat, LevelInfo, Option<Vec<u8>>, RpcReplyPort<(Bytes, ImageFormat)>),
+    UpscaleRaw(DynamicImage, RpcReplyPort<DynamicImage>),
     Init(Arc<AppConfig>),
     Destroy,
 }
@@ -19,6 +20,7 @@ pub enum UpscaleSupervisorMessage {
 pub enum UpscaleMessage {
     Upscale(Bytes, ImageFormat, RpcReplyPort<(Bytes, ImageFormat)>),
     UpscalePreprocessed(DynamicImage, ImageFormat, LevelInfo, Option<Vec<u8>>, RpcReplyPort<(Bytes, ImageFormat)>),
+    UpscaleRaw(DynamicImage, RpcReplyPort<DynamicImage>),
 }
 
 pub struct UpscaleSupervisorActor;
@@ -55,6 +57,16 @@ impl Actor for UpscaleSupervisorActor {
                     Some(upscale_actor) => {
                         let _ = upscale_actor
                             .send_message(UpscaleMessage::UpscalePreprocessed(image, format, level_info, icc, reply_to));
+                    }
+                }
+            }
+
+            UpscaleSupervisorMessage::UpscaleRaw(image, reply_to) => {
+                match &state.upscale_actor {
+                    None => { return Err(From::from("Upscale Actor is not Initialized")); }
+                    Some(upscale_actor) => {
+                        let _ = upscale_actor
+                            .send_message(UpscaleMessage::UpscaleRaw(image, reply_to));
                     }
                 }
             }
@@ -131,6 +143,10 @@ impl Actor for UpscaleActor {
             }
             UpscaleMessage::UpscalePreprocessed(image, format, level_info, icc, reply_to) => {
                 let result = tokio::task::block_in_place(|| state.upscale_preprocessed(image, format, level_info, icc));
+                let _ = reply_to.send(result);
+            }
+            UpscaleMessage::UpscaleRaw(image, reply_to) => {
+                let result = tokio::task::block_in_place(|| state.upscale_image(image));
                 let _ = reply_to.send(result);
             }
         }

@@ -5,6 +5,8 @@ on:
     branches:
       - development
       - feat/auto-leveling-overhaul
+      - feat/auto-leveling-audit-optimization
+      - 'feat/**'
   workflow_dispatch:
 
 permissions:
@@ -139,22 +141,24 @@ jobs:
           "NCNN_DLL=$($ncnnDll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "$($ncnnDll.Directory.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Build kurp
+      - name: Run automated test suite (x86-64-v3 AVX2+FMA for CI runner)
         shell: pwsh
         env:
           CMAKE_BUILD_TYPE: Release
           CMAKE_VERBOSE_MAKEFILE: ON
-        run: cargo build --release -vv
-
-      - name: Run automated test suite
-        shell: pwsh
-        env:
-          CMAKE_BUILD_TYPE: Release
-          CMAKE_VERBOSE_MAKEFILE: ON
+          CARGO_BUILD_RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: |
           $ncnnDir = Split-Path -Parent $env:NCNN_DLL
           $env:PATH = "$ncnnDir;$env:PATH"
           cargo test --release --all-targets -- --nocapture
+
+      - name: Build kurp release binary (znver5 AVX-512 for Ryzen 7 9800X3D)
+        shell: pwsh
+        env:
+          CMAKE_BUILD_TYPE: Release
+          CMAKE_VERBOSE_MAKEFILE: ON
+          CARGO_BUILD_RUSTFLAGS: "-C target-cpu=znver5"
+        run: cargo build --release --bin kurp -vv
 
       - name: Package Windows release
         shell: pwsh

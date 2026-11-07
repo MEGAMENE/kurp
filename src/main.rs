@@ -27,6 +27,15 @@ async fn main() {
         .parse_default_env()
         .init();
 
+    // Size Rayon global thread pool to physical cores (8 on Ryzen 7 9800X3D)
+    // to prevent SMT thread oversubscription against Tokio and NCNN/Vulkan worker threads.
+    let rayon_threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(4, 8))
+        .unwrap_or(8);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
+        .build_global();
+
     let (upscale_actor, _) = Actor::spawn(None, UpscaleSupervisorActor, ())
         .await
         .expect("Failed to start Upscale Actor!");

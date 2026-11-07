@@ -761,9 +761,11 @@ pub fn analyze_page(
             let h = height as usize;
             total_valid_pixels = w * h;
 
-            // Fast single-pass Stride-4/12 CIELAB Pre-Flight, 4x4 Spatial Grid & Luminance Histogram (< 0.8ms on 6MP)
+            // Fast single-pass Prime-Lattice CIELAB Pre-Flight, 4x4 Spatial Grid & Luminance Histogram (< 0.8ms on 6MP)
+            // Uses coprime prime stride=11 with row phase shift on >=2MP pages to prevent composite
+            // stride=12 (2^2 * 3) Nyquist aliasing against 2px/3px/4px/6px/12px halftone screentones.
             let stride = if total_valid_pixels >= 2_000_000 {
-                12usize
+                11usize
             } else if total_valid_pixels >= 250_000 {
                 4usize
             } else {
@@ -776,7 +778,12 @@ pub fn analyze_page(
             for y_coord in (0..h).step_by(stride) {
                 let grid_r = (y_coord / cell_h).min(3);
                 let row_offset = y_coord * w * 3;
-                for x_coord in (0..w).step_by(stride) {
+                let x_start = if stride > 1 {
+                    ((y_coord / stride) * 3) % stride
+                } else {
+                    0
+                };
+                for x_coord in (x_start..w).step_by(stride) {
                     let grid_c = (x_coord / cell_w).min(3);
                     let cell_idx = grid_r * 4 + grid_c;
                     let idx = row_offset + x_coord * 3;
@@ -784,15 +791,15 @@ pub fn analyze_page(
                     let g = raw[idx + 1];
                     let b = raw[idx + 2];
 
-                    let (y_lum, rgb_diff, l_star, a_star, b_star, c_star) = if r == g && g == b {
+                    let (y_lum, rgb_diff, l_star, a_star, b_star, c_sq) = if r == g && g == b {
                         let (l, _, _) = rgb_to_lab_fast(r, r, r);
                         (r, 0u8, l, 0.0f32, 0.0f32, 0.0f32)
                     } else {
                         let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
                         let diff = r.max(g).max(b) - r.min(g).min(b);
                         let (l, a, bl) = rgb_to_lab_fast(r, g, b);
-                        let c = (a * a + bl * bl).sqrt();
-                        (y, diff, l, a, bl, c)
+                        let c2 = a * a + bl * bl;
+                        (y, diff, l, a, bl, c2)
                     };
 
                     hist_y[y_lum as usize] += scale_weight;
@@ -802,30 +809,30 @@ pub fn analyze_page(
 
                     sampled_pixels += 1;
 
-                    let is_colored = c_star >= 6.0 && l_star >= 2.0;
+                    let is_colored = c_sq >= 36.0 && l_star >= 2.0;
                     if is_colored {
                         raw_colored_count += 1;
                         // Track whether this colored pixel sits on the lignin paper-yellowing axis
-                        if l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0 {
+                        if l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0 {
                             yellow_paper_colored_count += 1;
-                        } else if l_star < 55.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star <= 12.0 {
+                        } else if l_star < 55.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq <= 144.0 {
                             muddy_shadow_colored_count += 1;
                         }
-                        if c_star >= 20.0 && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0) {
+                        if c_sq >= 400.0 && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0) {
                             high_chroma_accent_count += 1;
                         }
                     }
 
-                    
-
                     // Paper candidate filter: (L* >= 65.0) & (C* < 42.0) & (|a*| < 12.0)
-                    if l_star >= 65.0 && c_star < 42.0 && a_star.abs() < 12.0 {
+                    if l_star >= 65.0 && c_sq < 1764.0 && a_star.abs() < 12.0 {
                         if (70.0..99.0).contains(&l_star) {
                             let bin = (((l_star - 70.0) * 2.0).floor() as usize).min(57);
                             paper_l_hist[bin] += 1;
                             paper_bin_sum_a[bin] += a_star as f64;
                             paper_bin_sum_b[bin] += b_star as f64;
-                            paper_bin_sum_c[bin] += c_star as f64;
+                            if c_sq > 0.0 {
+                                paper_bin_sum_c[bin] += c_sq.sqrt() as f64;
+                            }
 
                             if a_star.abs() <= 6.0 && b_star >= -2.0 {
                                 let b_bin = ((b_star.round() as i32) + 20).clamp(0, 80) as usize;
@@ -856,7 +863,7 @@ pub fn analyze_page(
                         sh_sum_r += r as u64;
                         sh_sum_g += g as u64;
                         sh_sum_b += b as u64;
-                        if c_star < 25.0 {
+                        if c_sq < 625.0 {
                             sh_lab_count += 1;
                             sh_sum_lab_a += a_star as f64;
                             sh_sum_lab_b += b_star as f64;
@@ -871,7 +878,7 @@ pub fn analyze_page(
             let h = height as usize;
             let total_px = w * h;
             let stride = if total_px >= 2_000_000 {
-                12usize
+                11usize
             } else if total_px >= 250_000 {
                 4usize
             } else {
@@ -884,7 +891,12 @@ pub fn analyze_page(
             for y_coord in (0..h).step_by(stride) {
                 let grid_r = (y_coord / cell_h).min(3);
                 let row_offset = y_coord * w * 4;
-                for x_coord in (0..w).step_by(stride) {
+                let x_start = if stride > 1 {
+                    ((y_coord / stride) * 3) % stride
+                } else {
+                    0
+                };
+                for x_coord in (x_start..w).step_by(stride) {
                     let idx = row_offset + x_coord * 4;
                     if raw[idx + 3] < 128 {
                         continue;
@@ -895,15 +907,15 @@ pub fn analyze_page(
                     let g = raw[idx + 1];
                     let b = raw[idx + 2];
 
-                    let (y_lum, rgb_diff, l_star, a_star, b_star, c_star) = if r == g && g == b {
+                    let (y_lum, rgb_diff, l_star, a_star, b_star, c_sq) = if r == g && g == b {
                         let (l, _, _) = rgb_to_lab_fast(r, r, r);
                         (r, 0u8, l, 0.0f32, 0.0f32, 0.0f32)
                     } else {
                         let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
                         let diff = r.max(g).max(b) - r.min(g).min(b);
                         let (l, a, bl) = rgb_to_lab_fast(r, g, b);
-                        let c = (a * a + bl * bl).sqrt();
-                        (y, diff, l, a, bl, c)
+                        let c2 = a * a + bl * bl;
+                        (y, diff, l, a, bl, c2)
                     };
 
                     hist_y[y_lum as usize] += scale_weight;
@@ -914,28 +926,28 @@ pub fn analyze_page(
                         max_observed_l = l_star;
                     }
 
-                    let is_colored = c_star >= 6.0 && l_star >= 2.0;
+                    let is_colored = c_sq >= 36.0 && l_star >= 2.0;
                     if is_colored {
                         raw_colored_count += 1;
-                        if l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0 {
+                        if l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0 {
                             yellow_paper_colored_count += 1;
-                        } else if l_star < 55.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star <= 12.0 {
+                        } else if l_star < 55.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq <= 144.0 {
                             muddy_shadow_colored_count += 1;
                         }
-                        if c_star >= 20.0 && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0) {
+                        if c_sq >= 400.0 && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0) {
                             high_chroma_accent_count += 1;
                         }
                     }
 
-                    
-
-                    if l_star >= 65.0 && c_star < 42.0 && a_star.abs() < 12.0 {
+                    if l_star >= 65.0 && c_sq < 1764.0 && a_star.abs() < 12.0 {
                         if (70.0..99.0).contains(&l_star) {
                             let bin = (((l_star - 70.0) * 2.0).floor() as usize).min(57);
                             paper_l_hist[bin] += 1;
                             paper_bin_sum_a[bin] += a_star as f64;
                             paper_bin_sum_b[bin] += b_star as f64;
-                            paper_bin_sum_c[bin] += c_star as f64;
+                            if c_sq > 0.0 {
+                                paper_bin_sum_c[bin] += c_sq.sqrt() as f64;
+                            }
 
                             if a_star.abs() <= 6.0 && b_star >= -2.0 {
                                 let b_bin = ((b_star.round() as i32) + 20).clamp(0, 80) as usize;
@@ -964,7 +976,7 @@ pub fn analyze_page(
                         sh_sum_r += r as u64;
                         sh_sum_g += g as u64;
                         sh_sum_b += b as u64;
-                        if c_star < 25.0 {
+                        if c_sq < 625.0 {
                             sh_lab_count += 1;
                             sh_sum_lab_a += a_star as f64;
                             sh_sum_lab_b += b_star as f64;
@@ -1953,61 +1965,63 @@ pub fn apply_color_correction_oklab(image: &mut DynamicImage, plan: &CorrectionP
             });
         }
         DynamicImage::ImageRgba8(rgba) => {
-            (**rgba).par_chunks_exact_mut(4).for_each(|chunk| {
-                if chunk[3] < 128 {
-                    return;
-                }
-                let r = chunk[0];
-                let g = chunk[1];
-                let b = chunk[2];
+            (**rgba).par_chunks_mut(4096).for_each(|strip| {
+                for chunk in strip.chunks_exact_mut(4) {
+                    if chunk[3] < 128 {
+                        continue;
+                    }
+                    let r = chunk[0];
+                    let g = chunk[1];
+                    let b = chunk[2];
 
-                let srgb = Srgb::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
-                let mut oklab: Oklab = srgb.into_color();
+                    let srgb = Srgb::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+                    let mut oklab: Oklab = srgb.into_color();
 
-                let orig_l = oklab.l;
-                if orig_l <= 0.001 {
-                    return;
-                }
+                    let orig_l = oklab.l;
+                    if orig_l <= 0.001 {
+                        continue;
+                    }
 
-                let lut_idx = ((orig_l * 4095.0).round() as usize).min(4095);
-                let new_l = l_lut[lut_idx];
-                oklab.l = new_l;
+                    let lut_idx = ((orig_l * 4095.0).round() as usize).min(4095);
+                    let new_l = l_lut[lut_idx];
+                    oklab.l = new_l;
 
-                let lin_rgb: LinSrgb = oklab.into_color();
-                if (0.0..=1.0).contains(&lin_rgb.red)
-                    && (0.0..=1.0).contains(&lin_rgb.green)
-                    && (0.0..=1.0).contains(&lin_rgb.blue)
-                {
-                    let out_srgb: Srgb = lin_rgb.into_color();
+                    let lin_rgb: LinSrgb = oklab.into_color();
+                    if (0.0..=1.0).contains(&lin_rgb.red)
+                        && (0.0..=1.0).contains(&lin_rgb.green)
+                        && (0.0..=1.0).contains(&lin_rgb.blue)
+                    {
+                        let out_srgb: Srgb = lin_rgb.into_color();
+                        chunk[0] = (out_srgb.red * 255.0).round().clamp(0.0, 255.0) as u8;
+                        chunk[1] = (out_srgb.green * 255.0).round().clamp(0.0, 255.0) as u8;
+                        chunk[2] = (out_srgb.blue * 255.0).round().clamp(0.0, 255.0) as u8;
+                        continue;
+                    }
+
+                    let mut t_low = 0.0f32;
+                    let mut t_high = 1.0f32;
+                    let mut best_lin = lin_rgb;
+
+                    for _ in 0..10 {
+                        let t_mid = 0.5 * (t_low + t_high);
+                        let test_oklab = Oklab::new(new_l, oklab.a * t_mid, oklab.b * t_mid);
+                        let test_lin: LinSrgb = test_oklab.into_color();
+                        if (0.0..=1.0).contains(&test_lin.red)
+                            && (0.0..=1.0).contains(&test_lin.green)
+                            && (0.0..=1.0).contains(&test_lin.blue)
+                        {
+                            t_low = t_mid;
+                            best_lin = test_lin;
+                        } else {
+                            t_high = t_mid;
+                        }
+                    }
+
+                    let out_srgb: Srgb = best_lin.into_color();
                     chunk[0] = (out_srgb.red * 255.0).round().clamp(0.0, 255.0) as u8;
                     chunk[1] = (out_srgb.green * 255.0).round().clamp(0.0, 255.0) as u8;
                     chunk[2] = (out_srgb.blue * 255.0).round().clamp(0.0, 255.0) as u8;
-                    return;
                 }
-
-                let mut t_low = 0.0f32;
-                let mut t_high = 1.0f32;
-                let mut best_lin = lin_rgb;
-
-                for _ in 0..10 {
-                    let t_mid = 0.5 * (t_low + t_high);
-                    let test_oklab = Oklab::new(new_l, oklab.a * t_mid, oklab.b * t_mid);
-                    let test_lin: LinSrgb = test_oklab.into_color();
-                    if (0.0..=1.0).contains(&test_lin.red)
-                        && (0.0..=1.0).contains(&test_lin.green)
-                        && (0.0..=1.0).contains(&test_lin.blue)
-                    {
-                        t_low = t_mid;
-                        best_lin = test_lin;
-                    } else {
-                        t_high = t_mid;
-                    }
-                }
-
-                let out_srgb: Srgb = best_lin.into_color();
-                chunk[0] = (out_srgb.red * 255.0).round().clamp(0.0, 255.0) as u8;
-                chunk[1] = (out_srgb.green * 255.0).round().clamp(0.0, 255.0) as u8;
-                chunk[2] = (out_srgb.blue * 255.0).round().clamp(0.0, 255.0) as u8;
             });
         }
         _ => {}
@@ -2046,10 +2060,10 @@ fn build_dilated_accent_mask_rgb(raw: &[u8], width: usize, height: usize) -> Vec
                     continue;
                 }
                 let (l_star, a_star, b_star) = rgb_to_lab_fast(r, g, b);
-                let c_star = (a_star * a_star + b_star * b_star).sqrt();
+                let c_sq = a_star * a_star + b_star * b_star;
                 let is_yellow_paper =
-                    l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0;
-                if !is_yellow_paper && (c_star >= 20.0 || rgb_diff >= 35) {
+                    l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0;
+                if !is_yellow_paper && (c_sq >= 400.0 || rgb_diff >= 35) {
                     mask_row[x] = 1;
                 }
             }
@@ -2158,22 +2172,26 @@ pub fn apply_monochrome_mixed_correction(
                         }
 
                         let (l_star, a_star, b_star) = rgb_to_lab_fast(r, g, b);
-                        let c_star = (a_star * a_star + b_star * b_star).sqrt();
-
-                        // Dual-Boundary Luminance-Adaptive Sigmoid Chroma Gate via 2D fixed-point LUT
-                        let l_bin = (l_star.round() as usize).min(100);
-                        let c_bin = ((c_star * 4.0).round() as usize).min(255);
-                        let mut chroma_retention_q8 = tables.taper_lut[l_bin][c_bin] as i32;
+                        let c_sq = a_star * a_star + b_star * b_star;
 
                         // Neutralize verified lignin / acid paper yellowing & dirty paper tint
-                        // while strictly preserving pastel blue skies (b* < 0) and warm skin (a* > 4.5)
+                        // while strictly preserving pastel blue skies (b* < 0) and warm skin (a* > 4.5),
+                        // using squared chroma C*^2 short-circuiting before sqrt().
                         let is_paper_yellow_axis =
-                            l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0;
-                        if is_paper_yellow_axis
-                            && (has_paper_cast || classification == PageClassification::Monochrome || c_star <= 5.5)
+                            l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0;
+                        let chroma_retention_q8 = if is_paper_yellow_axis
+                            && (has_paper_cast || classification == PageClassification::Monochrome || c_sq <= 30.25)
                         {
-                            chroma_retention_q8 = 0;
-                        }
+                            0
+                        } else if c_sq <= 1.0 {
+                            0
+                        } else if c_sq >= 576.0 {
+                            256
+                        } else {
+                            let l_bin = (l_star.round() as usize).min(100);
+                            let c_bin = ((c_sq.sqrt() * 4.0).round() as usize).min(255);
+                            tables.taper_lut[l_bin][c_bin] as i32
+                        };
 
                         if chroma_retention_q8 == 0 {
                             let y_u8 = y_new as u8;
@@ -2182,9 +2200,25 @@ pub fn apply_monochrome_mixed_correction(
                             chunk[2] = y_u8;
                         } else {
                             let y_i32 = y_old as i32;
-                            let r_out = y_new + (((r as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
-                            let g_out = y_new + (((g as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
-                            let b_out = y_new + (((b as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
+                            let dr = ((r as i32 - y_i32) * chroma_retention_q8 + 128) >> 8;
+                            let dg = ((g as i32 - y_i32) * chroma_retention_q8 + 128) >> 8;
+                            let db = ((b as i32 - y_i32) * chroma_retention_q8 + 128) >> 8;
+                            let mut r_out = y_new + dr;
+                            let mut g_out = y_new + dg;
+                            let mut b_out = y_new + db;
+                            if ((r_out | g_out | b_out) & !255) != 0 {
+                                let mut scale_q8 = 256i32;
+                                for d in [dr, dg, db] {
+                                    if y_new + d > 255 && d > 0 {
+                                        scale_q8 = scale_q8.min(((255 - y_new) << 8) / d);
+                                    } else if y_new + d < 0 && d < 0 {
+                                        scale_q8 = scale_q8.min((y_new << 8) / (-d));
+                                    }
+                                }
+                                r_out = y_new + ((dr * scale_q8 + 128) >> 8);
+                                g_out = y_new + ((dg * scale_q8 + 128) >> 8);
+                                b_out = y_new + ((db * scale_q8 + 128) >> 8);
+                            }
                             chunk[0] = r_out.clamp(0, 255) as u8;
                             chunk[1] = g_out.clamp(0, 255) as u8;
                             chunk[2] = b_out.clamp(0, 255) as u8;
@@ -2194,65 +2228,87 @@ pub fn apply_monochrome_mixed_correction(
         }
         DynamicImage::ImageRgba8(rgba) => {
             let raw: &mut [u8] = rgba;
-            raw.par_chunks_exact_mut(4).for_each(|chunk| {
-                if chunk[3] < 128 {
-                    return;
-                }
-                let r = chunk[0];
-                let g = chunk[1];
-                let b = chunk[2];
-                let rgb_diff = r.max(g).max(b) - r.min(g).min(b);
+            raw.par_chunks_mut(4096).for_each(|strip| {
+                for chunk in strip.chunks_exact_mut(4) {
+                    if chunk[3] < 128 {
+                        continue;
+                    }
+                    let r = chunk[0];
+                    let g = chunk[1];
+                    let b = chunk[2];
+                    let rgb_diff = r.max(g).max(b) - r.min(g).min(b);
 
-                if classification == PageClassification::Mixed && rgb_diff >= 35 {
-                    return;
-                }
+                    if classification == PageClassification::Mixed && rgb_diff >= 35 {
+                        continue;
+                    }
 
-                let y_old = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
-                let y_new = lut_y[y_old as usize] as i32;
+                    let y_old = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
+                    let y_new = lut_y[y_old as usize] as i32;
 
-                if r == g && g == b {
-                    let y_u8 = y_new as u8;
-                    chunk[0] = y_u8;
-                    chunk[1] = y_u8;
-                    chunk[2] = y_u8;
-                    return;
-                }
+                    if r == g && g == b {
+                        let y_u8 = y_new as u8;
+                        chunk[0] = y_u8;
+                        chunk[1] = y_u8;
+                        chunk[2] = y_u8;
+                        continue;
+                    }
 
-                let (l_star, a_star, b_star) = rgb_to_lab_fast(r, g, b);
-                let c_star = (a_star * a_star + b_star * b_star).sqrt();
+                    let (l_star, a_star, b_star) = rgb_to_lab_fast(r, g, b);
+                    let c_sq = a_star * a_star + b_star * b_star;
 
-                if classification == PageClassification::Mixed
-                    && c_star >= 20.0
-                    && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0)
-                {
-                    return;
-                }
+                    if classification == PageClassification::Mixed
+                        && c_sq >= 400.0
+                        && !(l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0)
+                    {
+                        continue;
+                    }
 
-                let l_bin = (l_star.round() as usize).min(100);
-                let c_bin = ((c_star * 4.0).round() as usize).min(255);
-                let mut chroma_retention_q8 = tables.taper_lut[l_bin][c_bin] as i32;
+                    let is_paper_yellow_axis =
+                        l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_sq < 1296.0;
+                    let chroma_retention_q8 = if is_paper_yellow_axis
+                        && (has_paper_cast || classification == PageClassification::Monochrome || c_sq <= 30.25)
+                    {
+                        0
+                    } else if c_sq <= 1.0 {
+                        0
+                    } else if c_sq >= 576.0 {
+                        256
+                    } else {
+                        let l_bin = (l_star.round() as usize).min(100);
+                        let c_bin = ((c_sq.sqrt() * 4.0).round() as usize).min(255);
+                        tables.taper_lut[l_bin][c_bin] as i32
+                    };
 
-                let is_paper_yellow_axis =
-                    l_star >= 65.0 && a_star.abs() <= 4.5 && b_star > 0.0 && c_star < 36.0;
-                if is_paper_yellow_axis
-                    && (has_paper_cast || classification == PageClassification::Monochrome || c_star <= 5.5)
-                {
-                    chroma_retention_q8 = 0;
-                }
-
-                if chroma_retention_q8 == 0 {
-                    let y_u8 = y_new as u8;
-                    chunk[0] = y_u8;
-                    chunk[1] = y_u8;
-                    chunk[2] = y_u8;
-                } else {
-                    let y_i32 = y_old as i32;
-                    let r_out = y_new + (((r as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
-                    let g_out = y_new + (((g as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
-                    let b_out = y_new + (((b as i32 - y_i32) * chroma_retention_q8 + 128) >> 8);
-                    chunk[0] = r_out.clamp(0, 255) as u8;
-                    chunk[1] = g_out.clamp(0, 255) as u8;
-                    chunk[2] = b_out.clamp(0, 255) as u8;
+                    if chroma_retention_q8 == 0 {
+                        let y_u8 = y_new as u8;
+                        chunk[0] = y_u8;
+                        chunk[1] = y_u8;
+                        chunk[2] = y_u8;
+                    } else {
+                        let y_i32 = y_old as i32;
+                        let dr = ((r as i32 - y_i32) * chroma_retention_q8 + 128) >> 8;
+                        let dg = ((g as i32 - y_i32) * chroma_retention_q8 + 128) >> 8;
+                        let db = ((b as i32 - y_i32) * chroma_retention_q8 + 128) >> 8;
+                        let mut r_out = y_new + dr;
+                        let mut g_out = y_new + dg;
+                        let mut b_out = y_new + db;
+                        if ((r_out | g_out | b_out) & !255) != 0 {
+                            let mut scale_q8 = 256i32;
+                            for d in [dr, dg, db] {
+                                if y_new + d > 255 && d > 0 {
+                                    scale_q8 = scale_q8.min(((255 - y_new) << 8) / d);
+                                } else if y_new + d < 0 && d < 0 {
+                                    scale_q8 = scale_q8.min((y_new << 8) / (-d));
+                                }
+                            }
+                            r_out = y_new + ((dr * scale_q8 + 128) >> 8);
+                            g_out = y_new + ((dg * scale_q8 + 128) >> 8);
+                            b_out = y_new + ((db * scale_q8 + 128) >> 8);
+                        }
+                        chunk[0] = r_out.clamp(0, 255) as u8;
+                        chunk[1] = g_out.clamp(0, 255) as u8;
+                        chunk[2] = b_out.clamp(0, 255) as u8;
+                    }
                 }
             });
         }
@@ -2291,25 +2347,27 @@ pub fn apply_paper_cast_ramp(
             });
         }
         DynamicImage::ImageRgba8(rgba) => {
-            (**rgba).par_chunks_exact_mut(4).for_each(|chunk| {
-                if chunk[3] < 128 {
-                    return;
-                }
-                let r = chunk[0];
-                let g = chunk[1];
-                let b = chunk[2];
-                let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
-                if y >= ramp_start {
-                    let factor = ((y as f32 - ramp_start as f32) / ramp_range).clamp(0.0, 1.0);
-                    chunk[0] = (r as f32 * (1.0 + (gain_r - 1.0) * factor))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                    chunk[1] = (g as f32 * (1.0 + (gain_g - 1.0) * factor))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                    chunk[2] = (b as f32 * (1.0 + (gain_b - 1.0) * factor))
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
+            (**rgba).par_chunks_mut(4096).for_each(|strip| {
+                for chunk in strip.chunks_exact_mut(4) {
+                    if chunk[3] < 128 {
+                        continue;
+                    }
+                    let r = chunk[0];
+                    let g = chunk[1];
+                    let b = chunk[2];
+                    let y = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
+                    if y >= ramp_start {
+                        let factor = ((y as f32 - ramp_start as f32) / ramp_range).clamp(0.0, 1.0);
+                        chunk[0] = (r as f32 * (1.0 + (gain_r - 1.0) * factor))
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                        chunk[1] = (g as f32 * (1.0 + (gain_g - 1.0) * factor))
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                        chunk[2] = (b as f32 * (1.0 + (gain_b - 1.0) * factor))
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
                 }
             });
         }
@@ -2678,6 +2736,33 @@ pub fn quality_tier_1(
                 .zip(lev_rgba.as_raw().par_chunks_exact(4))
                 .filter(|(o, _)| o[3] >= 128)
                 .map(|(o, l)| {
+                    let rgb_diff = o[0].max(o[1]).max(o[2]) - o[0].min(o[1]).min(o[2]);
+                    if rgb_diff >= 12 && o[0] == l[0] && o[1] == l[1] && o[2] == l[2] {
+                        return (0.0, 0u64);
+                    }
+                    let yo = ((54 * o[0] as u32 + 183 * o[1] as u32 + 19 * o[2] as u32 + 128) >> 8) as usize;
+                    let yl = ((54 * l[0] as u32 + 183 * l[1] as u32 + 19 * l[2] as u32 + 128) >> 8) as f64;
+                    let expected_y = expected_lut[yo] as f64;
+                    let diff = yl - expected_y;
+                    (diff * diff, 1u64)
+                })
+                .reduce(|| (0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            (s, c as f64)
+        }
+        (DynamicImage::ImageRgb8(orig_rgb), DynamicImage::ImageRgb8(lev_rgb)) => {
+            let orig_raw = orig_rgb.as_raw();
+            let lev_raw = lev_rgb.as_raw();
+            let total_px = orig_raw.len() / 3;
+            let step = if total_px >= 1_000_000 { 4usize } else { 1usize };
+            let (s, c) = orig_raw
+                .par_chunks_exact(3)
+                .step_by(step)
+                .zip(lev_raw.par_chunks_exact(3).step_by(step))
+                .map(|(o, l)| {
+                    let rgb_diff = o[0].max(o[1]).max(o[2]) - o[0].min(o[1]).min(o[2]);
+                    if rgb_diff >= 12 && o[0] == l[0] && o[1] == l[1] && o[2] == l[2] {
+                        return (0.0, 0u64);
+                    }
                     let yo = ((54 * o[0] as u32 + 183 * o[1] as u32 + 19 * o[2] as u32 + 128) >> 8) as usize;
                     let yl = ((54 * l[0] as u32 + 183 * l[1] as u32 + 19 * l[2] as u32 + 128) >> 8) as f64;
                     let expected_y = expected_lut[yo] as f64;
@@ -2789,8 +2874,14 @@ pub fn quality_tier_2(
     }
 
     if classification == PageClassification::Color || classification == PageClassification::Mixed {
-        let orig_rgb = original.to_rgb8();
-        let lev_rgb = leveled.to_rgb8();
+        let orig_rgb = match original.as_rgb8() {
+            Some(rgb) => std::borrow::Cow::Borrowed(rgb),
+            None => std::borrow::Cow::Owned(original.to_rgb8()),
+        };
+        let lev_rgb = match leveled.as_rgb8() {
+            Some(rgb) => std::borrow::Cow::Borrowed(rgb),
+            None => std::borrow::Cow::Owned(leveled.to_rgb8()),
+        };
         let total_pixels = (orig_rgb.width() * orig_rgb.height()) as usize;
         let step = (total_pixels / 2000).max(1);
 
@@ -2827,7 +2918,23 @@ pub fn quality_tier_2(
             let (_l_lev, a_lev, b_lev) = rgb_to_lab_fast(lp[0], lp[1], lp[2]);
             let delta_a = a_orig - a_lev;
             let delta_b = b_orig - b_lev;
-            let delta_chroma = (delta_a * delta_a + delta_b * delta_b).sqrt();
+            let mut delta_chroma = (delta_a * delta_a + delta_b * delta_b).sqrt();
+
+            // Luminance-compensated chromaticity reference for YCrCb-preserved pixels (taper == 1.0)
+            let lev_y = ((54 * lp[0] as u32 + 183 * lp[1] as u32 + 19 * lp[2] as u32 + 128) >> 8) as u8;
+            if lev_y != orig_y {
+                let dy = lev_y as i32 - orig_y as i32;
+                let er = (or as i32 + dy).clamp(0, 255) as u8;
+                let eg = (og as i32 + dy).clamp(0, 255) as u8;
+                let eb = (ob as i32 + dy).clamp(0, 255) as u8;
+                let (_, a_exp, b_exp) = rgb_to_lab_fast(er, eg, eb);
+                let da_exp = a_exp - a_lev;
+                let db_exp = b_exp - b_lev;
+                let dc_exp = (da_exp * da_exp + db_exp * db_exp).sqrt();
+                if dc_exp < delta_chroma {
+                    delta_chroma = dc_exp;
+                }
+            }
             chroma_deltas.push(delta_chroma);
         }
 
@@ -3063,29 +3170,38 @@ pub fn level_and_verify_filtered(
         );
     }
 
-    // Fast strided subimage extraction for Quality Guard on large >= 2MP images (< 0.10ms on 6MP)
+    // Fast contiguous 32x32 block extraction for Quality Guard on large >= 2MP images (< 0.15ms on 6MP)
+    // Preserves contiguous local neighborhoods for 8x8 SSIM, 3x3 Sobel gradients, and 32x32 contrast blocks.
     fn sample_for_quality_guard(img: &DynamicImage) -> DynamicImage {
         let (w, h) = img.dimensions();
-        if (w as usize) * (h as usize) < 2_000_000 {
+        let w_usize = w as usize;
+        let h_usize = h as usize;
+        if w_usize * h_usize < 2_000_000 || w_usize < 128 || h_usize < 128 {
             return img.clone();
         }
+        const BS: usize = 32;
+        const BLOCK_STRIDE: usize = 4;
+        let bx_count = ((w_usize / BS) + BLOCK_STRIDE - 1) / BLOCK_STRIDE;
+        let by_count = ((h_usize / BS) + BLOCK_STRIDE - 1) / BLOCK_STRIDE;
+        let sw = (bx_count * BS).max(BS);
+        let sh = (by_count * BS).max(BS);
+
         match img {
             DynamicImage::ImageRgb8(rgb) => {
-                let stride = 12usize;
-                let sw = (w as usize / stride).max(1);
-                let sh = (h as usize / stride).max(1);
                 let raw = rgb.as_raw();
-                let w_usize = w as usize;
                 let mut out = vec![0u8; sw * sh * 3];
-                for sy in 0..sh {
-                    let row_off = (sy * stride) * w_usize * 3;
-                    let dst_off = sy * sw * 3;
-                    for sx in 0..sw {
-                        let src_idx = row_off + (sx * stride) * 3;
-                        let dst_idx = dst_off + sx * 3;
-                        out[dst_idx] = raw[src_idx];
-                        out[dst_idx + 1] = raw[src_idx + 1];
-                        out[dst_idx + 2] = raw[src_idx + 2];
+                for by in 0..by_count {
+                    let src_by = (by * BLOCK_STRIDE * BS).min(h_usize - BS);
+                    for dy in 0..BS {
+                        let src_row_off = (src_by + dy) * w_usize * 3;
+                        let dst_row_off = (by * BS + dy) * sw * 3;
+                        for bx in 0..bx_count {
+                            let src_bx = (bx * BLOCK_STRIDE * BS).min(w_usize - BS);
+                            let src_idx = src_row_off + src_bx * 3;
+                            let dst_idx = dst_row_off + (bx * BS) * 3;
+                            out[dst_idx..dst_idx + BS * 3]
+                                .copy_from_slice(&raw[src_idx..src_idx + BS * 3]);
+                        }
                     }
                 }
                 if let Some(sub) = image::RgbImage::from_raw(sw as u32, sh as u32, out) {
@@ -3093,22 +3209,20 @@ pub fn level_and_verify_filtered(
                 }
             }
             DynamicImage::ImageRgba8(rgba) => {
-                let stride = 12usize;
-                let sw = (w as usize / stride).max(1);
-                let sh = (h as usize / stride).max(1);
                 let raw = rgba.as_raw();
-                let w_usize = w as usize;
                 let mut out = vec![0u8; sw * sh * 4];
-                for sy in 0..sh {
-                    let row_off = (sy * stride) * w_usize * 4;
-                    let dst_off = sy * sw * 4;
-                    for sx in 0..sw {
-                        let src_idx = row_off + (sx * stride) * 4;
-                        let dst_idx = dst_off + sx * 4;
-                        out[dst_idx] = raw[src_idx];
-                        out[dst_idx + 1] = raw[src_idx + 1];
-                        out[dst_idx + 2] = raw[src_idx + 2];
-                        out[dst_idx + 3] = raw[src_idx + 3];
+                for by in 0..by_count {
+                    let src_by = (by * BLOCK_STRIDE * BS).min(h_usize - BS);
+                    for dy in 0..BS {
+                        let src_row_off = (src_by + dy) * w_usize * 4;
+                        let dst_row_off = (by * BS + dy) * sw * 4;
+                        for bx in 0..bx_count {
+                            let src_bx = (bx * BLOCK_STRIDE * BS).min(w_usize - BS);
+                            let src_idx = src_row_off + src_bx * 4;
+                            let dst_idx = dst_row_off + (bx * BS) * 4;
+                            out[dst_idx..dst_idx + BS * 4]
+                                .copy_from_slice(&raw[src_idx..src_idx + BS * 4]);
+                        }
                     }
                 }
                 if let Some(sub) = image::RgbaImage::from_raw(sw as u32, sh as u32, out) {
@@ -3132,6 +3246,16 @@ pub fn level_and_verify_filtered(
             return cloned.clone();
         }
         if !_original_bytes.is_empty() {
+            if let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(_original_bytes)).with_guessed_format() {
+                if let Ok(mut decoder) = reader.into_decoder() {
+                    use image::ImageDecoder;
+                    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+                    if let Ok(mut decoded) = DynamicImage::from_decoder(decoder) {
+                        decoded.apply_orientation(orientation);
+                        return decoded;
+                    }
+                }
+            }
             if let Ok(decoded) = image::load_from_memory(_original_bytes) {
                 return decoded;
             }
@@ -3151,9 +3275,11 @@ pub fn level_and_verify_filtered(
         image.clone()
     };
     let mut lev_hist = compute_image_luminance_histogram(&guard_leveled);
-    if is_large_page {
+    let guard_px = (guard_leveled.width() as u64 * guard_leveled.height() as u64).max(1);
+    if is_large_page && analysis.total_pixels as u64 > guard_px {
+        let total_px = analysis.total_pixels as u64;
         for slot in lev_hist.iter_mut() {
-            *slot = slot.saturating_mul(144);
+            *slot = ((*slot as u64 * total_px) / guard_px).min(u32::MAX as u64) as u32;
         }
     }
 
@@ -3254,9 +3380,11 @@ pub fn level_and_verify_filtered(
             retry_image.clone()
         };
         let mut retry_lev_hist = compute_image_luminance_histogram(&guard_retry);
-        if is_large_page {
+        let retry_guard_px = (guard_retry.width() as u64 * guard_retry.height() as u64).max(1);
+        if is_large_page && analysis.total_pixels as u64 > retry_guard_px {
+            let total_px = analysis.total_pixels as u64;
             for slot in retry_lev_hist.iter_mut() {
-                *slot = slot.saturating_mul(144);
+                *slot = ((*slot as u64 * total_px) / retry_guard_px).min(u32::MAX as u64) as u32;
             }
         }
 
@@ -3889,5 +4017,36 @@ mod tests {
                 restore_ms
             );
         }
+    }
+
+    #[test]
+    fn test_m1_to_m5_gamut_scaling_and_large_page_screentone_guard() {
+        // Verify [M-3] radial gamut scaling preserves hue ratio (dr:dg:db) and prevents channel flat-clipping
+        // when a pastel cyan-blue sky pixel [195, 238, 245] (Y=229) is stretched to Y'=248.
+        // Without radial gamut scaling, both G (238+19=257->255) and B (245+19=264->255) clip to 255.
+        let mut img = RgbImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                img.put_pixel(x, y, Rgb([195, 238, 245]));
+            }
+        }
+        let mut dyn_img = DynamicImage::ImageRgb8(img);
+        let plan = CorrectionPlan {
+            black_point: 20,
+            white_point: 230,
+            correction_fraction: 1.0,
+            gamma: 1.0,
+            paper_cast_gains: None,
+            paper_cast_ramp_start: 180,
+            use_oklab: false,
+            skip_correction: false,
+        };
+        apply_monochrome_mixed_correction(&mut dyn_img, &plan, PageClassification::Mixed);
+        let out_px = dyn_img.as_rgb8().unwrap().get_pixel(0, 0);
+        assert!(
+            out_px[2] > out_px[1] && out_px[1] > out_px[0],
+            "Radial gamut scaling must preserve strict B > G > R ordering without flat-clipping G=B=255 (got {:?})",
+            out_px
+        );
     }
 }

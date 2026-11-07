@@ -271,25 +271,30 @@ impl BookProfileManager {
                         }
                     };
 
-                    // Streaming drop sequence:
-                    // 1. Decode image
-                    let decoded = match image::load_from_memory(&image_bytes) {
-                        Ok(img) => img,
-                        Err(e) => {
-                            warn!("[BookProfile] Failed to decode page {} for {}: {}", p_num, b_id, e);
-                            return None;
-                        }
-                    };
-                    // Drop compressed bytes immediately
-                    drop(image_bytes);
+                    // Streaming drop sequence inside spawn_blocking to avoid starving Tokio async worker threads:
+                    tokio::task::spawn_blocking(move || {
+                        // 1. Decode image
+                        let decoded = match image::load_from_memory(&image_bytes) {
+                            Ok(img) => img,
+                            Err(e) => {
+                                warn!("[BookProfile] Failed to decode page {} for {}: {}", p_num, b_id, e);
+                                return None;
+                            }
+                        };
+                        // Drop compressed bytes immediately
+                        drop(image_bytes);
 
-                    // 2. Lightweight extraction
-                    let summary = analyze_page_lightweight(&decoded, p_num);
+                        // 2. Lightweight extraction
+                        let summary = analyze_page_lightweight(&decoded, p_num);
 
-                    // 3. Drop uncompressed pixel buffer immediately
-                    drop(decoded);
+                        // 3. Drop uncompressed pixel buffer immediately
+                        drop(decoded);
 
-                    Some(summary)
+                        Some(summary)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
                 }));
             }
 

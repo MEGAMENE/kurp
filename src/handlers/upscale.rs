@@ -17,15 +17,21 @@ use moka::future::Cache;
 use once_cell::sync::Lazy;
 use ractor::call;
 use regex::Regex;
+use tokio::sync::Semaphore;
 use unicase::Ascii;
 
 use crate::app_state::AppState;
 use crate::http_compression;
 use crate::http_compression::{Algorithm, compress};
 use crate::models::errors::HttpError;
-use crate::upscaler::auto_levels::level_and_verify_with_context;
+use crate::upscaler::auto_levels::{level_and_verify_with_context, LevelInfo};
 use crate::upscaler::book_profile::BookProfile;
 use crate::upscaler::upscale_actor::UpscaleSupervisorMessage;
+use crate::upscaler::upscaler::encode_upscaled_output;
+
+/// 6-permit semaphore bounding concurrent in-flight upscale pipeline jobs
+/// (1 page on GPU, 1-2 pages decoding/leveling on CPU, 2-3 pages encoding to WebP/PNG on CPU).
+static UPSCALE_PIPELINE_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(6));
 
 pub async fn upscale_komga(
     State(state): State<AppState>,
@@ -173,68 +179,93 @@ async fn upscale_response(
         response_bytes.clone()
     };
 
+    if state.config.size_threshold_enabled {
+        let input_kb = (to_upscale.len() / 1024) as u32;
+        let threshold = if image_format == ImageFormat::Png {
+            state.config.size_threshold_png
+        } else {
+            state.config.size_threshold
+        };
+        if input_kb > threshold {
+            info!("image size {} is bigger than threshold {}. skipping upscale", input_kb, threshold);
+            return to_response(status, response_bytes, &headers, image_format);
+        }
+    }
+
+    // Acquire 1 of 6 pipeline concurrency permits before decoding large uncompressed pixel buffers
+    let _pipeline_permit = UPSCALE_PIPELINE_SEMAPHORE.acquire().await.ok();
+
     let auto_levels_config = state.config.auto_levels;
+    let max_upscale_dimension = state.config.max_upscale_dimension;
 
-    // Decoupled Pre-Actor CPU Execution (Milestone 4):
-    // Image decoding, histogram generation, color correction, and Quality Guard verification
-    // run inside tokio::task::spawn_blocking on the CPU threadpool before dispatching to GPU actor.
-    let preprocessed = if auto_levels_config.enabled {
-        let to_upscale_cl = to_upscale.clone();
-        let bp_cl = book_profile.clone();
-        let b_id = book_id.clone();
-        let p_num = page_number;
-        tokio::task::spawn_blocking(move || {
-            let mut reader = match ImageReader::new(Cursor::new(to_upscale_cl.clone())).with_guessed_format() {
-                Ok(r) => r,
-                Err(e) => {
-                    log::info!("Failed to guess format for pre-actor leveling: {}. Falling back.", e);
-                    return None;
-                }
-            };
-            if reader.format().is_none() {
-                reader.set_format(image_format);
+    // Stage 1 (CPU spawn_blocking): Decode image, apply orientation, check max dimension,
+    // and execute Auto-Levels + Quality Guard if enabled.
+    let to_upscale_cl = to_upscale.clone();
+    let bp_cl = book_profile.clone();
+    let b_id = book_id.clone();
+    let p_num = page_number;
+    let decoded_stage = tokio::task::spawn_blocking(move || {
+        let mut reader = match ImageReader::new(Cursor::new(to_upscale_cl.clone())).with_guessed_format() {
+            Ok(r) => r,
+            Err(e) => {
+                log::info!("Failed to guess format: {}. Returning original.", e);
+                return None;
             }
-            let detected_format = reader.format().unwrap_or(image_format);
-            let is_avif = detected_format == ImageFormat::Avif || image_format == ImageFormat::Avif;
-            let avif_color_info = if is_avif {
-                crate::upscaler::avif::parse_avif_color_info(&to_upscale_cl)
-            } else {
-                None
-            };
+        };
+        if reader.format().is_none() {
+            reader.set_format(image_format);
+        }
+        let detected_format = reader.format().unwrap_or(image_format);
+        let is_avif = detected_format == ImageFormat::Avif || image_format == ImageFormat::Avif;
+        let avif_color_info = if is_avif {
+            crate::upscaler::avif::parse_avif_color_info(&to_upscale_cl)
+        } else {
+            None
+        };
 
-            let mut decoder = match reader.into_decoder() {
-                Ok(d) => d,
-                Err(_) => {
-                    let mut fallback = ImageReader::new(Cursor::new(to_upscale_cl.clone()));
-                    fallback.set_format(image_format);
-                    match fallback.into_decoder() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            log::info!("Failed to decode image for pre-actor leveling: {}. Falling back.", e);
-                            return None;
-                        }
+        let mut decoder = match reader.into_decoder() {
+            Ok(d) => d,
+            Err(_) => {
+                let mut fallback = ImageReader::new(Cursor::new(to_upscale_cl.clone()));
+                fallback.set_format(image_format);
+                match fallback.into_decoder() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::info!("Failed to decode image: {}. Returning original.", e);
+                        return None;
                     }
                 }
-            };
-
-            let orientation = decoder.orientation().ok();
-            let icc_profile = decoder.icc_profile().ok().flatten().or_else(|| {
-                avif_color_info.as_ref().and_then(|info| info.icc_profile.clone())
-            });
-
-            let mut image = match DynamicImage::from_decoder(decoder) {
-                Ok(img) => img,
-                Err(e) => {
-                    log::info!("Failed to decode DynamicImage for pre-actor leveling: {}. Falling back.", e);
-                    return None;
-                }
-            };
-
-            if let Some(orientation) = orientation {
-                image.apply_orientation(orientation);
             }
+        };
 
-            let (leveled_image, level_info, _verdict) = level_and_verify_with_context(
+        let (dim_w, dim_h) = decoder.dimensions();
+        if max_upscale_dimension > 0 && (dim_w > max_upscale_dimension || dim_h > max_upscale_dimension) {
+            info!(
+                "image dimensions ({}x{}) exceed max_upscale_dimension ({}). Returning original without upscaling",
+                dim_w, dim_h, max_upscale_dimension
+            );
+            return None;
+        }
+
+        let orientation = decoder.orientation().ok();
+        let icc_profile = decoder.icc_profile().ok().flatten().or_else(|| {
+            avif_color_info.as_ref().and_then(|info| info.icc_profile.clone())
+        });
+
+        let mut image = match DynamicImage::from_decoder(decoder) {
+            Ok(img) => img,
+            Err(e) => {
+                log::info!("Failed to decode DynamicImage: {}. Returning original.", e);
+                return None;
+            }
+        };
+
+        if let Some(orientation) = orientation {
+            image.apply_orientation(orientation);
+        }
+
+        let (processed_image, level_info) = if auto_levels_config.enabled {
+            let (leveled_image, info, _verdict) = level_and_verify_with_context(
                 image,
                 &to_upscale_cl,
                 b_id.as_deref(),
@@ -242,28 +273,50 @@ async fn upscale_response(
                 bp_cl.as_deref(),
                 &auto_levels_config,
             );
+            (leveled_image, info)
+        } else {
+            (image, LevelInfo::default())
+        };
 
-            Some((leveled_image, level_info, icc_profile))
-        }).await.unwrap_or(None)
-    } else {
-        None
+        Some((processed_image, level_info, icc_profile))
+    }).await.unwrap_or(None);
+
+    let (img, level_info, icc) = match decoded_stage {
+        Some(res) => res,
+        None => return to_response(status, response_bytes, &headers, image_format),
     };
 
-    let (upscaled, format) = if let Some((img, level_info, icc)) = preprocessed {
-        match call!(state.upscaler, UpscaleSupervisorMessage::UpscalePreprocessed, img, image_format, level_info, icc) {
-            Ok(res) => res,
-            Err(e) => {
-                log::error!("Upscale actor call failed: {}. Returning original response.", e);
-                return to_response(status, response_bytes, &headers, image_format);
-            }
+    // Stage 2 (GPU Actor): Execute pure Real-CUGAN inference and immediately release actor for next page.
+    let upscaled_image = match call!(state.upscaler, UpscaleSupervisorMessage::UpscaleRaw, img) {
+        Ok(res) => res,
+        Err(e) => {
+            log::error!("Upscale actor call failed: {}. Returning original response.", e);
+            return to_response(status, response_bytes, &headers, image_format);
         }
-    } else {
-        match call!(state.upscaler, UpscaleSupervisorMessage::Upscale, to_upscale, image_format) {
-            Ok(res) => res,
-            Err(e) => {
-                log::error!("Upscale actor call failed: {}. Returning original response.", e);
-                return to_response(status, response_bytes, &headers, image_format);
-            }
+    };
+
+    // Stage 3 (CPU spawn_blocking): Fold monochrome L8 if applicable and encode to WebP/PNG/JPEG
+    // concurrently while the GPU actor processes subsequent pages.
+    let return_format = state.config.return_format;
+    let jpeg_quality = state.config.jpeg_quality;
+    let output_grayscale_for_monochrome = auto_levels_config.output_grayscale_for_monochrome;
+    let encoded_res = tokio::task::spawn_blocking(move || {
+        encode_upscaled_output(
+            upscaled_image,
+            image_format,
+            &level_info,
+            icc.as_deref(),
+            return_format,
+            jpeg_quality,
+            output_grayscale_for_monochrome,
+        )
+    }).await;
+
+    let (upscaled, format) = match encoded_res {
+        Ok(res) => res,
+        Err(e) => {
+            log::error!("Image encoding task panicked: {}. Returning original response.", e);
+            return to_response(status, response_bytes, &headers, image_format);
         }
     };
 

@@ -5,8 +5,9 @@ use bytes::Bytes;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
-use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
+use image::{DynamicImage, ExtendedColorType, GrayImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use log::{error, info};
+use rayon::prelude::*;
 use realcugan_ncnn_vulkan_rs::{RealCugan, RealCuganError};
 
 use crate::config::app_config::{AppConfig, AutoLevelsConfig, Format};
@@ -22,13 +23,13 @@ pub struct UpscalerConfig {
     auto_levels: AutoLevelsConfig,
 }
 
-fn encode_image(
+pub fn encode_image(
     image: &DynamicImage,
     target_format: ImageFormat,
     icc_profile: Option<&[u8]>,
     jpeg_quality: u8,
 ) -> Bytes {
-    let mut buf = Cursor::new(Vec::new());
+    let mut buf = Cursor::new(Vec::with_capacity(1024 * 1024));
     match target_format {
         ImageFormat::WebP => {
             let mut encoder = WebPEncoder::new_lossless(&mut buf);
@@ -118,6 +119,43 @@ fn encode_image(
     Bytes::from(buf.into_inner())
 }
 
+pub fn encode_upscaled_output(
+    upscaled: DynamicImage,
+    image_format: ImageFormat,
+    level_info: &crate::upscaler::auto_levels::LevelInfo,
+    icc_profile: Option<&[u8]>,
+    return_format: Format,
+    jpeg_quality: u8,
+    output_grayscale_for_monochrome: bool,
+) -> (Bytes, ImageFormat) {
+    let is_mono = level_info.is_monochrome
+        || level_info.classification == crate::upscaler::auto_levels::PageClassification::Monochrome;
+    let (final_image, final_icc) = if output_grayscale_for_monochrome && is_mono {
+        (fold_monochrome_post_upscale(upscaled, level_info, output_grayscale_for_monochrome), None)
+    } else {
+        (upscaled, icc_profile)
+    };
+
+    match return_format {
+        Format::WebP => {
+            (encode_image(&final_image, ImageFormat::WebP, final_icc, jpeg_quality), ImageFormat::WebP)
+        }
+        Format::Png => {
+            (encode_image(&final_image, ImageFormat::Png, final_icc, jpeg_quality), ImageFormat::Png)
+        }
+        Format::Jpeg => {
+            (encode_image(&final_image, ImageFormat::Jpeg, final_icc, jpeg_quality), ImageFormat::Jpeg)
+        }
+        Format::Original => {
+            let target_format = match image_format {
+                ImageFormat::Avif => ImageFormat::WebP,
+                other => other,
+            };
+            (encode_image(&final_image, target_format, final_icc, jpeg_quality), target_format)
+        }
+    }
+}
+
 pub trait Upscaler: Send {
     fn upscale(&self, input: Bytes, image_format: ImageFormat) -> (Bytes, ImageFormat) {
         let config = self.get_config();
@@ -201,34 +239,15 @@ pub trait Upscaler: Send {
 
         let upscaled = self.upscale_image(processed_image);
 
-        let is_mono = level_info.is_monochrome
-            || level_info.classification == crate::upscaler::auto_levels::PageClassification::Monochrome;
-        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && is_mono {
-            (fold_monochrome_post_upscale(upscaled, &level_info, config.auto_levels.output_grayscale_for_monochrome), None)
-        } else {
-            (upscaled, icc_profile.as_deref())
-        };
-
-        let (output_bytes, final_format) = match config.return_format {
-            Format::WebP => {
-                (encode_image(&final_image, ImageFormat::WebP, final_icc, config.jpeg_quality), ImageFormat::WebP)
-            }
-            Format::Png => {
-                (encode_image(&final_image, ImageFormat::Png, final_icc, config.jpeg_quality), ImageFormat::Png)
-            }
-            Format::Jpeg => {
-                (encode_image(&final_image, ImageFormat::Jpeg, final_icc, config.jpeg_quality), ImageFormat::Jpeg)
-            }
-            Format::Original => {
-                let target_format = match image_format {
-                    ImageFormat::Avif => ImageFormat::WebP,
-                    other => other,
-                };
-                (encode_image(&final_image, target_format, final_icc, config.jpeg_quality), target_format)
-            }
-        };
-
-        (output_bytes, final_format)
+        encode_upscaled_output(
+            upscaled,
+            image_format,
+            &level_info,
+            icc_profile.as_deref(),
+            config.return_format,
+            config.jpeg_quality,
+            config.auto_levels.output_grayscale_for_monochrome,
+        )
     }
 
     fn upscale_preprocessed(
@@ -250,34 +269,15 @@ pub trait Upscaler: Send {
 
         let upscaled = self.upscale_image(image);
 
-        let is_mono = level_info.is_monochrome
-            || level_info.classification == crate::upscaler::auto_levels::PageClassification::Monochrome;
-        let (final_image, final_icc) = if config.auto_levels.output_grayscale_for_monochrome && is_mono {
-            (fold_monochrome_post_upscale(upscaled, &level_info, config.auto_levels.output_grayscale_for_monochrome), None)
-        } else {
-            (upscaled, icc_profile.as_deref())
-        };
-
-        let (output_bytes, final_format) = match config.return_format {
-            Format::WebP => {
-                (encode_image(&final_image, ImageFormat::WebP, final_icc, config.jpeg_quality), ImageFormat::WebP)
-            }
-            Format::Png => {
-                (encode_image(&final_image, ImageFormat::Png, final_icc, config.jpeg_quality), ImageFormat::Png)
-            }
-            Format::Jpeg => {
-                (encode_image(&final_image, ImageFormat::Jpeg, final_icc, config.jpeg_quality), ImageFormat::Jpeg)
-            }
-            Format::Original => {
-                let target_format = match image_format {
-                    ImageFormat::Avif => ImageFormat::WebP,
-                    other => other,
-                };
-                (encode_image(&final_image, target_format, final_icc, config.jpeg_quality), target_format)
-            }
-        };
-
-        (output_bytes, final_format)
+        encode_upscaled_output(
+            upscaled,
+            image_format,
+            &level_info,
+            icc_profile.as_deref(),
+            config.return_format,
+            config.jpeg_quality,
+            config.auto_levels.output_grayscale_for_monochrome,
+        )
     }
 
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
@@ -352,6 +352,40 @@ pub fn fold_monochrome_post_upscale(
     if output_grayscale_for_monochrome && is_mono {
         match upscaled {
             DynamicImage::ImageLuma8(_) => upscaled,
+            DynamicImage::ImageRgb8(rgb) => {
+                let (w, h) = (rgb.width(), rgb.height());
+                let raw = rgb.as_raw();
+                let mut luma_buf = vec![0u8; (w as usize) * (h as usize)];
+                luma_buf
+                    .par_chunks_mut(16384)
+                    .zip(raw.par_chunks(16384 * 3))
+                    .for_each(|(dst, src)| {
+                        for (d, px) in dst.iter_mut().zip(src.chunks_exact(3)) {
+                            *d = ((54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32 + 128) >> 8) as u8;
+                        }
+                    });
+                match GrayImage::from_raw(w, h, luma_buf) {
+                    Some(gray) => DynamicImage::ImageLuma8(gray),
+                    None => DynamicImage::ImageLuma8(DynamicImage::ImageRgb8(rgb).to_luma8()),
+                }
+            }
+            DynamicImage::ImageRgba8(rgba) => {
+                let (w, h) = (rgba.width(), rgba.height());
+                let raw = rgba.as_raw();
+                let mut luma_buf = vec![0u8; (w as usize) * (h as usize)];
+                luma_buf
+                    .par_chunks_mut(16384)
+                    .zip(raw.par_chunks(16384 * 4))
+                    .for_each(|(dst, src)| {
+                        for (d, px) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                            *d = ((54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32 + 128) >> 8) as u8;
+                        }
+                    });
+                match GrayImage::from_raw(w, h, luma_buf) {
+                    Some(gray) => DynamicImage::ImageLuma8(gray),
+                    None => DynamicImage::ImageLuma8(DynamicImage::ImageRgba8(rgba).to_luma8()),
+                }
+            }
             other => DynamicImage::ImageLuma8(other.to_luma8()),
         }
     } else {
