@@ -21,6 +21,8 @@ pub struct UpscalerConfig {
     jpeg_quality: u8,
     return_format: Format,
     auto_levels: AutoLevelsConfig,
+    force_cpu: bool,
+    cpu_fallback: bool,
 }
 
 pub fn encode_image(
@@ -283,6 +285,10 @@ pub trait Upscaler: Send {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage;
 
     fn get_config(&self) -> UpscalerConfig;
+
+    fn scale(&self) -> u32 {
+        2
+    }
 }
 
 pub struct RealCuganUpscaler {
@@ -292,17 +298,77 @@ pub struct RealCuganUpscaler {
 
 impl RealCuganUpscaler {
     pub fn new(config: Arc<AppConfig>) -> Result<Self, RealCuganError> {
-        let realcugan = RealCugan::new(
-            config.realcugan.gpuid,
+        let tta_level = config.realcugan.effective_tta_level();
+        if tta_level != 1 && tta_level != 2 && tta_level != 4 && tta_level != 8 {
+            return Err(RealCuganError::InvalidTtaLevel(tta_level));
+        }
+
+        if config.realcugan.gpuid >= 0 && !config.realcugan.force_cpu {
+            let gpu_count = RealCugan::get_gpu_count();
+            let dev_type = RealCugan::get_gpu_device_type(config.realcugan.gpuid);
+            let heap_mb = RealCugan::get_heap_budget(config.realcugan.gpuid);
+            let dev_type_str = match dev_type {
+                0 => "Discrete GPU",
+                1 => "Integrated GPU",
+                2 => "Virtual GPU",
+                3 => "CPU",
+                _ => "Unknown",
+            };
+            info!(
+                "Real-CUGAN GPU #{} detected: {} (VRAM heap budget: {} MB, total GPUs: {})",
+                config.realcugan.gpuid, dev_type_str, heap_mb, gpu_count
+            );
+
+            if config.realcugan.tile_size == 0 {
+                let prepadding = match config.realcugan.scale {
+                    2 => 18,
+                    3 => 14,
+                    4 => 19,
+                    _ => 18,
+                };
+                let calculated_tile = RealCugan::calculate_tile_size(
+                    config.realcugan.gpuid,
+                    config.realcugan.scale,
+                    prepadding,
+                );
+                info!(
+                    "Real-CUGAN continuous VRAM tile size: {}px (scale: {}x, prepadding: {})",
+                    calculated_tile, config.realcugan.scale, prepadding
+                );
+            }
+        } else {
+            info!("Real-CUGAN configured in explicit CPU execution mode");
+        }
+
+        let effective_gpuid = if config.realcugan.force_cpu {
+            -1
+        } else {
+            config.realcugan.gpuid
+        };
+
+        let realcugan = RealCugan::new_with_options(
+            effective_gpuid,
             config.realcugan.noise,
             config.realcugan.scale,
             config.realcugan.model,
             config.realcugan.tile_size,
             config.realcugan.sync_gap,
-            config.realcugan.tta_mode,
+            tta_level,
+            config.realcugan.use_fp16_arithmetic,
             config.realcugan.num_threads,
             config.realcugan.models_path.clone(),
         )?;
+
+        info!(
+            "Real-CUGAN initialized successfully: scale={}x, model={:?}, noise={}, tta_level={}x, fp16={}, force_cpu={}, cpu_fallback={}",
+            realcugan.scale(),
+            config.realcugan.model,
+            config.realcugan.noise,
+            tta_level,
+            config.realcugan.use_fp16_arithmetic,
+            config.realcugan.force_cpu,
+            config.realcugan.cpu_fallback,
+        );
 
         let upscaler_config = UpscalerConfig {
             threshold_enabled: config.size_threshold_enabled,
@@ -312,6 +378,8 @@ impl RealCuganUpscaler {
             jpeg_quality: config.jpeg_quality,
             return_format: config.return_format,
             auto_levels: config.auto_levels,
+            force_cpu: config.realcugan.force_cpu,
+            cpu_fallback: config.realcugan.cpu_fallback,
         };
 
         Ok(Self {
@@ -323,17 +391,45 @@ impl RealCuganUpscaler {
 
 impl Upscaler for RealCuganUpscaler {
     fn upscale_image(&self, image: DynamicImage) -> DynamicImage {
+        if self.config.force_cpu {
+            return match self.realcugan.proc_image_cpu(&image) {
+                Ok(upscaled) => upscaled,
+                Err(e) => {
+                    error!("Real-CUGAN CPU upscale error: {}. Falling back to original image.", e);
+                    image
+                }
+            };
+        }
+
         match self.realcugan.proc_image(&image) {
             Ok(upscaled) => upscaled,
             Err(e) => {
-                error!("Real-CUGAN upscale error: {}. Falling back to original image.", e);
-                image
+                if self.config.cpu_fallback {
+                    log::warn!("Real-CUGAN GPU upscale failed: {}. Attempting CPU fallback...", e);
+                    match self.realcugan.proc_image_cpu(&image) {
+                        Ok(upscaled) => {
+                            info!("Real-CUGAN CPU fallback succeeded.");
+                            upscaled
+                        }
+                        Err(cpu_err) => {
+                            error!("Real-CUGAN CPU fallback also failed: {}. Falling back to original image.", cpu_err);
+                            image
+                        }
+                    }
+                } else {
+                    error!("Real-CUGAN upscale error: {}. Falling back to original image.", e);
+                    image
+                }
             }
         }
     }
 
     fn get_config(&self) -> UpscalerConfig {
         self.config
+    }
+
+    fn scale(&self) -> u32 {
+        self.realcugan.scale()
     }
 }
 
@@ -390,5 +486,87 @@ pub fn fold_monochrome_post_upscale(
         }
     } else {
         upscaled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_config() -> AppConfig {
+        let models_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("realcugan-ncnn-vulkan-rs")
+            .join("src")
+            .join("realcugan-ncnn-vulkan")
+            .join("models")
+            .to_string_lossy()
+            .to_string();
+
+        let yaml = format!(
+            r#"
+port: 3030
+upstream_url: "http://localhost:8080"
+upscale: true
+return_format: "WebP"
+size_threshold_enabled: false
+size_threshold: 500
+size_threshold_png: 1000
+max_upscale_dimension: 4000
+jpeg_quality: 90
+allow_config_updates: false
+realcugan:
+  gpuid: -1
+  scale: 2
+  noise: -1
+  model: "Se"
+  tile_size: 400
+  sync_gap: 2
+  tta_mode: false
+  tta_level: 1
+  use_fp16_arithmetic: false
+  force_cpu: true
+  cpu_fallback: true
+  num_threads: 2
+  models_path: "{}"
+"#,
+            models_dir.replace('\\', "/")
+        );
+        serde_yaml::from_str(&yaml).expect("Failed to parse test AppConfig")
+    }
+
+    #[test]
+    fn test_realcugan_upscaler_invalid_tta_level() {
+        let mut config = create_test_config();
+        config.realcugan.tta_level = 3; // Invalid TTA level
+        let res = RealCuganUpscaler::new(Arc::new(config));
+        assert!(matches!(res, Err(RealCuganError::InvalidTtaLevel(3))));
+    }
+
+    #[test]
+    fn test_realcugan_upscaler_valid_options_and_scale() {
+        let config = create_test_config();
+        let upscaler = RealCuganUpscaler::new(Arc::new(config))
+            .expect("Failed to instantiate RealCuganUpscaler");
+        assert_eq!(upscaler.scale(), 2);
+
+        let test_img = DynamicImage::ImageRgb8(image::RgbImage::new(16, 16));
+        let upscaled = upscaler.upscale_image(test_img);
+        assert_eq!(upscaled.width(), 32);
+        assert_eq!(upscaled.height(), 32);
+    }
+
+    #[test]
+    fn test_realcugan_upscaler_cpu_fallback_mode() {
+        let mut config = create_test_config();
+        config.realcugan.force_cpu = false;
+        config.realcugan.cpu_fallback = true;
+        let upscaler = RealCuganUpscaler::new(Arc::new(config))
+            .expect("Failed to instantiate RealCuganUpscaler with CPU fallback");
+        assert_eq!(upscaler.scale(), 2);
+
+        let test_img = DynamicImage::ImageRgb8(image::RgbImage::new(16, 16));
+        let upscaled = upscaler.upscale_image(test_img);
+        assert_eq!(upscaled.width(), 32);
+        assert_eq!(upscaled.height(), 32);
     }
 }

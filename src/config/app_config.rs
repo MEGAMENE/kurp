@@ -256,7 +256,7 @@ pub enum Format {
     Original,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(remote = "RealCuganModelType")]
 enum RealCuganModelTypeDef {
     Nose,
@@ -264,7 +264,11 @@ enum RealCuganModelTypeDef {
     Se,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+fn default_tta_level() -> u32 {
+    1
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RealCuganConfig {
     pub gpuid: i32,
     pub scale: u32,
@@ -275,8 +279,32 @@ pub struct RealCuganConfig {
     pub tile_size: u32,
     pub sync_gap: u32,
     pub tta_mode: bool,
+    #[serde(default = "default_tta_level")]
+    pub tta_level: u32,
+    #[serde(default)]
+    pub use_fp16_arithmetic: bool,
+    #[serde(default)]
+    pub force_cpu: bool,
+    #[serde(default)]
+    pub cpu_fallback: bool,
     pub num_threads: i32,
     pub models_path: String,
+}
+
+impl RealCuganConfig {
+    /// Resolves the effective TTA level (1, 2, 4, or 8).
+    /// If `tta_level` is explicitly set to > 1, it takes precedence.
+    /// Otherwise, if `tta_mode` is enabled (legacy boolean), it maps to 8.
+    /// Defaults to 1 (TTA disabled).
+    pub fn effective_tta_level(&self) -> u32 {
+        if self.tta_level > 1 {
+            self.tta_level
+        } else if self.tta_mode {
+            8
+        } else {
+            1
+        }
+    }
 }
 
 impl AppConfig {
@@ -307,6 +335,10 @@ impl AppConfig {
             .set_default("realcugan.tile_size", 0)?
             .set_default("realcugan.sync_gap", 2)?
             .set_default("realcugan.tta_mode", false)?
+            .set_default("realcugan.tta_level", 1)?
+            .set_default("realcugan.use_fp16_arithmetic", false)?
+            .set_default("realcugan.force_cpu", false)?
+            .set_default("realcugan.cpu_fallback", false)?
             .set_default("realcugan.num_threads", 2)?
             .set_default("realcugan.models_path", models_default_dir.to_str().unwrap())?
             .set_default("auto_levels.enabled", true)?
@@ -532,5 +564,95 @@ allow_config_updates: false
         let app_config: AppConfig = serde_yaml::from_str(yaml_str)
             .expect("AppConfig should deserialize with default AutoLevelsConfig when omitted");
         assert_eq!(app_config.auto_levels, AutoLevelsConfig::default());
+        assert_eq!(app_config.realcugan.tta_level, 1);
+        assert!(!app_config.realcugan.use_fp16_arithmetic);
+        assert!(!app_config.realcugan.force_cpu);
+        assert!(!app_config.realcugan.cpu_fallback);
+        assert_eq!(app_config.realcugan.effective_tta_level(), 1);
+    }
+
+    #[test]
+    fn test_realcugan_config_with_new_features() {
+        let yaml_str = r#"
+gpuid: 1
+scale: 3
+noise: 1
+model: "Pro"
+tile_size: 256
+sync_gap: 1
+tta_mode: false
+tta_level: 4
+use_fp16_arithmetic: true
+force_cpu: true
+cpu_fallback: true
+num_threads: 4
+models_path: "./models_pro"
+"#;
+        let cugan_cfg: RealCuganConfig = serde_yaml::from_str(yaml_str)
+            .expect("RealCuganConfig should deserialize all advanced options");
+        assert_eq!(cugan_cfg.gpuid, 1);
+        assert_eq!(cugan_cfg.scale, 3);
+        assert_eq!(cugan_cfg.noise, 1);
+        assert_eq!(cugan_cfg.model, RealCuganModelType::Pro);
+        assert_eq!(cugan_cfg.tile_size, 256);
+        assert_eq!(cugan_cfg.sync_gap, 1);
+        assert_eq!(cugan_cfg.tta_level, 4);
+        assert!(cugan_cfg.use_fp16_arithmetic);
+        assert!(cugan_cfg.force_cpu);
+        assert!(cugan_cfg.cpu_fallback);
+        assert_eq!(cugan_cfg.num_threads, 4);
+        assert_eq!(cugan_cfg.models_path, "./models_pro");
+        assert_eq!(cugan_cfg.effective_tta_level(), 4);
+    }
+
+    #[test]
+    fn test_realcugan_effective_tta_level_resolution() {
+        // Case 1: tta_mode is true, tta_level default 1 -> maps to 8 (legacy compatibility)
+        let yaml_legacy = r#"
+gpuid: 0
+scale: 2
+noise: -1
+model: "Se"
+tile_size: 0
+sync_gap: 2
+tta_mode: true
+num_threads: 2
+models_path: "./models"
+"#;
+        let cfg_legacy: RealCuganConfig = serde_yaml::from_str(yaml_legacy).unwrap();
+        assert_eq!(cfg_legacy.tta_level, 1);
+        assert_eq!(cfg_legacy.effective_tta_level(), 8);
+
+        // Case 2: tta_level explicitly set to 2 -> maps to 2
+        let yaml_lvl2 = r#"
+gpuid: 0
+scale: 2
+noise: -1
+model: "Se"
+tile_size: 0
+sync_gap: 2
+tta_mode: false
+tta_level: 2
+num_threads: 2
+models_path: "./models"
+"#;
+        let cfg_lvl2: RealCuganConfig = serde_yaml::from_str(yaml_lvl2).unwrap();
+        assert_eq!(cfg_lvl2.effective_tta_level(), 2);
+
+        // Case 3: Both tta_mode true and tta_level 4 specified -> tta_level takes precedence
+        let yaml_lvl4 = r#"
+gpuid: 0
+scale: 2
+noise: -1
+model: "Se"
+tile_size: 0
+sync_gap: 2
+tta_mode: true
+tta_level: 4
+num_threads: 2
+models_path: "./models"
+"#;
+        let cfg_lvl4: RealCuganConfig = serde_yaml::from_str(yaml_lvl4).unwrap();
+        assert_eq!(cfg_lvl4.effective_tta_level(), 4);
     }
 }

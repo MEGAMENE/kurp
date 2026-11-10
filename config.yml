@@ -15,6 +15,10 @@ realcugan:
   tile_size: 0
   sync_gap: 2
   tta_mode: false
+  tta_level: 1
+  use_fp16_arithmetic: false
+  force_cpu: false
+  cpu_fallback: false
   num_threads: 2
   models_path: "./models"
 
