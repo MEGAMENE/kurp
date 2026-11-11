@@ -157,8 +157,8 @@ jobs:
         env:
           CMAKE_BUILD_TYPE: Release
           CMAKE_VERBOSE_MAKEFILE: ON
-          CARGO_BUILD_RUSTFLAGS: "-C target-cpu=znver5"
-        run: cargo build --release --bin kurp -vv
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-cpu=znver5"
+        run: cargo build --release --target x86_64-pc-windows-msvc --bin kurp -vv
 
       - name: Package Windows release
         shell: pwsh
@@ -166,7 +166,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Remove-Item dist -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path dist\models -Force | Out-Null
-          Copy-Item target\release\kurp.exe dist\kurp.exe
+          $kurpExe = if (Test-Path "target\x86_64-pc-windows-msvc\release\kurp.exe") {
+              "target\x86_64-pc-windows-msvc\release\kurp.exe"
+          } else {
+              "target\release\kurp.exe"
+          }
+          Copy-Item $kurpExe dist\kurp.exe
           Copy-Item $env:NCNN_DLL dist\ncnn.dll
           if (Test-Path "C:\vcpkg\installed\x64-windows\bin\dav1d.dll") {
               Copy-Item "C:\vcpkg\installed\x64-windows\bin\dav1d.dll" dist\dav1d.dll
