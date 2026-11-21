@@ -1,22 +1,50 @@
-name: Windows Release
+name: Windows CI & Release
 
 on:
   push:
     branches:
-      - development
-      - feat/auto-leveling-overhaul
-      - feat/auto-leveling-audit-optimization
-      - 'feat/**'
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - '**'
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish GitHub release after CI passes'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - preview
+          - stable
+      release_tag:
+        description: 'Optional tag override for stable manual release (e.g. v1.0.0)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build-windows:
-    name: Build Windows x64
+  ci:
+    name: Build, Lint & Test (Windows x86_64-v3)
     runs-on: windows-2022
     timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      CMAKE_BUILD_TYPE: Release
+      REALCUGAN_NATIVE: "1"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
     steps:
       - name: Checkout repository and submodules
@@ -25,205 +53,297 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Install Vulkan SDK
-        uses: jakoch/install-vulkan-sdk-action@v1
-        with:
-          cache: true
-          stripdown: false
-
-      - name: Configure glslang CMake package
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $glslangDir = Join-Path $env:RUNNER_TEMP 'glslang-cmake'
-          Remove-Item $glslangDir -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $glslangDir -Force | Out-Null
-
-          @'
-          find_package(Vulkan REQUIRED COMPONENTS glslang)
-
-          if (NOT TARGET Vulkan::glslang)
-              message(FATAL_ERROR "CMake could not expose Vulkan::glslang from the Vulkan SDK")
-          endif()
-
-          if (NOT TARGET glslang::glslang)
-              add_library(glslang::glslang INTERFACE IMPORTED)
-              set_property(TARGET glslang::glslang PROPERTY INTERFACE_LINK_LIBRARIES Vulkan::glslang)
-          endif()
-
-          if (NOT TARGET glslang::SPIRV)
-              add_library(glslang::SPIRV INTERFACE IMPORTED)
-              set_property(TARGET glslang::SPIRV PROPERTY INTERFACE_LINK_LIBRARIES Vulkan::glslang)
-          endif()
-          '@ | Set-Content -Path (Join-Path $glslangDir 'glslangConfig.cmake') -Encoding utf8
-
-          "glslang_DIR=$glslangDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Install dav1d via vcpkg
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          choco install pkgconfiglite -y
-          vcpkg install dav1d:x64-windows
-          $vcpkgRoot = "C:\vcpkg\installed\x64-windows"
-          "PKG_CONFIG_PATH=$vcpkgRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "$vcpkgRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Set up Rust
+      - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-msvc
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+          components: clippy
 
-      - name: Download prebuilt ncnn
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $headers = @{
-            'User-Agent' = 'MEGAMENE-kurp-GitHub-Actions'
-            'Accept' = 'application/vnd.github+json'
-            'Authorization' = "Bearer $env:GH_TOKEN"
-          }
+      - name: Cache Cargo and CMake artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "windows-x86_64-v3"
 
-          $downloadUrl = $null
-          try {
-            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Tencent/ncnn/releases/latest' -Headers $headers
-            $ncnnAsset = $release.assets | Where-Object { $_.name -match '^ncnn-\d+-windows-vs2022-shared\.zip$' } | Select-Object -First 1
-            if ($ncnnAsset) {
-              $downloadUrl = $ncnnAsset.browser_download_url
-            }
-          } catch {
-            Write-Host "Warning: GitHub API query failed: $_"
-          }
+      - name: Build release binary (x86-64-v3)
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
-          if (-not $downloadUrl) {
-            Write-Host "Falling back to official NCNN 20260526 release asset URL..."
-            $downloadUrl = 'https://github.com/Tencent/ncnn/releases/download/20260526/ncnn-20260526-windows-vs2022-shared.zip'
-          }
+      - name: Run Clippy (--all-targets)
+        run: cargo clippy --release --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
-          Write-Host "Downloading NCNN package from: $downloadUrl"
-          $zipPath = Join-Path $env:RUNNER_TEMP 'ncnn-windows.zip'
-          $ncnnPath = Join-Path $env:RUNNER_TEMP 'ncnn'
-          Remove-Item $ncnnPath -Recurse -Force -ErrorAction SilentlyContinue
-          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath $ncnnPath -Force
+      - name: Run release test suite
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc -- --nocapture
 
-          $configs = Get-ChildItem $ncnnPath -Recurse -Filter 'ncnnConfig.cmake'
-          $ncnnConfig = $configs | Where-Object {
-            $_.FullName -match '(?i)(^|[\\/])(x64|x86_64)([\\/]|$)' -and
-            $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))'
-          } | Select-Object -First 1
-
-          if (-not $ncnnConfig) {
-            $configs | ForEach-Object { Write-Host " - $($_.FullName)" }
-            throw 'Could not find an x64 ncnnConfig.cmake in the downloaded VS2022 package.'
-          }
-
-          $ncnnRoot = $ncnnConfig.Directory.Parent.Parent.Parent.FullName
-          $ncnnDir = $ncnnConfig.Directory.FullName
-          "NCNN_ROOT=$ncnnRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "ncnn_DIR=$ncnnDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CMAKE_PREFIX_PATH=$ncnnRoot;$env:CMAKE_PREFIX_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          $ncnnLib = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.lib' |
-            Where-Object { $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))' } |
-            Select-Object -First 1
-          if (-not $ncnnLib) { throw 'Could not find ncnn.lib in the selected x64 NCNN package.' }
-          Write-Host "NCNN_LIB = $($ncnnLib.FullName)"
-          "NCNN_LIB_DIR=$($ncnnLib.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "LIB=$($ncnnLib.Directory.FullName);$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          $ncnnDll = Get-ChildItem $ncnnRoot -Recurse -Filter 'ncnn.dll' |
-            Where-Object { $_.FullName -notmatch '(?i)(arm64|aarch64|[\\/]arm([\\/]|$))' } |
-            Select-Object -First 1
-          if (-not $ncnnDll) { throw 'Could not find ncnn.dll in the selected x64 NCNN package.' }
-          "NCNN_DLL=$($ncnnDll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "$($ncnnDll.Directory.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Run automated test suite (x86-64-v3 AVX2+FMA for CI runner)
-        shell: pwsh
-        env:
-          CMAKE_BUILD_TYPE: Release
-          CMAKE_VERBOSE_MAKEFILE: ON
-          CARGO_BUILD_RUSTFLAGS: "-C target-cpu=x86-64-v3"
-        run: |
-          $ncnnDir = Split-Path -Parent $env:NCNN_DLL
-          $env:PATH = "$ncnnDir;$env:PATH"
-          cargo test --release --all-targets -- --nocapture
-
-      - name: Build kurp release binary (znver5 AVX-512 for Ryzen 7 9800X3D)
-        shell: pwsh
-        env:
-          CMAKE_BUILD_TYPE: Release
-          CMAKE_VERBOSE_MAKEFILE: ON
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-cpu=znver5"
-        run: cargo build --release --target x86_64-pc-windows-msvc --bin kurp -vv
-
-      - name: Package Windows release
+      - name: Package portable Windows x86-64-v3 archive
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Remove-Item dist -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item kurp-windows-x86_64-v3.zip, kurp-windows-x86_64-v3.sha256 -Force -ErrorAction SilentlyContinue
+
+          $kurpExe = "target\x86_64-pc-windows-msvc\release\kurp.exe"
+          if (-not (Test-Path $kurpExe)) {
+            throw "Expected release binary not found at $kurpExe"
+          }
+
+          $modelsDir = "realcugan-ncnn-vulkan-rs\src\realcugan-ncnn-vulkan\models"
+          if (-not (Test-Path "$modelsDir\models-se")) {
+            throw "Real-CUGAN submodule models not found at $modelsDir"
+          }
+
           New-Item -ItemType Directory -Path dist\models -Force | Out-Null
-          $kurpExe = if (Test-Path "target\x86_64-pc-windows-msvc\release\kurp.exe") {
-              "target\x86_64-pc-windows-msvc\release\kurp.exe"
-          } else {
-              "target\release\kurp.exe"
-          }
           Copy-Item $kurpExe dist\kurp.exe
-          Copy-Item $env:NCNN_DLL dist\ncnn.dll
-          if (Test-Path "C:\vcpkg\installed\x64-windows\bin\dav1d.dll") {
-              Copy-Item "C:\vcpkg\installed\x64-windows\bin\dav1d.dll" dist\dav1d.dll
-          }
+          Copy-Item README.md, LICENSE, config.yml dist\
+          Copy-Item "$modelsDir\*" dist\models\ -Recurse -Force
 
-          Copy-Item README.md, LICENSE dist\
-          git clone --depth 1 https://github.com/nihui/realcugan-ncnn-vulkan.git "$env:RUNNER_TEMP\realcugan-models"
-          Copy-Item "$env:RUNNER_TEMP\realcugan-models\models\*" dist\models\ -Recurse -Force
-
-          Copy-Item config.yml dist\config.yml
-
-          Compress-Archive -Path dist\* -DestinationPath kurp-windows-x64.zip -Force
-          (Get-FileHash kurp-windows-x64.zip -Algorithm SHA256).Hash | Out-File kurp-windows-x64.sha256 -Encoding ascii
+          Compress-Archive -Path dist\* -DestinationPath kurp-windows-x86_64-v3.zip -Force
+          $sha256 = (Get-FileHash kurp-windows-x86_64-v3.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha256  kurp-windows-x86_64-v3.zip`n" | Set-Content -Path kurp-windows-x86_64-v3.sha256 -Encoding ascii -NoNewline
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kurp-windows-x64
+          name: kurp-windows-x86_64-v3
           path: |
-            kurp-windows-x64.zip
-            kurp-windows-x64.sha256
+            kurp-windows-x86_64-v3.zip
+            kurp-windows-x86_64-v3.sha256
+          retention-days: 14
           if-no-files-found: error
 
-      - name: Publish Windows release
-        shell: pwsh
+  release-preview:
+    name: Publish Preview Release (development)
+    needs: ci
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/development') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == 'preview')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kurp-windows-x86_64-v3
+          path: artifacts
+
+      - name: Publish preview release and update preview-latest
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
-          $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy.MM.dd-HHmm")
-          $tag = "dev-$buildDate-$shortSha"
-          $title = "Kurp Windows x64 - $buildDate ($shortSha)"
-          $notes = @"
-          Automated Windows x64 build from commit $env:GITHUB_SHA on branch $env:GITHUB_REF_NAME.
-          Build date: $((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'"))
+          set -euo pipefail
 
-          Includes bundled Real-CUGAN models and ncnn Vulkan runtime.
-          This is a prerelease build.
-          "@
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag kurp-windows-x64.zip kurp-windows-x64.sha256 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $title --notes $notes --prerelease
-          } else {
-            gh release edit $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $title --notes $notes --prerelease
-            gh release upload $tag kurp-windows-x64.zip kurp-windows-x64.sha256 --repo $env:GITHUB_REPOSITORY --clobber
-          }
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          BUILD_DATE="$(date -u +%Y.%m.%d)"
+          BUILD_UTC="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          TAG="preview-${BUILD_DATE}-${SHORT_SHA}"
+          TITLE="Kurp Preview - ${BUILD_DATE} (${SHORT_SHA})"
+          ZIP_PATH="artifacts/kurp-windows-x86_64-v3.zip"
+          SHA_PATH="artifacts/kurp-windows-x86_64-v3.sha256"
+          SHA256="$(awk '{print $1}' "$SHA_PATH")"
 
-          # Also update rolling windows-latest release
-          gh release view windows-latest --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create windows-latest kurp-windows-x64.zip kurp-windows-x64.sha256 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Windows Latest" --notes "Latest automated build from commit $shortSha ($buildDate)" --prerelease
-          } else {
-            gh release upload windows-latest kurp-windows-x64.zip kurp-windows-x64.sha256 --repo $env:GITHUB_REPOSITORY --clobber
-          }
+          PREV_TAG="$(git describe --tags --abbrev=0 --exclude='preview-latest' --exclude='windows-latest' "${GITHUB_SHA}^" 2>/dev/null || true)"
+          if [[ -n "$PREV_TAG" ]]; then
+            CHANGELOG_HEADER="### Changes Since \`${PREV_TAG}\`"
+            CHANGELOG="$(git log -n 50 "${PREV_TAG}..${GITHUB_SHA}" --no-merges --pretty=format:'- %s (`%h`)' || true)"
+          else
+            CHANGELOG_HEADER="### Recent Commits"
+            CHANGELOG="$(git log -n 20 "${GITHUB_SHA}" --no-merges --pretty=format:'- %s (`%h`)' || true)"
+          fi
+          if [[ -z "$CHANGELOG" ]]; then
+            CHANGELOG="- Automated build from \`${GITHUB_SHA}\`."
+          fi
+
+          cat > release-notes.md <<EOF
+          > [!NOTE]
+          > Automated **preview prerelease** built from branch \`${GITHUB_REF_NAME}\` at commit \`${SHORT_SHA}\` (${BUILD_UTC}).
+
+          ${CHANGELOG_HEADER}
+
+          ${CHANGELOG}
+
+          ### Target CPU Compatibility (\`x86-64-v3\`)
+
+          | Architecture Tier | Required Instructions | Supported Processors |
+          |---|---|---|
+          | \`x86-64-v3\` (AVX2) | AVX, AVX2, FMA, BMI1, BMI2, LZCNT, MOVBE | Intel Core 4th Gen (Haswell) and newer / Xeon v3+; AMD Ryzen 1000–9000 series / Excavator+ |
+
+          *Older pre-2013 x86-64 CPUs lacking AVX2 are not supported by this binary.*
+
+          ### GPU & Runtime Requirements
+
+          - **OS**: Windows 10 / Windows 11 (64-bit)
+          - **GPU (Recommended)**: Vulkan 1.1+ capable GPU driver (NVIDIA, AMD, or Intel). Set \`realcugan.gpuid: -1\` in \`config.yml\` for CPU-only execution (software Vulkan adapters also fall back automatically).
+          - **Self-Contained Package**: Bundles \`kurp.exe\`, \`config.yml\`, \`models/\` (\`models-se\`, \`models-pro\`, \`models-nose\`), \`README.md\`, and \`LICENSE\`. Static in-tree NCNN and pure-Rust AVIF decoding require no external \`ncnn.dll\`, \`dav1d.dll\`, or Vulkan SDK.
+
+          ### Checksums (SHA-256)
+
+          \`\`\`text
+          ${SHA256}  kurp-windows-x86_64-v3.zip
+          \`\`\`
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TITLE" --notes-file release-notes.md --prerelease --latest=false
+            gh release upload "$TAG" "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TITLE" --notes-file release-notes.md --prerelease --latest=false
+          fi
+
+          git tag -f preview-latest "$GITHUB_SHA"
+          git push -f origin refs/tags/preview-latest
+
+          if gh release view preview-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit preview-latest --repo "$GITHUB_REPOSITORY" --title "Kurp Preview Latest (${BUILD_DATE} - ${SHORT_SHA})" --notes-file release-notes.md --prerelease --latest=false
+            gh release upload preview-latest "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create preview-latest "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Kurp Preview Latest (${BUILD_DATE} - ${SHORT_SHA})" --notes-file release-notes.md --prerelease --latest=false
+          fi
+
+  release-stable:
+    name: Publish Stable Release
+    needs: ci
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == 'stable')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kurp-windows-x86_64-v3
+          path: artifacts
+
+      - name: Publish stable release and update windows-latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          BUILD_DATE="$(date -u +%Y.%m.%d)"
+          BUILD_UTC="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          ZIP_PATH="artifacts/kurp-windows-x86_64-v3.zip"
+          SHA_PATH="artifacts/kurp-windows-x86_64-v3.sha256"
+          SHA256="$(awk '{print $1}' "$SHA_PATH")"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="$GITHUB_REF_NAME"
+            VERSION_LABEL="$TAG"
+          elif [[ -n "${INPUT_RELEASE_TAG:-}" ]]; then
+            TAG="$INPUT_RELEASE_TAG"
+            VERSION_LABEL="$TAG"
+          else
+            BASE_TAG="v${BUILD_DATE}"
+            EXISTING_SHA="$(git rev-list -n 1 "$BASE_TAG" 2>/dev/null || true)"
+            if [[ -z "$EXISTING_SHA" || "$EXISTING_SHA" == "$GITHUB_SHA" ]]; then
+              TAG="$BASE_TAG"
+            else
+              TAG="${BASE_TAG}-${SHORT_SHA}"
+            fi
+            VERSION_LABEL="$TAG"
+          fi
+
+          TITLE="Kurp ${VERSION_LABEL} (Windows x86-64-v3)"
+
+          PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' --exclude='windows-latest' --exclude='preview-*' "${GITHUB_SHA}^" 2>/dev/null || true)"
+          if [[ -n "$PREV_TAG" ]]; then
+            CHANGELOG_HEADER="### What's Changed Since \`${PREV_TAG}\`"
+            CHANGELOG="$(git log -n 50 "${PREV_TAG}..${GITHUB_SHA}" --no-merges --pretty=format:'- %s (`%h`)' || true)"
+          else
+            CHANGELOG_HEADER="### Recent Changes"
+            CHANGELOG="$(git log -n 20 "${GITHUB_SHA}" --no-merges --pretty=format:'- %s (`%h`)' || true)"
+          fi
+          if [[ -z "$CHANGELOG" ]]; then
+            CHANGELOG="- Release build from commit \`${SHORT_SHA}\`."
+          fi
+
+          cat > release-notes.md <<EOF
+          ## Kurp ${VERSION_LABEL} — Windows x86-64-v3
+
+          Self-contained Real-CUGAN upscaling & manga/comic page restoration reverse proxy for **Komga** (${BUILD_UTC}, commit \`${SHORT_SHA}\`).
+
+          ### Highlights
+          - **Static Real-CUGAN Vulkan + Auto-CPU Fallback**: Embedded static NCNN Vulkan inference with bundled \`models-se\`, \`models-pro\`, and \`models-nose\` (zero external \`ncnn.dll\` or Vulkan SDK required).
+          - **Pure-Rust AVIF & Lossless WebP**: Safe \`zenavif\` decoding and lossless \`libwebp\` encoding with ICC profile preservation and automatic PNG fallback above \`16383px\`.
+          - **CIELAB & Fritsch-Carlson Auto-Levels**: Pre-flight tile quality guards, digital typesetting spike isolation, arbitrary-hue cast neutralization, and strict full-color/high-key/low-key veto gates.
+          - **Komga Ecosystem Parity**: Full forwarding for \`X-API-Key\`, \`X-Auth-Token\`, \`Authorization\` (\`Bearer\` / \`Basic\`), and session \`Cookie\`, plus OPDS v1.2 page interception and config-hashed \`ETag\` caching.
+
+          ${CHANGELOG_HEADER}
+
+          ${CHANGELOG}
+
+          ### Target CPU Compatibility (\`x86-64-v3\`)
+
+          | Architecture Tier | Required Instructions | Supported Processors |
+          |---|---|---|
+          | \`x86-64-v3\` (AVX2) | AVX, AVX2, FMA, BMI1, BMI2, LZCNT, MOVBE | Intel Core 4th Gen (Haswell) and newer / Xeon v3+; AMD Ryzen 1000–9000 series / Excavator+ |
+
+          *Older pre-2013 x86-64 CPUs lacking AVX2 are not supported by this build.*
+
+          ### GPU & Runtime Requirements
+
+          - **OS**: Windows 10 / Windows 11 (64-bit)
+          - **GPU (Recommended)**: Vulkan 1.1+ capable GPU driver (NVIDIA, AMD, or Intel). Set \`realcugan.gpuid: -1\` in \`config.yml\` for CPU-only execution.
+
+          ### Quickstart \`config.yml\`
+
+          \`\`\`yaml
+          port: 3030
+          upstream_url: "http://localhost:25600"
+          upscale: true
+          return_format: WebP
+
+          realcugan:
+            gpuid: 0
+            scale: 2
+            noise: -1
+            model: Se
+            models_path: "./models"
+          \`\`\`
+
+          ### Checksums (SHA-256)
+
+          \`\`\`text
+          ${SHA256}  kurp-windows-x86_64-v3.zip
+          \`\`\`
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TITLE" --notes-file release-notes.md --prerelease=false --latest
+            gh release upload "$TAG" "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TITLE" --notes-file release-notes.md --prerelease=false --latest
+          fi
+
+          git tag -f windows-latest "$GITHUB_SHA"
+          git push -f origin refs/tags/windows-latest
+
+          if gh release view windows-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit windows-latest --repo "$GITHUB_REPOSITORY" --title "Kurp Windows Latest (${VERSION_LABEL})" --notes-file release-notes.md --prerelease=false --latest=false
+            gh release upload windows-latest "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create windows-latest "$ZIP_PATH" "$SHA_PATH" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Kurp Windows Latest (${VERSION_LABEL})" --notes-file release-notes.md --prerelease=false --latest=false
+          fi
