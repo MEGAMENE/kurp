@@ -1,293 +1,275 @@
-//! Tier 4: Real-World Application Scenarios Test Suite
-//!
-//! Validates end-to-end comic reader user workflows:
-//! - Scenario 1: 200-Page High-Resolution Manga Volume Profiling & Delivery
-//! - Scenario 2: Vintage 1970s Pulp Comic Scan with Lignin Oxidation
-//! - Scenario 3: Mixed Chapter with Color Cover and Chapter Title Logos
-//! - Scenario 4: Ultra-Tall Vertical Webtoon Strip (>20,000px)
-//! - Scenario 5: Upstream Server Crash, 60s Cooldown & Zero-Overhead Rollback
+//! Tier 4: End-to-End Real-CUGAN CPU + Auto-Levels + BookProfile Sampling + Concurrency Integration
 
 mod common;
 use common::*;
 
-use image::{DynamicImage, GenericImageView};
-use kurp::config::app_config::AutoLevelsConfig;
-use kurp::upscaler::auto_levels::{analyze_page, PageClassification};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-use tokio::sync::Semaphore;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-// ============================================================================
-// Scenario 1: 200-Page High-Resolution Manga Volume Profiling & Delivery
-// ============================================================================
+use axum::http::{StatusCode, header};
+use kurp::clients::komga_client::ForwardAuthHeaders;
+use kurp::upscaler::auto_levels::{PageClassification, level_and_verify_with_context, rec709_y};
+use kurp::upscaler::avif::decode_image_with_metadata;
+use kurp::upscaler::upscaler::UpscaleEngine;
 
 #[tokio::test]
-async fn test_tier4_scenario1_manga_volume_profiling_and_delivery() {
-    let mock = MockKomgaServer::start().await;
+async fn test_tier4_e2e_komga_realcugan_cpu_auto_levels_and_lossless_webp() {
+    let komga = MockKomgaServer::start().await;
+    komga.set_book_tags("manga-vol-1", "manga-series-1", vec!["upscale"]);
 
-    // Simulate 20 pages (scaled representation of 200-page volume)
-    let total_pages = 20usize;
-    for page_num in 1..=total_pages {
-        let img = generate_bimodal_ink_shelf_page(300, 450, 18);
-        mock.set_page(page_num, encode_to_png_bytes(&img));
-    }
-
-    let semaphore = Arc::new(Semaphore::new(8));
-    let cache: moka::future::Cache<String, Arc<Vec<u8>>> = moka::future::Cache::new(50);
-    let peak_active_workers = Arc::new(AtomicUsize::new(0));
-    let current_workers = Arc::new(AtomicUsize::new(0));
-
-    // Simulate Page 1 trigger initiating coalesced profile build
-    let sem_clone = semaphore.clone();
-    let base_url = mock.base_url.clone();
-    let peak = peak_active_workers.clone();
-    let curr = current_workers.clone();
-
-    let profile_future = async move {
-        let client = reqwest::Client::new();
-        let pages_url = format!("{}/api/v1/books/vol-1/pages", base_url);
-        let resp = client.get(&pages_url).send().await.unwrap();
-        let pages: Vec<serde_json::Value> = resp.json().await.unwrap();
-
-        let mut page_summaries = Vec::new();
-        let mut tasks = Vec::new();
-
-        for page in pages {
-            let p_num = page["number"].as_u64().unwrap() as usize;
-            let sem = sem_clone.clone();
-            let b_url = base_url.clone();
-            let p_peak = peak.clone();
-            let p_curr = curr.clone();
-
-            tasks.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let active = p_curr.fetch_add(1, Ordering::SeqCst) + 1;
-                p_peak.fetch_max(active, Ordering::SeqCst);
-
-                let img_url = format!("{}/api/v1/books/vol-1/pages/{}", b_url, p_num);
-                let c = reqwest::Client::new();
-                let img_bytes = c.get(&img_url).send().await.unwrap().bytes().await.unwrap();
-
-                // Streaming drop sequence
-                let decoded = image::load_from_memory(&img_bytes).unwrap();
-                drop(img_bytes); // DROP INVARIANT 1: Drop compressed network payload
-
-                let (w, h) = decoded.dimensions();
-                drop(decoded); // DROP INVARIANT 2: Drop uncompressed decoded buffer
-
-                p_curr.fetch_sub(1, Ordering::SeqCst);
-                (p_num, w, h)
-            }));
-        }
-
-        for t in tasks {
-            page_summaries.push(t.await.unwrap());
-        }
-
-        Ok(Arc::new(vec![1u8; 100])) // Lightweight BookProfile struct (~25 KB)
-    };
-
-    let profile = cache
-        .try_get_with::<_, String>("vol-1".to_string(), profile_future)
-        .await
-        .expect("Profile build failed");
-
-    assert!(profile.len() > 0);
-    assert!(
-        peak_active_workers.load(Ordering::SeqCst) <= 8,
-        "Concurrency must never exceed semaphore limit of 8 during profiling"
-    );
-}
-
-// ============================================================================
-// Scenario 2: Vintage 1970s Pulp Comic Scan with Lignin Oxidation
-// ============================================================================
-
-#[test]
-fn test_tier4_scenario2_vintage_comic_lignin_paper_yellowing() {
-    let vintage_comic = generate_lignin_yellowed_page(500, 750);
-    let rgb = vintage_comic.to_rgb8();
-
-    // 1. Zone Partitioning
-    let (w, h) = (rgb.width(), rgb.height());
-    let margin_x = (w as f32 * 0.06) as u32;
-    let margin_y = (h as f32 * 0.06) as u32;
-
-    let mut margin_paper_pixels = 0;
-    let mut sum_r = 0u64;
-    let mut sum_g = 0u64;
-    let mut sum_b = 0u64;
-
-    for y in 0..h {
-        for x in 0..w {
-            let in_margin = x < margin_x || x >= w - margin_x || y < margin_y || y >= h - margin_y;
-            if in_margin {
-                let p = rgb.get_pixel(x, y);
-                let (r, g, b) = (p[0] as u32, p[1] as u32, p[2] as u32);
-                let lum = (54 * r + 183 * g + 19 * b + 128) >> 8;
-                // Physical Lignin condition: R >= G > B, (R-B) in [6, 55], y >= 205
-                if lum >= 205 && r >= g && g > b && (r - b) >= 6 && (r - b) <= 55 {
-                    margin_paper_pixels += 1;
-                    sum_r += r as u64;
-                    sum_g += g as u64;
-                    sum_b += b as u64;
-                }
-            }
-        }
-    }
-
-    assert!(
-        margin_paper_pixels > 500,
-        "Physical lignin filter must identify oxidized paper in Zone M"
+    // 400x400 M1 page (>= 400px so auto-levels executes genuinely, then 2x CPU Real-CUGAN -> 800x800 Luma8 WebP)
+    let m1 = generate_m1_spike_page(400, 400, 0.012, 42);
+    let png_bytes = encode_to_png_bytes(&m1);
+    komga.set_default_book_pages(
+        "manga-vol-1",
+        5,
+        MockPageEntry {
+            bytes: png_bytes,
+            content_type: "image/png".to_string(),
+            etag: Some("\"manga-p1-v1\"".to_string()),
+            content_disposition: Some("inline; filename=\"001.png\"".to_string()),
+        },
     );
 
-    let avg_r = sum_r as f32 / margin_paper_pixels as f32;
-    let avg_g = sum_g as f32 / margin_paper_pixels as f32;
-    let avg_b = sum_b as f32 / margin_paper_pixels as f32;
-    let max_ch = avg_r.max(avg_g).max(avg_b);
+    let mut cfg = create_cpu_upscale_config(&komga.base_url);
+    cfg.upscale_tag = Some("upscale".to_string());
+    let expected_suffix = format!("-kurp-{:016x}", cfg.config_hash());
 
-    let gain_r = max_ch / avg_r;
-    let gain_g = max_ch / avg_g;
-    let gain_b = max_ch / avg_b;
+    let upscaler = Arc::new(UpscaleEngine::init(&cfg).await.expect("CPU upscaler init"));
+    let kurp = TestKurpServer::start(cfg, upscaler.clone()).await;
 
-    // Blue gain must be greatest to neutralize yellow cast
-    assert!(
-        gain_b > gain_r && gain_b > gain_g,
-        "Paper whitening must boost blue channel (gains: R={:.3}, G={:.3}, B={:.3})",
-        gain_r,
-        gain_g,
-        gain_b
-    );
-
-    // Verify Tier 2 Paper-Cast Exemption Mask allows whitening
-    let paper_cast_active = true;
-    let is_exempt = |r: u8, g: u8, b: u8| -> bool {
-        let lum = ((54 * r as u32 + 183 * g as u32 + 19 * b as u32 + 128) >> 8) as u8;
-        let chroma = r.max(g).max(b) - r.min(g).min(b);
-        paper_cast_active && lum >= 180 && chroma <= 55
-    };
-
-    assert!(is_exempt(248, 242, 215), "Oxidized paper highlights must be exempt from color drift");
-}
-
-// ============================================================================
-// Scenario 3: Mixed Chapter with Color Cover and Chapter Title Logos
-// ============================================================================
-
-#[test]
-fn test_tier4_scenario3_mixed_color_bw_chapter() {
-    let cover_page = generate_saturated_oklab_color_page(400, 600);
-    let logo_page = generate_hermite_mixed_page(400, 600);
-    let mono_page = generate_bimodal_ink_shelf_page(400, 600, 18);
-
-    let config = AutoLevelsConfig::default();
-    assert_eq!(
-        analyze_page(&cover_page, 1, &config).classification,
-        PageClassification::Color,
-        "Page 1 cover must be Color"
-    );
-    assert_eq!(
-        analyze_page(&logo_page, 2, &config).classification,
-        PageClassification::Mixed,
-        "Page 2 with chapter logo must be Mixed"
-    );
-    assert_eq!(
-        analyze_page(&mono_page, 3, &config).classification,
-        PageClassification::Monochrome,
-        "Pages 3+ must be Monochrome"
-    );
-}
-
-// ============================================================================
-// Scenario 4: Ultra-Tall Vertical Webtoon Strip (>20,000px)
-// ============================================================================
-
-#[test]
-fn test_tier4_scenario4_ultra_tall_vertical_webtoon() {
-    // Simulated tall webtoon strip (800 x 20,000)
-    let width = 800u32;
-    let height = 20_000u32;
-
-    // Simulate 32x32 block Michelson contrast with activity gating
-    let block_size = 32u32;
-    let blocks_x = width / block_size;
-    let blocks_y = height / block_size;
-    let total_blocks = blocks_x * blocks_y;
-
-    // Webtoons typically have ~70% blank gutters and dialogue bubbles
-    let active_block_count = (total_blocks as f32 * 0.30).round() as usize;
-
-    // Dynamic range activity gating: (I_max - I_min) >= 25
-    let mut evaluated_blocks = 0;
-    for b in 0..total_blocks {
-        let is_active = b < active_block_count as u32;
-        if is_active {
-            evaluated_blocks += 1;
-        }
-    }
-
-    assert_eq!(
-        evaluated_blocks, active_block_count,
-        "Activity gating must skip blank gutters, reducing CPU workload by 70%"
-    );
-}
-
-// ============================================================================
-// Scenario 5: Upstream Crash, 60s Negative Cache & Rollback Recovery
-// ============================================================================
-
-#[tokio::test]
-async fn test_tier4_scenario5_upstream_failure_and_rollback_recovery() {
-    let mock = MockKomgaServer::start().await;
-    // Inject upstream HTTP 500 error
-    mock.set_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-
-    let cooldown_cache: moka::future::Cache<String, (std::time::Instant, String)> =
-        moka::future::Cache::builder()
-            .time_to_live(std::time::Duration::from_secs(60))
-            .build();
-
-    // 1. Initial request encounters HTTP 500 and triggers negative cache
     let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/books/crashed-vol/pages", mock.base_url);
-    let resp = client.get(&url).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let resp = client
+        .get(format!("{}/api/v1/books/manga-vol-1/pages/1", kurp.base_url))
+        .header("X-API-Key", "reader-key")
+        .send()
+        .await
+        .unwrap();
 
-    cooldown_cache
-        .insert(
-            "crashed-vol".to_string(),
-            (std::time::Instant::now(), "Upstream 500".into()),
-        )
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "image/webp");
+    assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept");
+    assert_eq!(
+        resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+        format!("\"manga-p1-v1{expected_suffix}\"")
+    );
+    assert_eq!(
+        resp.headers().get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap(),
+        "inline; filename=\"001.webp\""
+    );
+
+    let webp_bytes = resp.bytes().await.unwrap();
+    let decoded = decode_image_with_metadata(&webp_bytes, None).expect("WebP decode must succeed");
+    assert_eq!((decoded.image.width(), decoded.image.height()), (800, 800));
+
+    // Sample paper background and verify monochrome restoration produced clean bright paper
+    let rgb = decoded.image.to_rgb8();
+    let paper = rgb.get_pixel(790, 790);
+    assert!(rec709_y(paper[0], paper[1], paper[2]) >= 245);
+
+    upscaler.shutdown();
+}
+
+#[tokio::test]
+async fn test_tier4_book_profile_12_of_200_even_sampling_and_outlier_guard() {
+    let komga = MockKomgaServer::start().await;
+    komga.set_book_tags("vol-200", "series-200", vec!["upscale"]);
+
+    // Register 200 pages with M4 aged paper (black floor ~26)
+    let page_bytes = encode_to_png_bytes(&generate_m4_aged_paper_page(400, 400));
+    komga.set_default_book_pages("vol-200", 200, MockPageEntry::png(page_bytes));
+
+    let mut cfg = create_cpu_upscale_config(&komga.base_url);
+    cfg.auto_levels.book_profile.sample_pages = 12;
+    cfg.auto_levels.book_profile.parallel_page_fetches = 4;
+
+    let kurp = TestKurpServer::start(cfg.clone(), Arc::new(UpscaleEngine::new_empty())).await;
+    let auth = ForwardAuthHeaders::default();
+
+    let profile = kurp
+        .state
+        .book_profile_manager
+        .get_or_build_profile("vol-200", &auth, &cfg.auto_levels)
         .await;
 
-    // 2. Subsequent 10 concurrent requests check cooldown and serve conservative single-page fallback
-    let mut fallback_count = 0;
-    for _ in 0..10 {
-        if let Some((_, reason)) = cooldown_cache.get("crashed-vol").await {
-            assert_eq!(reason, "Upstream 500");
-            fallback_count += 1;
-        }
-    }
-
+    assert_eq!(profile.total_book_pages, 200);
+    assert_eq!(profile.sampled_pages, 12);
+    assert_eq!(profile.monochrome_group.page_count, 12);
+    assert!(
+        (24..=28).contains(&profile.monochrome_group.median_black_floor),
+        "Expected median black floor ~26, got {}",
+        profile.monochrome_group.median_black_floor
+    );
     assert_eq!(
-        fallback_count, 10,
-        "All 10 concurrent readers must receive single-page fallback without DDoS retry storm"
+        komga.page_fetch_count(),
+        12,
+        "BookProfile must fetch ONLY 12 evenly-spaced pages out of 200 (never 200!)"
     );
 
-    // 3. Corrupted image download triggers zero-overhead rollback
-    let test_img = generate_bimodal_ink_shelf_page(100, 100, 18);
-    let pristine_bytes = encode_to_png_bytes(&test_img);
+    // BookProfile Outlier Sanity Guard clamps an anomalous page with black floor ~68 to <= median + 20
+    let anomalous = generate_m1_spike_page(450, 450, 0.012, 68);
+    let (_out, info, _) = level_and_verify_with_context(
+        anomalous,
+        Some("vol-200"),
+        Some(99),
+        Some(&profile),
+        &cfg.auto_levels,
+    );
+    assert_eq!(info.classification, PageClassification::Monochrome);
+    assert!(
+        info.black_point <= profile.monochrome_group.median_black_floor.saturating_add(20),
+        "Outlier guard must clamp black_point ({}) <= median({}) + 20",
+        info.black_point,
+        profile.monochrome_group.median_black_floor
+    );
+}
 
-    // Simulate Tier 1 gross failure on corrupted leveled frame
-    let tier1_passed = false;
-    let final_dispatched_image = if !tier1_passed {
-        // Zero-overhead rollback re-decodes from pristine Bytes
-        image::load_from_memory(&pristine_bytes).expect("Rollback re-decode must succeed")
-    } else {
-        panic!("Should have rolled back");
-    };
+#[tokio::test]
+async fn test_tier4_book_profile_joinset_timeout_cancellation_and_empty_pages_nocache() {
+    let komga = MockKomgaServer::start().await;
+    komga.set_book_tags("slow-vol", "s-slow", vec!["upscale"]);
+    let page_bytes = encode_to_png_bytes(&generate_m4_aged_paper_page(400, 400));
+    komga.set_default_book_pages("slow-vol", 20, MockPageEntry::png(page_bytes));
+    komga.set_page_delay(Duration::from_secs(5));
 
-    assert_eq!(final_dispatched_image.dimensions(), test_img.dimensions());
+    let mut cfg = create_cpu_upscale_config(&komga.base_url);
+    cfg.auto_levels.book_profile.timeout_seconds = 1;
+    cfg.auto_levels.book_profile.sample_pages = 10;
+
+    let kurp = TestKurpServer::start(cfg.clone(), Arc::new(UpscaleEngine::new_empty())).await;
+    let auth = ForwardAuthHeaders::default();
+
+    // Timeout must abort all in-flight JoinSet tasks promptly (~1s, never 5s!)
+    let t0 = Instant::now();
+    let timed_out = kurp
+        .state
+        .book_profile_manager
+        .get_or_build_profile("slow-vol", &auth, &cfg.auto_levels)
+        .await;
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "JoinSet timeout must abort promptly near 1s (took {:?})",
+        elapsed
+    );
+    assert_eq!(timed_out.sampled_pages, 0);
+
+    // Empty page list must NOT be permanently cached in profile_cache:
+    komga.set_page_delay(Duration::ZERO);
+    *komga.state.return_empty_pages.write().unwrap() = true;
+    let empty_prof = kurp
+        .state
+        .book_profile_manager
+        .get_or_build_profile("empty-then-filled", &auth, &cfg.auto_levels)
+        .await;
+    assert_eq!(empty_prof.sampled_pages, 0);
+
+    *komga.state.return_empty_pages.write().unwrap() = false;
+    komga.set_book_tags("empty-then-filled", "s-ef", vec!["upscale"]);
+    let m4_bytes = encode_to_png_bytes(&generate_m4_aged_paper_page(400, 400));
+    komga.set_default_book_pages("empty-then-filled", 5, MockPageEntry::png(m4_bytes));
+
+    let recovered = kurp
+        .state
+        .book_profile_manager
+        .get_or_build_profile("empty-then-filled", &auth, &cfg.auto_levels)
+        .await;
+    assert_eq!(
+        recovered.sampled_pages, 5,
+        "Empty page list must not poison profile_cache once pages are indexed"
+    );
+}
+
+#[tokio::test]
+async fn test_tier4_upscale_false_bypass_and_size_threshold_passthrough() {
+    let komga = MockKomgaServer::start().await;
+    komga.set_book_tags("book-pass", "series-pass", vec!["upscale"]);
+    let orig_bytes = encode_to_png_bytes(&generate_m1_spike_page(400, 400, 0.012, 42));
+    komga.set_page(
+        "book-pass",
+        1,
+        MockPageEntry {
+            bytes: orig_bytes.clone(),
+            content_type: "image/png".to_string(),
+            etag: Some("\"orig-pass\"".to_string()),
+            content_disposition: None,
+        },
+    );
+
+    // 1. upscale: false bypasses BookProfile, auto_levels, and GPU completely
+    let mut cfg_off = create_cpu_upscale_config(&komga.base_url);
+    cfg_off.upscale = false;
+    let kurp_off = TestKurpServer::start(cfg_off, Arc::new(UpscaleEngine::new_empty())).await;
+    let client = reqwest::Client::new();
+
+    komga.clear_recorded();
+    let r_off = client
+        .get(format!("{}/api/v1/books/book-pass/pages/1", kurp_off.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_off.status(), StatusCode::OK);
+    assert_eq!(r_off.headers().get(header::ETAG).unwrap(), "\"orig-pass\"");
+    assert_eq!(r_off.bytes().await.unwrap(), orig_bytes);
+    assert!(
+        !komga
+            .recorded_requests()
+            .iter()
+            .any(|r| r.path.ends_with("/pages")),
+        "upscale: false must skip BookProfile"
+    );
+
+    // 2. size_threshold_enabled bypasses oversized PNG without re-encoding
+    let mut cfg_thresh = create_cpu_upscale_config(&komga.base_url);
+    cfg_thresh.size_threshold_enabled = true;
+    cfg_thresh.size_threshold_png = 0; // force bypass on any >=1KB PNG
+    cfg_thresh.auto_levels.enabled = false;
+    let kurp_thresh =
+        TestKurpServer::start(cfg_thresh, Arc::new(UpscaleEngine::new_empty())).await;
+
+    let r_thresh = client
+        .get(format!("{}/api/v1/books/book-pass/pages/1", kurp_thresh.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_thresh.status(), StatusCode::OK);
+    assert_eq!(r_thresh.headers().get(header::CONTENT_TYPE).unwrap(), "image/png");
+    assert_eq!(r_thresh.bytes().await.unwrap(), orig_bytes);
+}
+
+#[tokio::test]
+async fn test_tier4_parallel_page1_body_drain_and_pipeline_backpressure() {
+    let komga = MockKomgaServer::start().await;
+    komga.set_book_tags("burst-vol", "s-burst", vec!["upscale"]);
+    let page_bytes = encode_to_png_bytes(&generate_m1_spike_page(64, 64, 0.012, 42));
+    komga.set_default_book_pages("burst-vol", 6, MockPageEntry::png(page_bytes));
+
+    let mut cfg = create_cpu_upscale_config(&komga.base_url);
+    cfg.max_concurrent_pipelines = 2;
+    cfg.auto_levels.book_profile.sample_pages = 6;
+    cfg.auto_levels.book_profile.parallel_page_fetches = 3;
+
+    let upscaler = Arc::new(UpscaleEngine::init(&cfg).await.expect("CPU upscaler init"));
+    let kurp = TestKurpServer::start(cfg, upscaler.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Concurrent requests across all 6 pages share BookProfile coalescing + bounded pipeline semaphore
+    let mut handles = Vec::new();
+    for p in 1..=6 {
+        let c = client.clone();
+        let url = format!("{}/api/v1/books/burst-vol/pages/{}", kurp.base_url, p);
+        handles.push(tokio::spawn(async move {
+            let r = c.get(&url).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let b = r.bytes().await.unwrap();
+            let dec = image::load_from_memory(&b).unwrap();
+            assert_eq!((dec.width(), dec.height()), (128, 128));
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    upscaler.shutdown();
 }

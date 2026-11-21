@@ -1,686 +1,593 @@
-//! Tier 1: Feature Coverage Test Suite (Features 1 through 48)
+//! Tier 1: Genuine CV Restoration, Colorimetry & Image Codec Integration Tests
 //!
-//! Validates primary behavior and interface contracts across R1 through R7:
-//! - R1: Git branch & CI/CD workflow confirmation
-//! - R2: Exhaustive streaming BookProfile layer
-//! - R3: Page classification & defect detection engine
-//! - R4: Perceptual lightness & color correction engine
-//! - R5: Multi-tier quality guard & adaptive attenuation pipeline
-//! - R6: Decoupled pre-actor execution & edge cases
-//! - R7: Dependencies & configuration schema
+//! All auto-levels tests use >= 400px images so none trivially pass via the `<400px` bypass.
 
 mod common;
 use common::*;
 
-use bytes::Bytes;
-use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
-use kurp::config::app_config::AutoLevelsConfig;
+use std::io::Cursor;
+
+use image::{
+    DynamicImage, ImageBuffer, ImageDecoder, ImageEncoder, ImageFormat, ImageReader, Luma, LumaA,
+    Rgb, RgbImage, Rgba, RgbaImage, codecs::jpeg::JpegEncoder, codecs::png::PngEncoder,
+    metadata::Orientation,
+};
+use kurp::config::app_config::{AutoLevelsConfig, Format};
 use kurp::upscaler::auto_levels::{
-    analyze_page, level_and_verify, rgb_to_lab_fast, Outcome, PageClassification,
+    LevelInfo, Outcome, PageClassification, analyze_page, is_image_grayscale, level_and_verify,
+    rec709_y, rgb_to_lab_fast,
 };
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use kurp::upscaler::avif::{decode_image_with_metadata, display_p3_icc, probe_image_dimensions};
+use kurp::upscaler::upscaler::{
+    WEBP_MAX_DIMENSION, encode_image, encode_upscaled_output, fold_monochrome_post_upscale,
+    should_fold_luma,
 };
-use tokio::sync::Semaphore;
-
-// ============================================================================
-// R1: CI/CD & Build Workflow Tests (Features 1 & 4)
-// ============================================================================
 
 #[test]
-fn test_tier1_r1_cicd_workflow_branching_and_target() {
-    let workflow_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".github")
-        .join("workflows")
-        .join("build-windows.yml");
-
-    assert!(
-        workflow_path.exists(),
-        "build-windows.yml workflow must exist"
-    );
-
-    let content = std::fs::read_to_string(&workflow_path)
-        .expect("Failed to read build-windows.yml");
-
-    assert!(
-        content.contains("feat/auto-leveling-overhaul"),
-        "Workflow must trigger on feat/auto-leveling-overhaul branch"
-    );
-    assert!(
-        content.contains("development"),
-        "Workflow must trigger on development branch"
-    );
-    assert!(
-        content.contains("windows-2022"),
-        "Workflow must run on windows-2022"
-    );
-}
-
-#[test]
-fn test_tier1_r1_test_execution_step_in_ci() {
-    let workflow_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".github")
-        .join("workflows")
-        .join("build-windows.yml");
-    let content = std::fs::read_to_string(&workflow_path)
-        .expect("Failed to read build-windows.yml");
-
-    // The workflow should include build and release steps
-    assert!(
-        content.contains("cargo build") || content.contains("cargo test"),
-        "Workflow must execute cargo commands"
-    );
-}
-
-// ============================================================================
-// R2: Exhaustive Streaming BookProfile Layer Tests (Features 5 - 12)
-// ============================================================================
-
-#[tokio::test]
-async fn test_tier1_r2_komga_page_metadata_client() {
-    let mock = MockKomgaServer::start().await;
-    let page_img = generate_bimodal_ink_shelf_page(100, 100, 18);
-    let png_bytes = encode_to_png_bytes(&page_img);
-
-    mock.set_page(1, png_bytes.clone());
-    mock.set_page(2, png_bytes.clone());
-
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/books/test-book/pages", mock.base_url);
-    let resp = client.get(&url).send().await.unwrap();
-
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let pages: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert_eq!(pages.len(), 2);
-    assert_eq!(pages[0]["number"], 1);
-    assert_eq!(pages[1]["number"], 2);
-    assert_eq!(pages[0]["mediaType"], "image/png");
-}
-
-#[tokio::test]
-async fn test_tier1_r2_streaming_image_fetcher() {
-    let mock = MockKomgaServer::start().await;
-    let test_img = generate_lignin_yellowed_page(200, 200);
-    let bytes = encode_to_png_bytes(&test_img);
-    mock.set_page(1, bytes.clone());
-
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/books/test-book/pages/1", mock.base_url);
-    let resp = client.get(&url).send().await.unwrap();
-
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let fetched_bytes = resp.bytes().await.unwrap();
-    assert_eq!(fetched_bytes, bytes);
-}
-
-#[test]
-fn test_tier1_r2_immediate_streaming_drop_invariant() {
-    // Verifies drop ordering: compressed network bytes dropped before analysis,
-    // decoded image dropped immediately after lightweight extraction.
-    let img = generate_lignin_yellowed_page(400, 400);
-    let mut image_bytes: Option<Bytes> = Some(encode_to_png_bytes(&img));
-
-    // Decode image
-    let mut decoded: Option<DynamicImage> = Some(
-        image::load_from_memory(image_bytes.as_ref().unwrap())
-            .expect("Decoding failed"),
-    );
-
-    // DROP INVARIANT 1: Drop compressed network payload immediately
-    drop(image_bytes.take());
-    assert!(image_bytes.is_none(), "image_bytes must be dropped before analysis");
-
-    // Extract lightweight summary (histograms)
-    let (w, h) = decoded.as_ref().unwrap().dimensions();
-    assert_eq!(w, 400);
-    assert_eq!(h, 400);
-
-    // DROP INVARIANT 2: Drop decoded DynamicImage immediately post-analysis
-    drop(decoded.take());
-    assert!(decoded.is_none(), "decoded image must be dropped immediately after analysis");
-}
-
-#[tokio::test]
-async fn test_tier1_r2_native_moka_request_coalescing() {
-    // Tests that concurrent requests for the same book_id coalesce into a single execution
-    let cache: moka::future::Cache<String, Arc<String>> = moka::future::Cache::new(50);
-    let execution_count = Arc::new(AtomicUsize::new(0));
-
-    let mut handles = Vec::new();
-    for _ in 0..10 {
-        let c = cache.clone();
-        let exec = execution_count.clone();
-        handles.push(tokio::spawn(async move {
-            c.try_get_with::<_, String>("book-vol-1".to_string(), async {
-                exec.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                Ok(Arc::new("Profile-Vol-1".to_string()))
-            })
-            .await
-        }));
-    }
-
-    for h in handles {
-        let res = h.await.unwrap();
-        assert!(res.is_ok());
-        assert_eq!(*res.unwrap(), "Profile-Vol-1");
-    }
-
-    assert_eq!(
-        execution_count.load(Ordering::SeqCst),
-        1,
-        "Native moka coalescing must execute future exactly once across concurrent callers"
-    );
-}
-
-#[tokio::test]
-async fn test_tier1_r2_negative_caching_and_cooldown() {
-    let mock = MockKomgaServer::start().await;
-    mock.set_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/books/broken-book/pages", mock.base_url);
-    let resp = client.get(&url).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-
-    // Cache fallback profile with 60s cooldown
-    let cooldown_cache: moka::future::Cache<String, (std::time::Instant, String)> =
-        moka::future::Cache::builder()
-            .time_to_live(std::time::Duration::from_secs(60))
-            .build();
-
-    cooldown_cache
-        .insert("broken-book".to_string(), (std::time::Instant::now(), "HTTP 500".into()))
-        .await;
-
-    // Verify negative cache hit avoids secondary upstream request
-    let cached = cooldown_cache.get("broken-book").await;
-    assert!(cached.is_some(), "Negative cache must retain failure state during cooldown");
-}
-
-#[tokio::test]
-async fn test_tier1_r2_semaphore_concurrency_bounding() {
-    let semaphore = Arc::new(Semaphore::new(8));
-    let max_concurrent = Arc::new(AtomicUsize::new(0));
-    let active_concurrent = Arc::new(AtomicUsize::new(0));
-
-    let mut handles = Vec::new();
-    for _ in 0..32 {
-        let sem = semaphore.clone();
-        let max = max_concurrent.clone();
-        let active = active_concurrent.clone();
-
-        handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-            max.fetch_max(current, Ordering::SeqCst);
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
-            active.fetch_sub(1, Ordering::SeqCst);
-        }));
-    }
-
-    for h in handles {
-        h.await.unwrap();
-    }
-
-    assert!(
-        max_concurrent.load(Ordering::SeqCst) <= 8,
-        "Active concurrency must not exceed Semaphore limit of 8"
-    );
-}
-
-#[tokio::test]
-async fn test_tier1_r2_book_invalidation_hook() {
-    let cache: moka::future::Cache<String, Arc<String>> = moka::future::Cache::new(50);
-    cache.insert("book-42".to_string(), Arc::new("Profile-42".to_string())).await;
-
-    assert!(cache.get("book-42").await.is_some());
-    // Active invalidation hook
-    cache.invalidate("book-42").await;
-    assert!(
-        cache.get("book-42").await.is_none(),
-        "Invalidation must immediately purge profile from cache"
-    );
-}
-
-// ============================================================================
-// R3: Page Classification & Defect Detection Engine Tests (Features 13 - 29)
-// ============================================================================
-
-#[test]
-fn test_tier1_r3_rec709_integer_luminance_precision() {
-    // Formula: y = (54 * R + 183 * G + 19 * B + 128) >> 8
-    let calc = |r: u8, g: u8, b: u8| -> u8 {
-        ((54 * (r as u32) + 183 * (g as u32) + 19 * (b as u32) + 128) >> 8) as u8
-    };
-
-    assert_eq!(calc(0, 0, 0), 0);
-    assert_eq!(calc(255, 255, 255), 255);
-    // Green weight dominance:
-    assert!(calc(0, 255, 0) > calc(255, 0, 0));
-    assert!(calc(255, 0, 0) > calc(0, 0, 255));
-    // Midpoint balance:
-    assert_eq!(calc(128, 128, 128), 128);
-}
-
-#[test]
-fn test_tier1_r3_cielab_euclidean_chroma_neutral_filtering() {
-    let is_neutral = |r: u8, g: u8, b: u8| -> bool {
-        let (l, a, b_val) = rgb_to_lab_fast(r, g, b);
-        let c_star = (a * a + b_val * b_val).sqrt();
-        !(c_star >= 6.0 && l >= 2.0)
-    };
-
-    // Dark ink with 1-bit JPEG compression noise (e.g. [5, 4, 3]) must remain neutral
-    assert!(is_neutral(5, 4, 3));
-    assert!(is_neutral(15, 15, 14));
-
-    // Clean or slightly aged paper highlights
-    assert!(is_neutral(245, 245, 244));
-    assert!(is_neutral(246, 245, 240));
-
-    // Intentional chromatic pixels (C* >= 6.0)
-    assert!(!is_neutral(245, 230, 195)); // Warm sepia / yellowed tone (C* > 10.0)
-    assert!(!is_neutral(220, 235, 245)); // Pastel blue sky (L*=92.1, C*=7.17 >= 6.0)
-    assert!(!is_neutral(210, 25, 25));   // Vibrant red logo
-}
-
-#[test]
-fn test_tier1_r3_three_tier_classification() {
-    let mono_img = generate_bimodal_ink_shelf_page(200, 200, 18);
-    let sepia_img = generate_intentional_sepia_page(200, 200);
-    let color_img = generate_saturated_oklab_color_page(200, 200);
+fn test_tier1_m1_digital_spike_dead_zone_sparse_ink_and_clean_gray() {
     let config = AutoLevelsConfig::default();
 
-    assert_eq!(
-        analyze_page(&mono_img, 1, &config).classification,
-        PageClassification::Monochrome
-    );
-    assert_eq!(
-        analyze_page(&sepia_img, 1, &config).classification,
-        PageClassification::Color
-    );
-    assert_eq!(
-        analyze_page(&color_img, 1, &config).classification,
-        PageClassification::Color
-    );
-}
+    // M1 at 1.2% and 0.8% (eliminated dead zone)
+    for &black_ratio in &[0.012f64, 0.008f64] {
+        let img = generate_m1_spike_page(1000, 1500, black_ratio, 42);
+        let (leveled, info, verdict) = level_and_verify(img, None, &config);
 
-#[test]
-fn test_tier1_r3_zero_ink_page_guard() {
-    // Blank white page with <0.1% dark mass
-    let blank = DynamicImage::ImageRgb8(RgbImage::from_pixel(200, 200, Rgb([255, 255, 255])));
-    let rgb = blank.to_rgb8();
-    let total = (rgb.width() * rgb.height()) as f32;
+        assert!(
+            info.was_leveled,
+            "M1 (m_zero={black_ratio}) must be leveled"
+        );
+        assert_eq!(verdict.outcome, Outcome::Pass);
+        assert!(
+            !verdict.attenuation_attempted,
+            "M1 (m_zero={black_ratio}) should pass without attenuation"
+        );
+        assert!(
+            (40..=52).contains(&info.black_point),
+            "Validated black_point={} out of [40, 52] for m_zero={black_ratio}",
+            info.black_point
+        );
 
-    let mut dark_count = 0f32;
-    for p in rgb.pixels() {
-        let y = ((54 * (p[0] as u32) + 183 * (p[1] as u32) + 19 * (p[2] as u32) + 128) >> 8) as u8;
-        if y <= 50 {
-            dark_count += 1.0;
+        let lev_rgb = leveled.to_rgb8();
+        // Find a pixel that started at washed-out drawing ink Y=45 (offset 3 into ink region)
+        let total = 1000usize * 1500;
+        let n_black = (total as f64 * black_ratio).round() as usize;
+        let n_white = (total as f64 * 0.050).round() as usize;
+        let idx = n_black + n_white + 3;
+        let x = (idx % 1000) as u32;
+        let y = (idx / 1000) as u32;
+        let px = lev_rgb.get_pixel(x, y);
+        let y_out = rec709_y(px[0], px[1], px[2]);
+        assert!(
+            y_out <= 8,
+            "Washed ink Y=45 must restore to Y_out <= 8 (got {y_out})"
+        );
+    }
+
+    // Sparse ink (1.0% Y=0 + 1.5% ink Y=25 + 5.0% midtone Y=75) must NOT overshoot to 75
+    {
+        let (w, h) = (1000u32, 1000u32);
+        let total = (w * h) as usize;
+        let mut raw = vec![250u8; total * 3];
+        let n_black = total / 100;
+        let n_ink = (total * 15) / 1000;
+        let n_mid = total / 20;
+        for i in 0..n_black {
+            raw[i * 3..i * 3 + 3].copy_from_slice(&[0, 0, 0]);
         }
+        for i in n_black..(n_black + n_ink) {
+            raw[i * 3..i * 3 + 3].copy_from_slice(&[25, 25, 25]);
+        }
+        for i in (n_black + n_ink)..(n_black + n_ink + n_mid) {
+            raw[i * 3..i * 3 + 3].copy_from_slice(&[75, 75, 75]);
+        }
+        let img = DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, raw).unwrap());
+        let (_leveled, info, _) = level_and_verify(img, None, &config);
+        assert!(
+            info.black_point <= 30,
+            "Sparse ink black floor must stay near 25, not overshoot to 75 (got {})",
+            info.black_point
+        );
     }
 
-    let is_zero_ink = (dark_count / total) < 0.001;
-    assert!(is_zero_ink, "Blank page must trigger zero-ink guard");
+    // Clean digital page (4% authentic black Y=0 + 6% dark-gray art Y=45 + 90% white) -> strict veto
+    {
+        let (w, h) = (1000u32, 1000u32);
+        let total = (w * h) as usize;
+        let mut raw = vec![255u8; total * 3];
+        for i in 0..(total * 4 / 100) {
+            raw[i * 3..i * 3 + 3].copy_from_slice(&[0, 0, 0]);
+        }
+        for i in (total * 4 / 100)..(total * 10 / 100) {
+            raw[i * 3..i * 3 + 3].copy_from_slice(&[45, 45, 45]);
+        }
+        let orig = DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, raw.clone()).unwrap());
+        let (out, info, _) = level_and_verify(orig, None, &config);
+        assert!(
+            !info.was_leveled,
+            "Clean digital art with 4% authentic black + 6% dark-gray tone must be vetoed"
+        );
+        assert_eq!(out.as_rgb8().unwrap().as_raw(), &raw);
+    }
 }
 
 #[test]
-fn test_tier1_r3_authentic_black_linework_discriminator() {
-    // True deep black manga ink fill (>3.0% in bins 0-2) does NOT disqualify the shelf!
-    let mut img = generate_bimodal_ink_shelf_page(400, 400, 18);
-    let rgb = img.as_mut_rgb8().unwrap();
-    // Add 3% additional level-0 authentic black text/borders (4800 pixels)
-    for i in 0..4800 {
-        rgb.put_pixel(i % 400, i / 400, Rgb([0, 0, 0]));
-    }
-
+fn test_tier1_m2_localized_yellow_margin_rgb_and_rgba_mixed_skin_preservation() {
     let config = AutoLevelsConfig::default();
-    let analysis = analyze_page(&img, 1, &config);
-    assert!(
-        analysis.is_shelf_detected,
-        "Authentic black text/borders (0-2) must NOT disqualify bimodal shelf at 18"
-    );
-    assert_eq!(analysis.black_floor, 18);
-}
 
+    // 1. Monochrome M2 (Rgb8)
+    let mono = generate_m2_localized_yellow_page(1000, 1500);
+    let (leveled, info, verdict) = level_and_verify(mono, None, &config);
+    assert_eq!(info.classification, PageClassification::Monochrome);
+    assert!(info.was_leveled);
+    assert_eq!(verdict.outcome, Outcome::Pass);
 
-#[test]
-fn test_tier1_r3_binomial_smoothing_3_tap() {
-    // Kernel: [0.25, 0.50, 0.25]
-    let mut hist = [0f32; 10];
-    hist[5] = 100.0; // Impulse spike at bin 5
-
-    let mut smoothed = [0f32; 10];
-    for b in 1..9 {
-        smoothed[b] = 0.25 * hist[b - 1] + 0.50 * hist[b] + 0.25 * hist[b + 1];
+    let lev_rgb = leveled.to_rgb8();
+    for &(px_x, px_y) in &[(20u32, 20u32), (500, 50), (200, 200)] {
+        let p = lev_rgb.get_pixel(px_x, px_y);
+        let (_, a, b) = rgb_to_lab_fast(p[0], p[1], p[2]);
+        assert!(
+            a.hypot(b) <= 2.0,
+            "M2 pixel ({px_x},{px_y}) must neutralize to C* <= 2.0 (got {:.2})",
+            a.hypot(b)
+        );
     }
 
-    assert_eq!(smoothed[4], 25.0);
-    assert_eq!(smoothed[5], 50.0);
-    assert_eq!(smoothed[6], 25.0);
-    assert_eq!(smoothed[4] + smoothed[5] + smoothed[6], 100.0, "Energy conservation");
+    // 2. Mixed M2 (Rgba8): yellowed outer margin + red logo + interior cream skin + semi-transparent edge
+    let mixed_rgba = generate_m2_mixed_rgba_page(1000, 1500);
+    let (lev_rgba, rgba_info, rgba_verdict) = level_and_verify(mixed_rgba, None, &config);
+    assert_eq!(rgba_info.classification, PageClassification::Mixed);
+    assert!(rgba_info.was_leveled);
+    assert_eq!(rgba_verdict.outcome, Outcome::Pass);
+
+    let out_rgba = lev_rgba.as_rgba8().expect("must remain Rgba8");
+    for &(mx, my) in &[(20u32, 20u32), (500, 50)] {
+        let p = out_rgba.get_pixel(mx, my);
+        let (_, a, b) = rgb_to_lab_fast(p[0], p[1], p[2]);
+        assert!(
+            a.hypot(b) <= 2.0,
+            "Mixed Rgba8 outer margin ({mx},{my}) must neutralize to C* <= 2.0 (got {:.2})",
+            a.hypot(b)
+        );
+    }
+
+    // Red logo protected by 3x3 dilated accent mask
+    let logo_p = out_rgba.get_pixel(200, 300);
+    assert!(logo_p[0] >= 205 && logo_p[1] <= 30 && logo_p[2] <= 30);
+    assert_eq!(logo_p[3], 255);
+
+    // Interior cream skin preserved (NEVER bleached to gray!)
+    let skin_p = out_rgba.get_pixel(500, 700);
+    let (_, sa, sb) = rgb_to_lab_fast(skin_p[0], skin_p[1], skin_p[2]);
+    assert!(
+        sa.hypot(sb) >= 10.0,
+        "Interior cream skin must NOT be bleached (got {:?}, C*={:.2})",
+        skin_p,
+        sa.hypot(sb)
+    );
+
+    // Alpha preserved untouched on semi-transparent A=64 edge pixels (no A=127 halo)
+    let edge_p = out_rgba.get_pixel(750, 675);
+    assert_eq!(edge_p[3], 64, "Alpha channel must remain untouched");
 }
 
 #[test]
-fn test_tier1_r3_bimodal_shelf_surge_ratio() {
-    // Peak at 18 with 6000 pixels, valley at 12 with 50 pixels
-    let peak_count = 6000.0f32;
-    let valley_count = 50.0f32;
-    let surge_ratio = peak_count / valley_count;
+fn test_tier1_m3_noisy_mono_and_m4_aged_paper_correct_paper_cast_toggle() {
+    let config = AutoLevelsConfig::default();
 
+    // M3: noisy [5, 4, 3] ink (HSV S=40%, CIELAB C*=0.49) -> Monochrome -> Luma8 fold
+    let m3 = generate_m3_noisy_mono_page(1000, 1500);
+    let (m3_leveled, m3_info, m3_verdict) = level_and_verify(m3, None, &config);
+    assert_eq!(m3_info.classification, PageClassification::Monochrome);
+    assert!(m3_info.is_monochrome);
+    assert!(!m3_info.paper_cast_preserved);
+    assert_eq!(m3_verdict.outcome, Outcome::Pass);
+    let m3_folded = fold_monochrome_post_upscale(m3_leveled, &m3_info, true);
+    assert!(matches!(m3_folded, DynamicImage::ImageLuma8(_)));
+
+    // M4: aged paper [232, 224, 198] + ink [26, 26, 26]
+    let m4 = generate_m4_aged_paper_page(1000, 1500);
+
+    // Default correct_paper_cast: true
+    let (m4_leveled, m4_info, m4_verdict) = level_and_verify(m4.clone(), None, &config);
+    assert!(m4_info.was_leveled);
+    assert_eq!(m4_verdict.outcome, Outcome::Pass);
+    assert!((24..=28).contains(&m4_info.black_point));
+    assert!((220..=228).contains(&m4_info.white_point));
+    assert!(!m4_info.paper_cast_preserved);
+    let m4_rgb = m4_leveled.as_rgb8().unwrap();
+    let ink_px = m4_rgb.get_pixel(0, 0);
+    assert!(rec709_y(ink_px[0], ink_px[1], ink_px[2]) <= 6);
+    let paper_px = m4_rgb.get_pixel(1, 0);
+    assert!(rec709_y(paper_px[0], paper_px[1], paper_px[2]) >= 250);
+    let (_, pa, pb) = rgb_to_lab_fast(paper_px[0], paper_px[1], paper_px[2]);
+    assert!(pa.hypot(pb) <= 1.0);
+
+    // Disabled correct_paper_cast: false -> preserves tint & skips Luma8 folding
+    let mut preserve_cfg = AutoLevelsConfig::default();
+    preserve_cfg.correction.correct_paper_cast = false;
+    let (pres_img, pres_info, _) = level_and_verify(m4, None, &preserve_cfg);
+    assert!(pres_info.paper_cast_preserved);
+    assert!(!should_fold_luma(&pres_info, true));
+    let pres_paper = pres_img.as_rgb8().unwrap().get_pixel(1, 0);
     assert!(
-        surge_ratio >= 2.8,
-        "Surge ratio {:.2} must exceed 2.8x threshold",
-        surge_ratio
+        pres_paper[0] > pres_paper[2],
+        "Warm paper tint must be preserved when correct_paper_cast=false (got {:?})",
+        pres_paper
+    );
+    let kept_rgb = fold_monochrome_post_upscale(pres_img, &pres_info, true);
+    assert!(
+        kept_rgb.as_rgb8().is_some(),
+        "Luma8 fold must be skipped when paper_cast_preserved=true"
     );
 }
 
 #[test]
-fn test_tier1_r3_tail_emptiness_calculation() {
-    let moody = generate_moody_atmospheric_page(200, 200);
-    let compressed = generate_compressed_scan_page(200, 200);
+fn test_tier1_arbitrary_hue_casts_blue_green_pink_on_mixed() {
+    let config = AutoLevelsConfig::default();
+    let cases = [
+        ("blue", [225u8, 235, 248], [210u8, 25, 25]),
+        ("green", [225u8, 245, 230], [210u8, 25, 25]),
+        ("pink", [248u8, 230, 240], [25u8, 90, 220]),
+    ];
 
-    let calc_emptiness = |img: &DynamicImage| -> f32 {
-        let mut hist = [0u32; 256];
-        let rgb = img.to_rgb8();
-        for p in rgb.pixels() {
-            let y = ((54 * (p[0] as u32) + 183 * (p[1] as u32) + 19 * (p[2] as u32) + 128) >> 8) as usize;
-            hist[y] += 1;
-        }
-
-        let p5 = 30usize;
-        let p95 = 190usize;
-
-        let empty_below = (0..=p5).filter(|&b| hist[b] == 0).count();
-        let empty_above = (p95..=255).filter(|&b| hist[b] == 0).count();
-        (empty_below + empty_above) as f32 / (p5 + (255 - p95)) as f32
-    };
-
-    let moody_emptiness = calc_emptiness(&moody);
-    let compressed_emptiness = calc_emptiness(&compressed);
-
-    assert!(
-        moody_emptiness < 0.70,
-        "Moody atmospheric art must have tail emptiness < 0.70 (got {:.2})",
-        moody_emptiness
-    );
-    assert!(
-        compressed_emptiness >= 0.70,
-        "Compressed scan must have tail emptiness >= 0.70 (got {:.2})",
-        compressed_emptiness
-    );
-}
-
-#[test]
-fn test_tier1_r3_physical_lignin_and_dual_zone_sepia() {
-    let yellowed = generate_lignin_yellowed_page(200, 200);
-    let sepia = generate_intentional_sepia_page(200, 200);
-
-    let check_sepia = |img: &DynamicImage| -> bool {
-        let rgb = img.to_rgb8();
-        // Sample core shadows (y in [8, 45])
-        let mut shadow_r_sum = 0u64;
-        let mut shadow_b_sum = 0u64;
-        let mut shadow_count = 0u64;
-
-        for p in rgb.pixels() {
-            let (r, g, b) = (p[0] as u32, p[1] as u32, p[2] as u32);
-            let y = (54 * r + 183 * g + 19 * b + 128) >> 8;
-            if (8..=45).contains(&y) {
-                shadow_r_sum += r as u64;
-                shadow_b_sum += b as u64;
-                shadow_count += 1;
+    for (name, paper_rgb, logo_rgb) in cases {
+        let (w, h) = (600u32, 600u32);
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let in_logo = (50..150).contains(&x) && (50..160).contains(&y);
+                let is_ink = !in_logo && (x + y).is_multiple_of(12);
+                let px = if in_logo {
+                    Rgb(logo_rgb)
+                } else if is_ink {
+                    Rgb([20, 20, 20])
+                } else {
+                    Rgb(paper_rgb)
+                };
+                img.put_pixel(x, y, px);
             }
         }
+        let (leveled, info, verdict) =
+            level_and_verify(DynamicImage::ImageRgb8(img), None, &config);
+        assert_eq!(info.classification, PageClassification::Mixed, "{name} cast");
+        assert!(info.was_leveled, "{name} cast");
+        assert_eq!(verdict.outcome, Outcome::Pass, "{name} cast");
 
-        if shadow_count > 0 {
-            let avg_r = shadow_r_sum as f32 / shadow_count as f32;
-            let avg_b = shadow_b_sum as f32 / shadow_count as f32;
-            avg_r > avg_b + 4.0 // Sepia condition
-        } else {
-            false
-        }
-    };
-
-    assert!(!check_sepia(&yellowed), "Lignin paper yellowing has neutral shadows");
-    assert!(check_sepia(&sepia), "Intentional sepia has warm shadows (R > B + 4)");
-}
-
-// ============================================================================
-// R4: Perceptual Lightness & Color Correction Engine Tests (Features 30 - 36)
-// ============================================================================
-
-#[test]
-fn test_tier1_r4_severity_confidence_scaling() {
-    let calc_fraction = |confidence: f32, severity_mult: f32| -> f32 {
-        if confidence < 0.75 {
-            0.0
-        } else {
-            let scale = ((confidence - 0.75) / (1.0 - 0.75)).clamp(0.0, 1.0);
-            severity_mult * scale
-        }
-    };
-
-    assert_eq!(calc_fraction(0.70, 1.0), 0.0);
-    assert_eq!(calc_fraction(0.75, 1.0), 0.0);
-    assert_eq!(calc_fraction(1.00, 1.0), 1.0);
-    assert_eq!(calc_fraction(1.00, 0.75), 0.75); // Moderate severity
-    assert!((calc_fraction(0.875, 1.0) - 0.50).abs() < 1e-4);
+        let out = leveled.as_rgb8().unwrap();
+        let pp = out.get_pixel(400, 400);
+        let (_, pa, pb) = rgb_to_lab_fast(pp[0], pp[1], pp[2]);
+        assert!(
+            pa.hypot(pb) <= 2.0,
+            "{name} paper cast must neutralize to C* <= 2.0 (got {:.2})",
+            pa.hypot(pb)
+        );
+        assert_eq!(
+            out.get_pixel(100, 100).0,
+            logo_rgb,
+            "{name} logo must stay bit-exact"
+        );
+    }
 }
 
 #[test]
-fn test_tier1_r4_fast_linear_srgb_in_gamut_check() {
-    let in_gamut = |r: f32, g: f32, b: f32| -> bool {
-        r >= 0.0 && r <= 1.0 && g >= 0.0 && g <= 1.0 && b >= 0.0 && b <= 1.0
-    };
+fn test_tier1_t1_to_t7_adversarial_traps_zero_false_positives() {
+    let config = AutoLevelsConfig::default();
 
-    assert!(in_gamut(0.0, 0.5, 1.0));
-    assert!(!in_gamut(-0.01, 0.5, 0.5)); // Out of gamut below 0
-    assert!(!in_gamut(0.5, 1.05, 0.5));  // Out of gamut above 1
-}
-
-#[test]
-fn test_tier1_r4_radial_chord_bisection_monotonicity() {
-    // Tests 10-step monotonic binary search scaling factor t in [0.0, 1.0]
-    let mut low = 0.0f32;
-    let mut high = 1.0f32;
-
-    // Simulate finding boundary at t = 0.654
-    let target = 0.654f32;
-    for _ in 0..10 {
-        let mid = (low + high) * 0.5;
-        if mid <= target {
-            low = mid;
-        } else {
-            high = mid;
+    // T1: Pristine digital page with 15% white bubbles + 35% light-gray screentone (Y=200) + 50% dark art
+    {
+        let (w, h) = (1000u32, 1500u32);
+        let total = (w * h) as usize;
+        let mut raw = vec![0u8; total * 3];
+        for idx in 0..total {
+            let v = if idx < total * 15 / 100 {
+                255u8
+            } else if idx < total * 50 / 100 {
+                200u8
+            } else {
+                (idx % 60) as u8
+            };
+            raw[idx * 3..idx * 3 + 3].copy_from_slice(&[v, v, v]);
         }
+        let orig = DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, raw.clone()).unwrap());
+        let (out, info, _) = level_and_verify(orig, None, &config);
+        assert!(!info.was_leveled, "T1 clean screentone page must be vetoed");
+        assert_eq!(out.as_rgb8().unwrap().as_raw(), &raw);
     }
 
-    let err = (low - target).abs();
-    assert!(
-        err < (1.0 / 1024.0),
-        "10 iterations must achieve error < 2^-10 (got {:.6})",
-        err
-    );
-}
+    // T2: Full-color cover at 500x500 (unconditional veto regardless of pixel count)
+    {
+        let color = generate_color_cover_page(500, 500);
+        let orig_raw = color.as_rgb8().unwrap().as_raw().clone();
+        let (out, info, _) = level_and_verify(color, None, &config);
+        assert_eq!(info.classification, PageClassification::Color);
+        assert!(!info.was_leveled);
+        assert_eq!(out.as_rgb8().unwrap().as_raw(), &orig_raw);
+    }
 
-#[test]
-fn test_tier1_r4_hermite_smoothstep_blending() {
-    let hermite = |chroma: f32, low_thresh: f32| -> f32 {
-        if chroma >= 35.0 {
-            0.0 // 100% original color preserved untouched
-        } else if chroma <= low_thresh {
-            1.0 // 100% leveled
-        } else {
-            let w = (35.0 - chroma) / (35.0 - low_thresh);
-            w * w * (3.0 - 2.0 * w)
+    // T3: Pastel blue sky [220, 235, 245] + washed ink Y=30
+    {
+        let (w, h) = (1000u32, 1500u32);
+        let mut raw = vec![250u8; (w * h) as usize * 3];
+        for i in 0..150_000 {
+            raw[i * 3..i * 3 + 3].copy_from_slice(&[220, 235, 245]);
         }
-    };
+        for i in 150_000..300_000 {
+            raw[i * 3..i * 3 + 3].copy_from_slice(&[30, 30, 30]);
+        }
+        let img = DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, raw).unwrap());
+        let (leveled, info, verdict) = level_and_verify(img, None, &config);
+        assert_eq!(info.classification, PageClassification::Mixed);
+        assert!(info.was_leveled);
+        assert_eq!(verdict.outcome, Outcome::Pass);
+        let rgb = leveled.as_rgb8().unwrap();
+        let sky = rgb.get_pixel(0, 0);
+        assert!(i32::from(sky[2]) - i32::from(sky[0]) >= 15);
+        let (_, a0, b0) = rgb_to_lab_fast(220, 235, 245);
+        let (_, a1, b1) = rgb_to_lab_fast(sky[0], sky[1], sky[2]);
+        assert!((a0 - a1).hypot(b0 - b1) <= 1.5);
+        let ink = rgb.get_pixel(0, 151);
+        assert!(rec709_y(ink[0], ink[1], ink[2]) <= 8);
+    }
 
-    assert_eq!(hermite(35.0, 12.0), 0.0);
-    assert_eq!(hermite(40.0, 12.0), 0.0);
-    assert_eq!(hermite(12.0, 12.0), 1.0);
-    assert_eq!(hermite(5.0, 12.0), 1.0);
-    let mid = hermite((35.0 + 12.0) * 0.5, 12.0);
-    assert!((mid - 0.5).abs() < 1e-4);
-}
-
-// ============================================================================
-// R5: Multi-Tier Quality Guard Tests (Features 37 - 45)
-// ============================================================================
-
-#[test]
-fn test_tier1_r5_luminance_mse_and_psnr() {
-    let calc_mse_psnr = |orig: &[u8], lev: &[u8]| -> (f32, f32) {
-        assert_eq!(orig.len(), lev.len());
-        let sum_sq: f64 = orig
+    // T4: High-key fog (M_ink[3..=85] == 0.0 -> black floor vetoed)
+    {
+        let (w, h) = (1000u32, 1500u32);
+        let total = (w * h) as usize;
+        let mut raw = vec![0u8; total * 3];
+        for idx in 0..total {
+            let v = if idx < 22_500 {
+                0u8
+            } else {
+                210 + ((idx % 41) as u8)
+            };
+            raw[idx * 3..idx * 3 + 3].copy_from_slice(&[v, v, v]);
+        }
+        let (leveled, info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, raw).unwrap()), None, &config);
+        assert_eq!(info.black_point, 0);
+        let avg_y: f64 = leveled
+            .to_luma8()
+            .as_raw()
             .iter()
-            .zip(lev.iter())
-            .map(|(&a, &b)| {
-                let diff = a as f64 - b as f64;
-                diff * diff
-            })
-            .sum();
-        let mse = (sum_sq / orig.len() as f64) as f32;
-        let psnr = if mse < 1e-6 {
-            99.0
-        } else {
-            10.0 * (255.0 * 255.0 / mse).log10()
-        };
-        (mse, psnr)
-    };
+            .map(|&v| f64::from(v))
+            .sum::<f64>()
+            / total as f64;
+        assert!(avg_y >= 215.0);
+    }
 
-    let a = vec![100u8; 1000];
-    let b = vec![105u8; 1000]; // Shift by 5
-    let (mse, psnr) = calc_mse_psnr(&a, &b);
+    // T5: Low-key nighttime splash in BOTH Rgb8 and Luma8
+    {
+        let (w, h) = (800u32, 800u32);
+        let luma_night = ImageBuffer::from_fn(w, h, |x, y| Luma([((x + y) % 111) as u8]));
+        let (_, info_luma, _) = level_and_verify(DynamicImage::ImageLuma8(luma_night), None, &config);
+        assert_eq!(info_luma.white_point, 255);
 
-    assert_eq!(mse, 25.0);
-    assert!(mse <= 220.0, "MSE within safe limit");
-    assert!(psnr >= 22.0, "PSNR >= 22dB requirement");
-}
+        let rgb_night = ImageBuffer::from_fn(w, h, |x, y| {
+            let v = ((x + y) % 111) as u8;
+            Rgb([v, v, v])
+        });
+        let (_, info_rgb, _) = level_and_verify(DynamicImage::ImageRgb8(rgb_night), None, &config);
+        assert_eq!(info_rgb.white_point, 255);
+    }
 
-#[test]
-fn test_tier1_r5_paper_cast_exemption_mask() {
-    // Verifies that unprinted paper highlights (y >= 180, chroma <= 30) are exempt from color drift penalty
-    let is_exempt = |r: u8, g: u8, b: u8, paper_cast_active: bool| -> bool {
-        if !paper_cast_active {
-            return false;
+    // T6: Microscopic 3% red logo on dirty paper [245, 243, 234]
+    {
+        let (w, h) = (1000u32, 1500u32);
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let in_logo = (100..250).contains(&x) && (100..400).contains(&y);
+                let is_ink = !in_logo && (x + y).is_multiple_of(15);
+                let px = if in_logo {
+                    Rgb([210, 25, 25])
+                } else if is_ink {
+                    Rgb([20, 20, 20])
+                } else {
+                    Rgb([245, 243, 234])
+                };
+                img.put_pixel(x, y, px);
+            }
         }
-        let y = ((54 * (r as u32) + 183 * (g as u32) + 19 * (b as u32) + 128) >> 8) as u8;
-        let chroma = r.max(g).max(b) - r.min(g).min(b);
-        y >= 180 && chroma <= 30
-    };
+        let (leveled, info, verdict) =
+            level_and_verify(DynamicImage::ImageRgb8(img), None, &config);
+        assert_eq!(info.classification, PageClassification::Mixed);
+        assert!(info.was_leveled);
+        assert_eq!(verdict.outcome, Outcome::Pass);
+        let out = leveled.as_rgb8().unwrap();
+        let logo = out.get_pixel(150, 200);
+        assert!(logo[0] >= 205 && logo[1] <= 30 && logo[2] <= 30);
+        let paper = out.get_pixel(500, 500);
+        let (_, pa, pb) = rgb_to_lab_fast(paper[0], paper[1], paper[2]);
+        assert!(pa.hypot(pb) <= 1.5);
+    }
 
-    assert!(is_exempt(240, 235, 215, true)); // Paper highlight exempt
-    assert!(!is_exempt(240, 235, 215, false)); // Disabled if no paper cast correction
-    assert!(!is_exempt(120, 115, 100, true)); // Midtones NOT exempt (y < 180)
-    assert!(!is_exempt(240, 50, 50, true)); // High-chroma color NOT exempt
+    // T7: Intentional warm sepia + pure-white speech bubbles dominating corner cell (0,0)
+    {
+        let sepia = generate_sepia_with_white_bubbles_page(1000, 1500);
+        let orig_raw = sepia.as_rgb8().unwrap().as_raw().clone();
+        let (out, info, _) = level_and_verify(sepia, None, &config);
+        assert_eq!(info.classification, PageClassification::Color);
+        assert!(!info.was_leveled, "T7 sepia + white bubbles must be vetoed");
+        assert_eq!(out.as_rgb8().unwrap().as_raw(), &orig_raw);
+    }
 }
 
 #[test]
-fn test_tier1_r5_gradient_edge_energy_gating() {
-    // Skip pixels with ||G|| < 12.0
-    let is_active_edge = |gx: f32, gy: f32| -> bool {
-        (gx * gx + gy * gy).sqrt() >= 12.0
-    };
+fn test_tier1_16bit_format_parity_and_disabled_grayscale_check() {
+    let config = AutoLevelsConfig::default();
 
-    assert!(!is_active_edge(3.0, 4.0)); // Magnitude 5 < 12 -> skipped
-    assert!(is_active_edge(10.0, 10.0)); // Magnitude ~14.14 >= 12 -> evaluated
+    // Luma16
+    let luma16 = ImageBuffer::from_fn(450u32, 450u32, |x, y| {
+        let v: u16 = if (x + y).is_multiple_of(8) { 30 } else { 220 };
+        Luma([v * 257])
+    });
+    let (lev_l16, info_l16, verdict_l16) =
+        level_and_verify(DynamicImage::ImageLuma16(luma16), None, &config);
+    assert!(info_l16.was_leveled);
+    assert_eq!(verdict_l16.outcome, Outcome::Pass);
+    let out_l16 = lev_l16.as_luma8().unwrap();
+    assert!(out_l16.get_pixel(0, 0)[0] <= 8);
+    assert!(out_l16.get_pixel(1, 0)[0] >= 250);
+
+    // Rgb16
+    let rgb16 = ImageBuffer::from_fn(450u32, 450u32, |x, y| {
+        if (x + y).is_multiple_of(8) {
+            Rgb([30 * 257, 30 * 257, 30 * 257])
+        } else {
+            Rgb([220 * 257, 215 * 257, 195 * 257])
+        }
+    });
+    let (lev_r16, info_r16, _) = level_and_verify(DynamicImage::ImageRgb16(rgb16), None, &config);
+    assert!(info_r16.was_leveled);
+    let out_r16 = lev_r16.as_rgb8().unwrap();
+    assert!(rec709_y(out_r16.get_pixel(1, 0)[0], out_r16.get_pixel(1, 0)[1], out_r16.get_pixel(1, 0)[2]) >= 250);
+
+    // Rgba16
+    let rgba16 = ImageBuffer::from_fn(450u32, 450u32, |x, y| {
+        if (x + y).is_multiple_of(8) {
+            Rgba([30 * 257, 30 * 257, 30 * 257, 65535])
+        } else {
+            Rgba([220 * 257, 220 * 257, 220 * 257, 65535])
+        }
+    });
+    let (_lev_a16, info_a16, _) =
+        level_and_verify(DynamicImage::ImageRgba16(rgba16), None, &config);
+    assert!(info_a16.was_leveled);
+
+    // auto_levels.enabled = false still preserves accurate is_image_grayscale
+    let disabled = AutoLevelsConfig {
+        enabled: false,
+        ..AutoLevelsConfig::default()
+    };
+    let m3 = generate_m3_noisy_mono_page(500, 500);
+    assert!(is_image_grayscale(&m3));
+    let (_, dis_mono, _) = level_and_verify(m3, None, &disabled);
+    assert!(!dis_mono.was_leveled);
+    assert!(dis_mono.is_monochrome);
+
+    let cover = generate_color_cover_page(500, 500);
+    assert!(!is_image_grayscale(&cover));
+    let (_, dis_col, _) = level_and_verify(cover, None, &disabled);
+    assert!(!dis_col.was_leveled);
+    assert!(!dis_col.is_monochrome);
 }
 
 #[test]
-fn test_tier1_r5_activity_gated_block_michelson() {
-    // Evaluated only if (I_max - I_min) >= 25
-    let is_active_block = |i_min: u8, i_max: u8| -> bool {
-        (i_max as i32 - i_min as i32) >= 25
+fn test_tier1_libwebp_lossless_icc_png_fallback_and_alpha_compositing() {
+    let mut rgb = RgbImage::new(32, 32);
+    for (x, y, px) in rgb.enumerate_pixels_mut() {
+        *px = Rgb([(x * 7) as u8, (y * 7) as u8, 128]);
+    }
+    let icc = display_p3_icc();
+    let (webp_bytes, out_fmt) = encode_image(&DynamicImage::ImageRgb8(rgb.clone()), ImageFormat::WebP, Some(icc), 90)
+        .expect("libwebp lossless encode must succeed");
+    assert_eq!(out_fmt, ImageFormat::WebP);
+
+    let decoded = decode_image_with_metadata(&webp_bytes, None).expect("WebP decode must succeed");
+    assert_eq!(decoded.detected_format, ImageFormat::WebP);
+    assert_eq!(decoded.icc_profile.as_deref(), Some(icc));
+    assert_eq!(decoded.image.to_rgb8().as_raw(), rgb.as_raw());
+
+    // Tall webtoon > 16383px falls back cleanly to PNG without panic
+    let tall = DynamicImage::ImageLuma8(ImageBuffer::from_pixel(4, WEBP_MAX_DIMENSION + 1, Luma([200])));
+    let (fb_bytes, fb_fmt) = encode_image(&tall, ImageFormat::WebP, None, 90)
+        .expect("WebP >16383px PNG fallback must succeed");
+    assert_eq!(fb_fmt, ImageFormat::Png);
+    assert!(fb_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    // Rgba8 monochrome fold composites transparent [0,0,0,0] over white (255), NOT black (0)
+    let mut rgba = RgbaImage::new(8, 8);
+    rgba.put_pixel(0, 0, Rgba([0, 0, 0, 0]));
+    rgba.put_pixel(1, 0, Rgba([0, 0, 0, 255]));
+    let mono_info = LevelInfo {
+        was_leveled: true,
+        is_monochrome: true,
+        paper_cast_preserved: false,
+        classification: PageClassification::Monochrome,
+        black_point: 0,
+        white_point: 255,
+        quality_verdict: None,
     };
-
-    assert!(!is_active_block(250, 255)); // Blank white gutter: diff 5 -> skipped
-    assert!(!is_active_block(0, 5));     // Solid black gutter: diff 5 -> skipped
-    assert!(is_active_block(10, 200));   // Active panel linework: diff 190 -> evaluated
-}
-
-// ============================================================================
-// R6: Decoupled Pre-Actor Execution & Edge Cases (Features 46 - 52)
-// ============================================================================
-
-#[tokio::test]
-async fn test_tier1_r6_decoupled_pre_actor_spawn_blocking() {
-    let result = tokio::task::spawn_blocking(|| {
-        // CPU leveling executed inside blocking threadpool
-        let img = generate_lignin_yellowed_page(100, 100);
-        let (w, h) = img.dimensions();
-        w * h
-    })
-    .await
+    let (folded_webp, _) = encode_upscaled_output(
+        DynamicImage::ImageRgba8(rgba.clone()),
+        ImageFormat::Png,
+        &mono_info,
+        Some(icc),
+        Format::WebP,
+        90,
+        true,
+    )
     .unwrap();
+    let decoded_mono = decode_image_with_metadata(&folded_webp, None).unwrap();
+    assert!(decoded_mono.icc_profile.is_none(), "Folded Luma8 drops RGB ICC");
+    let dec_rgb = decoded_mono.image.to_luma8();
+    assert_eq!(dec_rgb.get_pixel(0, 0)[0], 255);
+    assert_eq!(dec_rgb.get_pixel(1, 0)[0], 0);
 
-    assert_eq!(result, 10000);
+    // JPEG LumaA8 white-compositing emits 1-channel L8 JPEG
+    let mut la = ImageBuffer::<LumaA<u8>, Vec<u8>>::new(8, 8);
+    la.put_pixel(0, 0, LumaA([0, 0]));
+    la.put_pixel(1, 0, LumaA([0, 255]));
+    let (jpg_bytes, jpg_fmt) =
+        encode_image(&DynamicImage::ImageLumaA8(la), ImageFormat::Jpeg, None, 95).unwrap();
+    assert_eq!(jpg_fmt, ImageFormat::Jpeg);
+    let dec_jpg = image::load_from_memory(&jpg_bytes).unwrap();
+    assert!(matches!(dec_jpg, DynamicImage::ImageLuma8(_)));
 }
 
 #[test]
-fn test_tier1_r6_thumbnail_fast_bypass() {
-    let thumb_img = generate_bimodal_ink_shelf_page(300, 300, 18);
-    let bytes = Bytes::from(encode_to_png_bytes(&thumb_img));
-    let config = AutoLevelsConfig::default();
-    let (_leveled, info, verdict) = level_and_verify(thumb_img, &bytes, None, &config);
-    assert!(!info.was_leveled, "Thumbnails (<400px) must bypass auto-leveling");
-    assert_eq!(verdict.outcome, Outcome::Pass);
-}
+fn test_tier1_decode_image_with_metadata_exif_orientation_and_icc() {
+    // 1. PNG with ICC profile preserved through decode_image_with_metadata
+    let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 20, Rgb([10, 20, 30])));
+    let mut png_buf = Vec::new();
+    let mut enc = PngEncoder::new(&mut png_buf);
+    enc.set_icc_profile(display_p3_icc().to_vec()).unwrap();
+    enc.write_image(img.as_bytes(), 40, 20, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let dec = decode_image_with_metadata(&png_buf, None).unwrap();
+    assert_eq!(dec.detected_format, ImageFormat::Png);
+    assert_eq!(dec.icc_profile.as_deref(), Some(display_p3_icc()));
+    assert_eq!(probe_image_dimensions(&png_buf, None).unwrap(), (40, 20, ImageFormat::Png));
 
-#[test]
-fn test_tier1_r6_alpha_transparency_masking() {
-    let rgba_img = generate_rgba_transparent_page(100, 100);
-    let bytes = Bytes::from(encode_to_png_bytes(&rgba_img));
-    let config = AutoLevelsConfig::default();
-    let (leveled, _info, verdict) = level_and_verify(rgba_img, &bytes, None, &config);
-    assert_eq!(
-        verdict.outcome,
-        Outcome::Pass,
-        "Alpha transparent page must pass quality guard with masked transparency"
-    );
-    assert!(matches!(leveled, DynamicImage::ImageRgba8(_)));
-}
+    // 2. JPEG with EXIF Orientation::Rotate90 swaps 40x20 -> 20x40 in both probe and decode
+    let mut jpg_buf = Vec::new();
+    let jenc = JpegEncoder::new_with_quality(&mut jpg_buf, 95);
+    img.write_with_encoder(jenc).unwrap();
+    // Inject minimal APP1 EXIF Orientation=6 (Rotate90) after SOI (0xFF, 0xD8)
+    let exif_tiff: [u8; 32] = [
+        b'E', b'x', b'i', b'f', 0, 0, // Exif\0\0
+        b'M', b'M', 0, 42, 0, 0, 0, 8, // Big-endian TIFF header, IFD0 @ offset 8
+        0, 1, // 1 IFD entry
+        0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, // Orientation = 6
+        0, 0, 0, 0, // next IFD = 0
+    ];
+    let app1_len = (2 + exif_tiff.len()) as u16;
+    let mut oriented_jpg = Vec::with_capacity(jpg_buf.len() + exif_tiff.len() + 4);
+    oriented_jpg.extend_from_slice(&jpg_buf[..2]);
+    oriented_jpg.extend_from_slice(&[0xFF, 0xE1]);
+    oriented_jpg.extend_from_slice(&app1_len.to_be_bytes());
+    oriented_jpg.extend_from_slice(&exif_tiff);
+    oriented_jpg.extend_from_slice(&jpg_buf[2..]);
 
-#[test]
-fn test_tier1_r6_solid_black_blank_page() {
-    let black_img = DynamicImage::ImageRgb8(RgbImage::from_pixel(500, 500, Rgb([0, 0, 0])));
-    let bytes = Bytes::from(encode_to_png_bytes(&black_img));
-    let config = AutoLevelsConfig::default();
-    let (_leveled, info, verdict) = level_and_verify(black_img, &bytes, None, &config);
-    assert!(!info.was_leveled, "Solid black chapter divider must be skipped");
-    assert_eq!(verdict.outcome, Outcome::Pass);
-}
+    let mut dec_reader = ImageReader::new(Cursor::new(&oriented_jpg))
+        .with_guessed_format()
+        .unwrap()
+        .into_decoder()
+        .unwrap();
+    assert_eq!(dec_reader.orientation().unwrap(), Orientation::Rotate90);
 
-#[test]
-fn test_tier1_r6_solid_white_blank_page() {
-    let white_img = DynamicImage::ImageRgb8(RgbImage::from_pixel(500, 500, Rgb([255, 255, 255])));
-    let bytes = Bytes::from(encode_to_png_bytes(&white_img));
-    let config = AutoLevelsConfig::default();
-    let (_leveled, info, verdict) = level_and_verify(white_img, &bytes, None, &config);
-    assert!(!info.was_leveled, "Solid white blank page must be skipped");
-    assert_eq!(verdict.outcome, Outcome::Pass);
-}
+    let probed = probe_image_dimensions(&oriented_jpg, None).unwrap();
+    assert_eq!(probed, (20, 40, ImageFormat::Jpeg));
 
+    let dec_oriented = decode_image_with_metadata(&oriented_jpg, None).unwrap();
+    assert_eq!(dec_oriented.detected_format, ImageFormat::Jpeg);
+    assert_eq!((dec_oriented.image.width(), dec_oriented.image.height()), (20, 40));
 
-// ============================================================================
-// R7: Dependencies & Configuration Schema (Features 2, 3)
-// ============================================================================
-
-#[test]
-fn test_tier1_r7_test_auto_levels_config_defaults() {
-    let config = TestAutoLevelsConfig::default();
-
-    assert!(config.enabled);
-    assert_eq!(config.confidence_threshold, 0.75);
-    assert_eq!(config.black_clip_percent, 0.1);
-    assert_eq!(config.white_clip_percent, 0.1);
-    assert_eq!(config.surge_ratio_threshold, 2.8);
-    assert_eq!(config.max_black_shift, 85);
-    assert_eq!(config.min_white_threshold, 200);
-    assert!(config.correct_paper_cast);
-    assert!(config.protect_sepia_artwork);
+    // Reference unused shared generators cleanly in analyze_page smoke check
+    let cfg = AutoLevelsConfig::default();
+    let cover_analysis = analyze_page(&generate_color_cover_page(400, 400), 1, &cfg);
+    assert_eq!(cover_analysis.classification, PageClassification::Color);
+    let sepia_analysis = analyze_page(&generate_sepia_with_white_bubbles_page(400, 400), 1, &cfg);
+    assert_eq!(sepia_analysis.classification, PageClassification::Color);
+    assert!(!encode_to_png_bytes(&img).is_empty());
 }
