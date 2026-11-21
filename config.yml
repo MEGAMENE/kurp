@@ -1,11 +1,17 @@
 port: 3030
 upstream_url: "http://localhost:8080"
 allow_config_updates: false
+# config_api_token: "change-me-if-config-updates-enabled"
 upscale: true
 size_threshold_enabled: true
 size_threshold: 500
 size_threshold_png: 1000
+max_upscale_dimension: 4000
+jpeg_quality: 90
+max_concurrent_pipelines: 6
+# rayon_threads: 8
 return_format: WebP
+# upscale_tag: "upscale"
 
 realcugan:
   gpuid: 0
@@ -14,15 +20,40 @@ realcugan:
   model: Se
   tile_size: 0
   sync_gap: 2
-  tta_mode: false
   tta_level: 1
   use_fp16_arithmetic: false
-  force_cpu: false
-  cpu_fallback: false
-  num_threads: 2
+  # num_threads: 4
+  concurrent_jobs: 1
   models_path: "./models"
 
 auto_levels:
   enabled: true
-  mode: "All"
   output_grayscale_for_monochrome: true
+  book_profile:
+    cache_size: 100
+    cache_ttl_seconds: 3600
+    sample_pages: 12
+    parallel_page_fetches: 8
+    timeout_seconds: 45
+  detection:
+    black_clip_percent: 0.1
+    white_clip_percent: 0.1
+    surge_ratio_threshold: 2.8
+    protect_sepia_artwork: true
+  correction:
+    max_black_shift: 85
+    min_white_threshold: 200
+    correct_paper_cast: true
+    gamma: 1.0
+  quality_guards:
+    tier1:
+      check_tail_erosion: true
+      min_dynamic_range: 64
+    tier2:
+      ssim_threshold: 0.92
+      chroma_delta_p95: 2.5
+      chroma_delta_median: 1.5
+    tier3:
+      gradient_ncc: 0.90
+      min_contrast_ratio: 0.50
+      stride: 4

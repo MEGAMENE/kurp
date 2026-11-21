@@ -1,12 +1,14 @@
+use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use arc_swap::ArcSwap;
 use axum::http::Uri;
-use log::LevelFilter;
-use moka::future::Cache;
-use ractor::Actor;
+use log::{LevelFilter, error, info};
 use reqwest::redirect::Policy;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 use kurp::app_state::AppState;
 use kurp::clients::komga_client::KomgaClient;
@@ -14,102 +16,206 @@ use kurp::clients::proxy_client::ProxyClient;
 use kurp::config::app_config::AppConfig;
 use kurp::server;
 use kurp::tags_provider::UpscaleTagChecker;
-use kurp::upscaler::upscale_actor::{UpscaleSupervisorActor, UpscaleSupervisorMessage};
+use kurp::upscaler::book_profile::BookProfileManager;
+use kurp::upscaler::upscaler::UpscaleEngine;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() {
-    env_logger::Builder::new()
-        .filter_level(LevelFilter::Info)
-        .filter_module("ractor", LevelFilter::Warn)
-        .parse_default_env()
-        .init();
+async fn wait_for_os_shutdown() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
 
-    // Size Rayon global thread pool to physical cores (8 on Ryzen 7 9800X3D)
-    // to prevent SMT thread oversubscription against Tokio and NCNN/Vulkan worker threads.
-    let rayon_threads = std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).clamp(4, 8))
-        .unwrap_or(8);
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(rayon_threads)
-        .build_global();
-
-    let (upscale_actor, _) = Actor::spawn(None, UpscaleSupervisorActor, ())
-        .await
-        .expect("Failed to start Upscale Actor!");
-
-    let mut current_config = match AppConfig::new() {
-        Ok(cfg) => Arc::new(cfg),
-        Err(e) => {
-            log::error!("Failed to load configuration: {}. Exiting.", e);
-            return;
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                let _ = sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
         }
     };
 
-    loop {
-        upscale_actor.send_message(UpscaleSupervisorMessage::Destroy)
-            .expect("Failed to send Upscaler Destroy message");
-
-        match AppConfig::new() {
-            Ok(cfg) => {
-                current_config = Arc::new(cfg);
+    #[cfg(windows)]
+    let terminate = async {
+        match tokio::signal::windows::ctrl_close() {
+            Ok(mut sig) => {
+                let _ = sig.recv().await;
             }
-            Err(e) => {
-                log::error!("Failed to reload config: {}. Retaining previous configuration.", e);
-            }
+            Err(_) => std::future::pending::<()>().await,
         }
-        let config = current_config.clone();
-        upscale_actor.send_message(UpscaleSupervisorMessage::Init(config.clone()))
-            .expect("Failed to send Upscaler Init message");
+    };
 
-        let (tx, graceful_shutdown_rx) = broadcast::channel::<()>(10);
+    #[cfg(not(any(unix, windows)))]
+    let terminate = std::future::pending::<()>();
 
-        let reqwest_client = reqwest::Client::builder()
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C / SIGINT; initiating graceful shutdown");
+        }
+        _ = terminate => {
+            info!("Received OS termination signal; initiating graceful shutdown");
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    env_logger::Builder::new()
+        .filter_level(LevelFilter::Info)
+        .parse_default_env()
+        .init();
+
+    // Load and validate configuration once at startup.
+    let initial_config = match AppConfig::new() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            error!("Failed to load configuration: {e}. Exiting.");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(e) = initial_config.validate() {
+        error!("Invalid configuration: {e}. Exiting.");
+        return ExitCode::FAILURE;
+    }
+
+    // Configure Rayon only when explicitly overridden; otherwise use hardware-agnostic default.
+    if let Some(threads) = initial_config.rayon_threads {
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+        {
+            error!("Failed to configure Rayon thread pool ({threads} threads): {e}");
+        } else {
+            info!("Configured Rayon thread pool with {threads} threads");
+        }
+    }
+
+    let upscaler = match UpscaleEngine::init(&initial_config).await {
+        Ok(engine) => Arc::new(engine),
+        Err(e) => {
+            error!("Failed to initialize Real-CUGAN upscaler: {e}. Exiting.");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let shared_config = Arc::new(ArcSwap::from_pointee(initial_config));
+    let os_exit_flag = Arc::new(AtomicBool::new(false));
+    let (os_shutdown_tx, _) = broadcast::channel::<()>(4);
+
+    {
+        let os_flag = os_exit_flag.clone();
+        let os_tx = os_shutdown_tx.clone();
+        tokio::spawn(async move {
+            wait_for_os_shutdown().await;
+            os_flag.store(true, Ordering::SeqCst);
+            let _ = os_tx.send(());
+        });
+    }
+
+    let mut exit_code = ExitCode::SUCCESS;
+
+    loop {
+        if os_exit_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let cfg = shared_config.load_full();
+        let reqwest_client = match reqwest::Client::builder()
             .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(10))
             .tcp_nodelay(true)
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
             .build()
-            .expect("Reqwest client couldn't build");
+        {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Failed to build HTTP client: {e}");
+                exit_code = ExitCode::FAILURE;
+                break;
+            }
+        };
 
-        let upstream_url = match Uri::from_str(config.upstream_url.as_str()) {
+        let upstream_url = match Uri::from_str(cfg.upstream_url.trim()) {
             Ok(u) => u,
             Err(e) => {
-                log::error!("Invalid upstream URL '{}': {}. Falling back to http://localhost:8080", config.upstream_url, e);
-                Uri::from_static("http://localhost:8080")
+                error!("Invalid upstream URL '{}': {e}", cfg.upstream_url);
+                exit_code = ExitCode::FAILURE;
+                break;
             }
         };
         let upstream_url_raw = upstream_url.to_string();
-        let upstream_url_str = upstream_url_raw.strip_suffix('/').unwrap_or(&upstream_url_raw).to_string();
-        let komga_client = Arc::new(KomgaClient::new(reqwest_client.clone(), upstream_url_str.clone()));
+        let upstream_url_str = upstream_url_raw
+            .strip_suffix('/')
+            .unwrap_or(&upstream_url_raw)
+            .to_string();
 
+        let komga_client = Arc::new(KomgaClient::new(
+            reqwest_client.clone(),
+            upstream_url_str.clone(),
+        ));
         let tag_provider = Arc::new(UpscaleTagChecker::new(
-            config.upscale_tag.clone(),
+            cfg.upscale_tag.clone(),
             komga_client.clone(),
         ));
-
-        let upscale_call_cache = Cache::new(1_000);
-        let proxy_client = ProxyClient::new(reqwest_client, upstream_url_str);
-
-        let book_profile_manager = Arc::new(kurp::upscaler::book_profile::BookProfileManager::new(
+        let proxy_client = Arc::new(ProxyClient::new(reqwest_client, upstream_url_str));
+        let book_profile_manager = Arc::new(BookProfileManager::new(
             komga_client.clone(),
-            config.auto_levels.book_profile.cache_size,
-            config.auto_levels.book_profile.parallel_page_fetches,
-            config.auto_levels.book_profile.timeout_seconds,
+            &cfg.auto_levels.book_profile,
         ));
+        let pipeline_semaphore = Arc::new(Semaphore::new(cfg.max_concurrent_pipelines.max(1)));
+
+        let (reload_tx, mut reload_rx) = broadcast::channel::<()>(8);
+        let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel::<()>(4);
+
+        let mut os_rx = os_shutdown_tx.subscribe();
+        let forward_tx = server_shutdown_tx.clone();
+        let reload_tx_for_os = reload_tx.clone();
+        let forwarder = tokio::spawn(async move {
+            tokio::select! {
+                _ = os_rx.recv() => {
+                    let _ = forward_tx.send(());
+                    let _ = reload_tx_for_os.send(());
+                }
+                _ = reload_rx.recv() => {
+                    let _ = forward_tx.send(());
+                }
+            }
+        });
 
         let state = AppState {
-            config,
-            upscaler: upscale_actor.clone(),
-            proxy_client: Arc::new(proxy_client),
-            upscale_call_history_cache: Arc::new(upscale_call_cache),
+            config: shared_config.clone(),
+            upscaler: upscaler.clone(),
+            komga_client,
+            proxy_client,
             upscale_tag_checker: tag_provider,
             book_profile_manager,
-            shutdown_tx: tx,
+            pipeline_semaphore,
+            shutdown_tx: reload_tx,
         };
-        server::start(state, graceful_shutdown_rx).await;
+
+        let server_result = server::start(state, server_shutdown_rx).await;
+        forwarder.abort();
+
+        if let Err(e) = server_result {
+            error!("HTTP server failed on port {}: {e}", cfg.port);
+            exit_code = ExitCode::FAILURE;
+            break;
+        }
+
+        if os_exit_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        info!("Listener restarted for updated configuration");
     }
+
+    // Explicitly drop Real-CUGAN handles before returning from `main()` so NCNN's C `atexit`
+    // Vulkan teardown never races with a live handle.
+    upscaler.shutdown();
+    exit_code
 }

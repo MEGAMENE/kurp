@@ -1,4 +1,4 @@
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct KomgaSeries {
@@ -6,14 +6,10 @@ pub struct KomgaSeries {
     pub metadata: KomgaSeriesMetadata,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct KomgaSeriesMetadata {
+    #[serde(default)]
     pub tags: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct KomgaSeriesMetadataUpdate {
-    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -24,14 +20,10 @@ pub struct KomgaBook {
     pub metadata: KomgaBookMetadata,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct KomgaBookMetadata {
+    #[serde(default)]
     pub tags: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct KomgaBookMetadataUpdate {
-    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -47,4 +39,6 @@ pub struct KomgaPageInfo {
     pub height: Option<u32>,
     #[serde(rename = "sizeBytes", default)]
     pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub size: Option<String>,
 }
