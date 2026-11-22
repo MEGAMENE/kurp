@@ -10,7 +10,8 @@ use kurp::config::app_config::AutoLevelsConfig;
 use kurp::upscaler::auto_levels::{
     CorrectionPlan, DefectType, Outcome, PageClassification, PaperCastField,
     build_monotonic_tone_lut, build_monotonic_tone_lut_gamma, detect_elevated_black_floor,
-    level_and_verify, quality_tier_1, quality_tier_2, quality_tier_3,
+    level_and_verify, level_and_verify_with_ssim_override, quality_tier_1, quality_tier_2,
+    quality_tier_3,
 };
 use kurp::upscaler::avif::{
     decode_image_with_metadata, display_p3_icc, is_avif_bytes, parse_avif_color_info,
@@ -228,7 +229,6 @@ fn test_tier2_fritsch_carlson_zero_inversion_nan_and_gamma_monotonicity() {
 
 #[test]
 fn test_tier2_shadow_detector_bounds_3_5pct_cap_and_85_ink_ceiling() {
-    let config = AutoLevelsConfig::default();
     let total = 100_000u32;
 
     // 1. M_zero >= 0.035 strictly vetoes black floor elevation
@@ -236,16 +236,14 @@ fn test_tier2_shadow_detector_bounds_3_5pct_cap_and_85_ink_ceiling() {
     hist_cap[0] = 3500; // 3.5%
     hist_cap[22] = 10_000;
     hist_cap[255] = total - hist_cap[0] - hist_cap[22];
-    assert!(
-        detect_elevated_black_floor(&hist_cap, PageClassification::Monochrome, &config).is_none()
-    );
+    assert!(detect_elevated_black_floor(&hist_cap, PageClassification::Monochrome).is_none());
 
     // 2. Ink peak at Y=74 (> 65, <= 85) MUST be reachable (M_ink integrates [3..=85])
     let mut hist_74 = [0u32; 256];
     hist_74[0] = 800; // 0.8% spike
     hist_74[74] = 8000; // 8.0% washed ink in [66..=85]
     hist_74[250] = total - hist_74[0] - hist_74[74];
-    let det_74 = detect_elevated_black_floor(&hist_74, PageClassification::Monochrome, &config)
+    let det_74 = detect_elevated_black_floor(&hist_74, PageClassification::Monochrome)
         .expect("Washed ink peak at Y=74 (<= 85) must be reachable and validated");
     assert!(matches!(
         det_74,
@@ -257,16 +255,11 @@ fn test_tier2_shadow_detector_bounds_3_5pct_cap_and_85_ink_ceiling() {
     hist_no_valley[0] = 500;
     hist_no_valley[20..=145].fill(500);
     hist_no_valley[255] = total - hist_no_valley.iter().sum::<u32>();
-    assert!(
-        detect_elevated_black_floor(&hist_no_valley, PageClassification::Monochrome, &config)
-            .is_none()
-    );
+    assert!(detect_elevated_black_floor(&hist_no_valley, PageClassification::Monochrome).is_none());
 }
 
 #[test]
 fn test_tier2_quality_guards_genuine_rejections_and_2mp_untouched_rollback() {
-    let config = AutoLevelsConfig::default();
-
     // Genuine Tier 1 rejection: inverted luminance
     let (w, h) = (128u32, 128u32);
     let orig_grad =
@@ -275,7 +268,7 @@ fn test_tier2_quality_guards_genuine_rejections_and_2mp_untouched_rollback() {
         Luma([255u8.saturating_sub((x * 2).min(255) as u8)])
     }));
     assert_eq!(
-        quality_tier_1(&orig_grad, &inv_grad, &CorrectionPlan::default(), &config).outcome,
+        quality_tier_1(&orig_grad, &inv_grad, &CorrectionPlan::default()).outcome,
         Outcome::Reject
     );
 
@@ -304,7 +297,6 @@ fn test_tier2_quality_guards_genuine_rejections_and_2mp_untouched_rollback() {
             &sky_bleached,
             PageClassification::Mixed,
             &cast_plan,
-            &config
         )
         .outcome,
         Outcome::Reject
@@ -318,7 +310,7 @@ fn test_tier2_quality_guards_genuine_rejections_and_2mp_untouched_rollback() {
         Luma([if (x + y).is_multiple_of(2) { 118 } else { 122 }])
     }));
     assert_eq!(
-        quality_tier_3(&mid_orig, &mid_crushed, &CorrectionPlan::default(), &config).outcome,
+        quality_tier_3(&mid_orig, &mid_crushed, &CorrectionPlan::default()).outcome,
         Outcome::Reject
     );
 
@@ -333,7 +325,7 @@ fn test_tier2_quality_guards_genuine_rejections_and_2mp_untouched_rollback() {
         ..CorrectionPlan::default()
     };
     assert_eq!(
-        quality_tier_3(&bubble_orig, &bubble_white, &wp_plan, &config).outcome,
+        quality_tier_3(&bubble_orig, &bubble_white, &wp_plan).outcome,
         Outcome::Pass
     );
 
@@ -341,9 +333,8 @@ fn test_tier2_quality_guards_genuine_rejections_and_2mp_untouched_rollback() {
     let _guard = RAYON_BENCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let m4_2mp = generate_m4_aged_paper_page(2000, 1200);
     let orig_raw = m4_2mp.as_rgb8().unwrap().as_raw().clone();
-    let mut reject_cfg = AutoLevelsConfig::default();
-    reject_cfg.quality_guards.tier2.ssim_threshold = 1.01;
-    let (rolled_back, info, verdict) = level_and_verify(m4_2mp, None, &reject_cfg);
+    let (rolled_back, info, verdict) =
+        level_and_verify_with_ssim_override(m4_2mp, &AutoLevelsConfig::default(), 1.01);
     assert!(!info.was_leveled);
     assert_eq!(verdict.outcome, Outcome::Reject);
     assert!(verdict.attenuation_attempted);

@@ -13,6 +13,23 @@ use serde::{Deserialize, Serialize};
 use crate::config::app_config::AutoLevelsConfig;
 use crate::upscaler::book_profile::BookProfile;
 
+// Calibrated pipeline & Quality Guard constants (kept internal so `config.yml` stays minimal)
+const BLACK_CLIP_PERCENT: f64 = 0.1;
+const WHITE_CLIP_PERCENT: f64 = 0.1;
+const PROTECT_SEPIA_ARTWORK: bool = true;
+const MAX_BLACK_SHIFT: u8 = 85;
+const MIN_WHITE_THRESHOLD: u8 = 200;
+const DEFAULT_GAMMA: f32 = 1.0;
+
+const GUARD_TIER1_CHECK_TAIL_EROSION: bool = true;
+const GUARD_TIER1_MIN_DYNAMIC_RANGE: f32 = 64.0;
+const GUARD_TIER2_SSIM_THRESHOLD: f32 = 0.92;
+const GUARD_TIER2_CHROMA_DELTA_P95: f32 = 2.5;
+const GUARD_TIER2_CHROMA_DELTA_MEDIAN: f32 = 1.5;
+const GUARD_TIER3_GRADIENT_NCC: f32 = 0.90;
+const GUARD_TIER3_MIN_CONTRAST_RATIO: f32 = 0.50;
+const GUARD_TIER3_STRIDE: usize = 4;
+
 // ============================================================================
 // Precomputed Fast CIELAB Lookup Tables (D65, std::sync::LazyLock)
 // ============================================================================
@@ -1080,8 +1097,12 @@ fn empty_page_analysis(hist_y: [u32; 256]) -> PageAnalysis {
 pub fn analyze_page(
     image: &DynamicImage,
     _page_number: usize,
-    config: &AutoLevelsConfig,
+    _config: &AutoLevelsConfig,
 ) -> PageAnalysis {
+    analyze_page_with_min_white(image, MIN_WHITE_THRESHOLD)
+}
+
+fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) -> PageAnalysis {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
         return empty_page_analysis([0; 256]);
@@ -1090,16 +1111,28 @@ pub fn analyze_page(
     // Normalize 16-bit and 32F formats cleanly without dropping luma or alpha semantics
     match image {
         DynamicImage::ImageLuma16(_) => {
-            return analyze_page(&DynamicImage::ImageLuma8(image.to_luma8()), _page_number, config);
+            return analyze_page_with_min_white(
+                &DynamicImage::ImageLuma8(image.to_luma8()),
+                min_white_threshold,
+            );
         }
         DynamicImage::ImageLumaA16(_) => {
-            return analyze_page(&DynamicImage::ImageLumaA8(image.to_luma_alpha8()), _page_number, config);
+            return analyze_page_with_min_white(
+                &DynamicImage::ImageLumaA8(image.to_luma_alpha8()),
+                min_white_threshold,
+            );
         }
         DynamicImage::ImageRgb16(_) | DynamicImage::ImageRgb32F(_) => {
-            return analyze_page(&DynamicImage::ImageRgb8(image.to_rgb8()), _page_number, config);
+            return analyze_page_with_min_white(
+                &DynamicImage::ImageRgb8(image.to_rgb8()),
+                min_white_threshold,
+            );
         }
         DynamicImage::ImageRgba16(_) | DynamicImage::ImageRgba32F(_) => {
-            return analyze_page(&DynamicImage::ImageRgba8(image.to_rgba8()), _page_number, config);
+            return analyze_page_with_min_white(
+                &DynamicImage::ImageRgba8(image.to_rgba8()),
+                min_white_threshold,
+            );
         }
         _ => {}
     }
@@ -1357,7 +1390,7 @@ pub fn analyze_page(
     };
 
     let is_intentional_sepia = !is_already_luma
-        && config.detection.protect_sepia_artwork
+        && PROTECT_SEPIA_ARTWORK
         && acc.sh_lab_count >= min_sh_samples
         && paper_b >= 6.0
         && shadow_b >= 5.0
@@ -1499,7 +1532,7 @@ pub fn analyze_page(
     let mut defects = Vec::new();
 
     if !high_key_veto
-        && let Some(d) = detect_elevated_black_floor(&acc.hist_y, classification, config)
+        && let Some(d) = detect_elevated_black_floor(&acc.hist_y, classification)
     {
         if let DefectType::ElevatedBlackFloor {
             floor_value,
@@ -1524,7 +1557,7 @@ pub fn analyze_page(
 
     // 6. Already-Optimal Dynamic Range Veto
     let eff_white = find_effective_white(&acc.hist_y, p99_y);
-    let gamma_is_identity = (config.correction.gamma - 1.0).abs() < 1e-3;
+    let gamma_is_identity = (DEFAULT_GAMMA - 1.0).abs() < 1e-3;
     if p1_y <= 1.0
         && p99_y >= 254.0
         && eff_white >= 254.0
@@ -1551,7 +1584,8 @@ pub fn analyze_page(
         }
 
         if !high_key_veto
-            && let Some(d) = detect_dull_highlights(&acc.hist_y, classification, config)
+            && let Some(d) =
+                detect_dull_highlights_with_min_white(&acc.hist_y, classification, min_white_threshold)
         {
             if let DefectType::DullHighlights { white_point } = d {
                 analysis.white_ceiling = white_point;
@@ -1599,7 +1633,6 @@ fn populate_luma_paper_peak(
 pub fn detect_elevated_black_floor(
     hist: &[u32; 256],
     classification: PageClassification,
-    config: &AutoLevelsConfig,
 ) -> Option<DefectType> {
     if classification == PageClassification::Color {
         return None;
@@ -1660,7 +1693,7 @@ pub fn detect_elevated_black_floor(
         (val, val >= 8.0)
     } else {
         // No digital black spike (m_zero <= 0.05%)
-        let clip_bp = histogram_percentile(hist, hist_total, config.detection.black_clip_percent as f64);
+        let clip_bp = histogram_percentile(hist, hist_total, BLACK_CLIP_PERCENT);
         let cand_lo = if p1 >= 2.0 { p1.max(clip_bp) } else { clip_bp };
         if cand_lo < 2.0 {
             return None;
@@ -1681,11 +1714,18 @@ pub fn detect_elevated_black_floor(
 }
 
 /// Detects dull paper highlights using `hist_total`, unified `p95 >= 130` low-key guard,
-/// validated bimodal `find_effective_white`, and strict `min_white_threshold` enforcement.
+/// validated bimodal `find_effective_white`, and strict `MIN_WHITE_THRESHOLD` enforcement.
 pub fn detect_dull_highlights(
     hist: &[u32; 256],
     classification: PageClassification,
-    config: &AutoLevelsConfig,
+) -> Option<DefectType> {
+    detect_dull_highlights_with_min_white(hist, classification, MIN_WHITE_THRESHOLD)
+}
+
+fn detect_dull_highlights_with_min_white(
+    hist: &[u32; 256],
+    classification: PageClassification,
+    min_white_threshold: u8,
 ) -> Option<DefectType> {
     if classification == PageClassification::Color {
         return None;
@@ -1703,7 +1743,7 @@ pub fn detect_dull_highlights(
 
     let p99 = histogram_percentile(hist, hist_total, 99.0);
     let eff_white = find_effective_white(hist, p99);
-    let raw_wp = histogram_reverse_percentile(hist, hist_total, config.detection.white_clip_percent as f64);
+    let raw_wp = histogram_reverse_percentile(hist, hist_total, WHITE_CLIP_PERCENT);
 
     let white_point = if eff_white < p99 - 1.0 {
         (p99 - (p99 - eff_white) * 0.85).round() as u8
@@ -1711,7 +1751,7 @@ pub fn detect_dull_highlights(
         (raw_wp.min(p99)).round() as u8
     };
 
-    if white_point >= 254 || white_point < config.correction.min_white_threshold {
+    if white_point >= 254 || white_point < min_white_threshold {
         return None;
     }
 
@@ -1727,7 +1767,7 @@ pub fn generate_correction_plan(
     config: &AutoLevelsConfig,
 ) -> CorrectionPlan {
     let mut plan = CorrectionPlan {
-        gamma: config.correction.gamma.clamp(0.2, 5.0),
+        gamma: DEFAULT_GAMMA.clamp(0.2, 5.0),
         cast_field: analysis.paper_cast.clone(),
         has_muddy_shadow_cast: analysis.has_muddy_shadow_cast,
         has_high_chroma_accents: analysis.has_high_chroma_accents,
@@ -1742,14 +1782,14 @@ pub fn generate_correction_plan(
     for defect in &analysis.defects {
         match *defect {
             DefectType::ElevatedBlackFloor { floor_value, .. } => {
-                let clamped = floor_value.min(config.correction.max_black_shift);
+                let clamped = floor_value.min(MAX_BLACK_SHIFT);
                 plan.black_point = plan.black_point.max(clamped);
             }
             DefectType::DullHighlights { white_point } => {
                 plan.white_point = plan.white_point.min(white_point);
             }
             DefectType::PaperCast { .. } => {
-                if config.correction.correct_paper_cast {
+                if config.correct_paper_cast {
                     plan.cast_strength = 1.0;
                 }
             }
@@ -1759,10 +1799,10 @@ pub fn generate_correction_plan(
     if plan.black_point <= 1 {
         plan.black_point = 0;
     }
-    if plan.black_point > config.correction.max_black_shift {
-        plan.black_point = config.correction.max_black_shift;
+    if plan.black_point > MAX_BLACK_SHIFT {
+        plan.black_point = MAX_BLACK_SHIFT;
     }
-    if plan.white_point >= 254 || plan.white_point < config.correction.min_white_threshold {
+    if plan.white_point >= 254 || plan.white_point < MIN_WHITE_THRESHOLD {
         plan.white_point = 255;
     }
     if (plan.white_point as i32 - plan.black_point as i32) < 15 {
@@ -1775,7 +1815,7 @@ pub fn generate_correction_plan(
     let tonal_active =
         plan.black_point > 0 || plan.white_point < 255 || (plan.gamma - 1.0).abs() >= 1e-3;
     if analysis.classification == PageClassification::Monochrome
-        && config.correction.correct_paper_cast
+        && config.correct_paper_cast
         && tonal_active
     {
         plan.cast_strength = 1.0;
@@ -1942,6 +1982,116 @@ fn compute_cast_weight_at(
     compute_cast_weight_with_env(l_star, a_star, b_star, a_env, b_env, plan)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn eval_accent_px<const CHANNELS: usize>(
+    px: &[u8; CHANNELS],
+    prev_key0: &mut u32,
+    prev_acc0: &mut bool,
+    prev_key1: &mut u32,
+    prev_acc1: &mut bool,
+    cast_active: bool,
+    dom_u_a: f32,
+    dom_u_b: f32,
+    cast_cap: f32,
+    tables: &FastLabTables,
+) -> bool {
+    if CHANNELS == 4 && px[3] == 0 {
+        return false;
+    }
+    let (r, g, b) = (px[0], px[1], px[2]);
+    // Mathematical sRGB bound: rgb_diff < 30 can never reach CIELAB C* >= 20.0 (subsumes r==g==b)
+    let rgb_diff = r.max(g).max(b) - r.min(g).min(b);
+    if rgb_diff < 30 {
+        return false;
+    }
+    let key = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+    if key == *prev_key0 {
+        return *prev_acc0;
+    }
+    if key == *prev_key1 {
+        return *prev_acc1;
+    }
+    let (l_star, a_star, b_star) = rgb_to_lab_with_tables(tables, r, g, b);
+    let c_sq = a_star * a_star + b_star * b_star;
+    let hit = if c_sq < 400.0 {
+        false
+    } else if cast_active && l_star >= 65.0 {
+        let c_par = a_star * dom_u_a + b_star * dom_u_b;
+        let c_perp = (a_star * dom_u_b - b_star * dom_u_a).abs();
+        !(c_par >= 0.0 && c_par <= cast_cap && c_perp <= 5.0)
+    } else {
+        true
+    };
+    *prev_key1 = *prev_key0;
+    *prev_acc1 = *prev_acc0;
+    *prev_key0 = key;
+    *prev_acc0 = hit;
+    hit
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn scan_accent_16<const CHANNELS: usize>(
+    b16: &[[u8; CHANNELS]; 16],
+    prev_key0: &mut u32,
+    prev_acc0: &mut bool,
+    prev_key1: &mut u32,
+    prev_acc1: &mut bool,
+    cast_active: bool,
+    dom_u_a: f32,
+    dom_u_b: f32,
+    cast_cap: f32,
+    tables: &FastLabTables,
+) -> u64 {
+    let mut any_cand = 0u8;
+    for px in b16 {
+        let d = px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2]);
+        any_cand |= (d >= 30) as u8;
+    }
+    if any_cand == 0 {
+        return 0;
+    }
+    let p0 = b16[0];
+    let mut all_eq = true;
+    for px in &b16[1..] {
+        all_eq &= *px == p0;
+    }
+    if all_eq {
+        let hit = eval_accent_px(
+            &p0,
+            prev_key0,
+            prev_acc0,
+            prev_key1,
+            prev_acc1,
+            cast_active,
+            dom_u_a,
+            dom_u_b,
+            cast_cap,
+            tables,
+        );
+        return if hit { 0xFFFF } else { 0 };
+    }
+    let mut sub = 0u64;
+    for (k, px) in b16.iter().enumerate() {
+        if eval_accent_px(
+            px,
+            prev_key0,
+            prev_acc0,
+            prev_key1,
+            prev_acc1,
+            cast_active,
+            dom_u_a,
+            dom_u_b,
+            cast_cap,
+            tables,
+        ) {
+            sub |= 1u64 << k;
+        }
+    }
+    sub
+}
+
 #[inline(always)]
 fn scan_accent_row<const CHANNELS: usize>(
     row_raw: &[u8],
@@ -1953,56 +2103,104 @@ fn scan_accent_row<const CHANNELS: usize>(
     tables: &FastLabTables,
 ) -> u8 {
     let chunks = row_raw.as_chunks::<CHANNELS>().0;
+    let (blocks16, tail) = chunks.as_chunks::<16>();
     let mut prev_key0 = u32::MAX;
     let mut prev_acc0 = false;
     let mut prev_key1 = u32::MAX;
     let mut prev_acc1 = false;
     let mut any = 0u8;
+    let mut wi = 0usize;
+    let (word_chunks, rem_blocks) = blocks16.as_chunks::<4>();
 
-    for (wi, block) in chunks.chunks(64).enumerate() {
+    for word_blocks in word_chunks {
+        let m0 = scan_accent_16(
+            &word_blocks[0],
+            &mut prev_key0,
+            &mut prev_acc0,
+            &mut prev_key1,
+            &mut prev_acc1,
+            cast_active,
+            dom_u_a,
+            dom_u_b,
+            cast_cap,
+            tables,
+        );
+        let m1 = scan_accent_16(
+            &word_blocks[1],
+            &mut prev_key0,
+            &mut prev_acc0,
+            &mut prev_key1,
+            &mut prev_acc1,
+            cast_active,
+            dom_u_a,
+            dom_u_b,
+            cast_cap,
+            tables,
+        );
+        let m2 = scan_accent_16(
+            &word_blocks[2],
+            &mut prev_key0,
+            &mut prev_acc0,
+            &mut prev_key1,
+            &mut prev_acc1,
+            cast_active,
+            dom_u_a,
+            dom_u_b,
+            cast_cap,
+            tables,
+        );
+        let m3 = scan_accent_16(
+            &word_blocks[3],
+            &mut prev_key0,
+            &mut prev_acc0,
+            &mut prev_key1,
+            &mut prev_acc1,
+            cast_active,
+            dom_u_a,
+            dom_u_b,
+            cast_cap,
+            tables,
+        );
+        let word = m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
+        mask_row[wi] = word;
+        if word != 0 {
+            any = 1;
+        }
+        wi += 1;
+    }
+
+    if !rem_blocks.is_empty() || !tail.is_empty() {
         let mut word = 0u64;
-        for (bit, px) in block.iter().enumerate() {
-            let (r, g, b) = (px[0], px[1], px[2]);
-            let key = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
-            if key == prev_key0 {
-                if prev_acc0 && (CHANNELS != 4 || px[CHANNELS - 1] != 0) {
-                    word |= 1u64 << bit;
-                }
-                continue;
-            }
-            if key == prev_key1 {
-                if prev_acc1 && (CHANNELS != 4 || px[CHANNELS - 1] != 0) {
-                    word |= 1u64 << bit;
-                }
-                continue;
-            }
-            // Mathematical sRGB bound: rgb_diff < 30 can never reach CIELAB C* >= 20.0 (subsumes r==g==b)
-            let rgb_diff = r.max(g).max(b) - r.min(g).min(b);
-            if rgb_diff < 30 {
-                prev_key1 = key;
-                prev_acc1 = false;
-                continue;
-            }
-            if CHANNELS == 4 && px[CHANNELS - 1] == 0 {
-                continue;
-            }
-            let (l_star, a_star, b_star) = rgb_to_lab_with_tables(tables, r, g, b);
-            let c_sq = a_star * a_star + b_star * b_star;
-            let hit = if c_sq < 400.0 {
-                false
-            } else if cast_active && l_star >= 65.0 {
-                let c_par = a_star * dom_u_a + b_star * dom_u_b;
-                let c_perp = (a_star * dom_u_b - b_star * dom_u_a).abs();
-                !(c_par >= 0.0 && c_par <= cast_cap && c_perp <= 5.0)
-            } else {
-                true
-            };
-            prev_key1 = prev_key0;
-            prev_acc1 = prev_acc0;
-            prev_key0 = key;
-            prev_acc0 = hit;
-            if hit {
-                word |= 1u64 << bit;
+        let mut bit_off = 0usize;
+        for b16 in rem_blocks {
+            word |= scan_accent_16(
+                b16,
+                &mut prev_key0,
+                &mut prev_acc0,
+                &mut prev_key1,
+                &mut prev_acc1,
+                cast_active,
+                dom_u_a,
+                dom_u_b,
+                cast_cap,
+                tables,
+            ) << bit_off;
+            bit_off += 16;
+        }
+        for (k, px) in tail.iter().enumerate() {
+            if eval_accent_px(
+                px,
+                &mut prev_key0,
+                &mut prev_acc0,
+                &mut prev_key1,
+                &mut prev_acc1,
+                cast_active,
+                dom_u_a,
+                dom_u_b,
+                cast_cap,
+                tables,
+            ) {
+                word |= 1u64 << (bit_off + k);
             }
         }
         mask_row[wi] = word;
@@ -2091,7 +2289,7 @@ struct MixedPixelCache {
     hi_y_old: i32,
     hi_y_new: i32,
     hi_lab: (f32, f32, f32),
-    hi_out: (u8, u8, u8),
+    hi_out: [u8; 4],
     /// Shadow/dark cache (`y_old < 120`, spatially invariant — never invalidated!).
     lo_key: u32,
     lo_out: (u8, u8, u8),
@@ -2106,7 +2304,7 @@ impl MixedPixelCache {
             hi_y_old: 0,
             hi_y_new: 0,
             hi_lab: (0.0, 0.0, 0.0),
-            hi_out: (0, 0, 0),
+            hi_out: [0, 0, 0, 255],
             lo_key: u32::MAX,
             lo_out: (0, 0, 0),
         }
@@ -2129,7 +2327,7 @@ impl MixedPixelCache {
         } else {
             256
         };
-        self.hi_out = if retain_q8 <= 0 {
+        let out = if retain_q8 <= 0 {
             let o = y_new as u8;
             (o, o, o)
         } else {
@@ -2138,7 +2336,236 @@ impl MixedPixelCache {
             let db = ((b as i32 - y_old) * retain_q8 + 128) >> 8;
             apply_chroma_preserving_luma_shift(y_new, dr, dg, db)
         };
+        self.hi_out = [out.0, out.1, out.2, 255];
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn apply_mixed_pixel_slow<const CHANNELS: usize>(
+    chunk: &mut [u8; CHANNELS],
+    r: u8,
+    g: u8,
+    b: u8,
+    key: u32,
+    ctx: &MixedSpanCtx<'_>,
+    cache: &mut MixedPixelCache,
+    hi_key: &mut u32,
+    hi_out: &mut [u8; 4],
+    lo_key: &mut u32,
+    lo_out: &mut (u8, u8, u8),
+) {
+    if r == g && g == b {
+        let out = ctx.lut_y[r as usize];
+        if r < 120 {
+            *lo_key = key;
+            *lo_out = (out, out, out);
+        }
+        chunk[0] = out;
+        chunk[1] = out;
+        chunk[2] = out;
+        return;
+    }
+
+    let y_old = rec709_y(r, g, b) as i32;
+    let y_new = ctx.lut_y[y_old as usize] as i32;
+    let is_hi = y_old >= 120;
+
+    let mut lab = (0.0f32, 0.0f32, 0.0f32);
+    let retain_q8 = if ctx.do_cast && (if is_hi { ctx.c_env > 1e-4 } else { ctx.has_muddy_shadow }) {
+        lab = rgb_to_lab_with_tables(ctx.tables, r, g, b);
+        let w_cast = compute_cast_weight_with_unit(
+            lab.0, lab.1, lab.2, ctx.c_env, ctx.ua, ctx.ub, ctx.plan,
+        );
+        ((1.0 - w_cast) * 256.0).round() as i32
+    } else {
+        if is_hi && ctx.do_cast {
+            lab = rgb_to_lab_with_tables(ctx.tables, r, g, b);
+        }
+        256
+    };
+
+    let out = if retain_q8 <= 0 {
+        let o = y_new as u8;
+        (o, o, o)
+    } else {
+        let dr = ((r as i32 - y_old) * retain_q8 + 128) >> 8;
+        let dg = ((g as i32 - y_old) * retain_q8 + 128) >> 8;
+        let db = ((b as i32 - y_old) * retain_q8 + 128) >> 8;
+        apply_chroma_preserving_luma_shift(y_new, dr, dg, db)
+    };
+
+    if is_hi {
+        *hi_key = key;
+        *hi_out = [out.0, out.1, out.2, 255];
+        cache.hi_rgb = (r, g, b);
+        cache.hi_y_old = y_old;
+        cache.hi_y_new = y_new;
+        cache.hi_lab = lab;
+    } else {
+        *lo_key = key;
+        *lo_out = out;
+    }
+    chunk[0] = out.0;
+    chunk[1] = out.1;
+    chunk[2] = out.2;
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn apply_mixed_one<const CHANNELS: usize>(
+    chunk: &mut [u8; CHANNELS],
+    ctx: &MixedSpanCtx<'_>,
+    cache: &mut MixedPixelCache,
+    hi_key: &mut u32,
+    hi_out: &mut [u8; 4],
+    lo_key: &mut u32,
+    lo_out: &mut (u8, u8, u8),
+    hi_u32: &mut u32,
+) {
+    if CHANNELS == 4 {
+        let raw32 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if raw32 == *hi_u32 {
+            chunk[0] = hi_out[0];
+            chunk[1] = hi_out[1];
+            chunk[2] = hi_out[2];
+            chunk[3] = 255;
+            return;
+        }
+        if (raw32 >> 24) == 0 {
+            return;
+        }
+        let key = raw32 & 0x00FF_FFFF;
+        if key == *hi_key {
+            chunk[0] = hi_out[0];
+            chunk[1] = hi_out[1];
+            chunk[2] = hi_out[2];
+            return;
+        }
+        if key == *lo_key {
+            chunk[0] = lo_out.0;
+            chunk[1] = lo_out.1;
+            chunk[2] = lo_out.2;
+            return;
+        }
+        apply_mixed_pixel_slow(
+            chunk,
+            chunk[0],
+            chunk[1],
+            chunk[2],
+            key,
+            ctx,
+            cache,
+            hi_key,
+            hi_out,
+            lo_key,
+            lo_out,
+        );
+        *hi_u32 = if *hi_key == u32::MAX {
+            0u32
+        } else {
+            *hi_key | 0xFF00_0000
+        };
+    } else {
+        let (r, g, b) = (chunk[0], chunk[1], chunk[2]);
+        let key = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        if key == *hi_key {
+            chunk[0] = hi_out[0];
+            chunk[1] = hi_out[1];
+            chunk[2] = hi_out[2];
+            return;
+        }
+        if key == *lo_key {
+            chunk[0] = lo_out.0;
+            chunk[1] = lo_out.1;
+            chunk[2] = lo_out.2;
+            return;
+        }
+        apply_mixed_pixel_slow(
+            chunk, r, g, b, key, ctx, cache, hi_key, hi_out, lo_key, lo_out,
+        );
+    }
+}
+
+#[inline(always)]
+fn apply_mixed_span_unmasked<const CHANNELS: usize>(
+    chunks: &mut [[u8; CHANNELS]],
+    ctx: &MixedSpanCtx<'_>,
+    cache: &mut MixedPixelCache,
+) {
+    let mut hi_key = cache.hi_key;
+    let mut hi_out = cache.hi_out;
+    let mut lo_key = cache.lo_key;
+    let mut lo_out = cache.lo_out;
+    let mut hi_u32 = if hi_key == u32::MAX {
+        0u32
+    } else {
+        hi_key | 0xFF00_0000
+    };
+
+    let (groups, tail) = chunks.as_chunks_mut::<4>();
+    for group in groups {
+        if CHANNELS == 4 {
+            let p0 = u32::from_le_bytes([group[0][0], group[0][1], group[0][2], group[0][3]]);
+            let p1 = u32::from_le_bytes([group[1][0], group[1][1], group[1][2], group[1][3]]);
+            let p2 = u32::from_le_bytes([group[2][0], group[2][1], group[2][2], group[2][3]]);
+            let p3 = u32::from_le_bytes([group[3][0], group[3][1], group[3][2], group[3][3]]);
+            if ((p0 ^ hi_u32) | (p1 ^ hi_u32) | (p2 ^ hi_u32) | (p3 ^ hi_u32)) == 0 {
+                for px in group.iter_mut() {
+                    px[0] = hi_out[0];
+                    px[1] = hi_out[1];
+                    px[2] = hi_out[2];
+                    px[3] = 255;
+                }
+                continue;
+            }
+        } else if hi_key != u32::MAX {
+            let hi_r = hi_key as u8;
+            let hi_g = (hi_key >> 8) as u8;
+            let hi_b = (hi_key >> 16) as u8;
+            let m0 = (group[0][0] == hi_r) & (group[0][1] == hi_g) & (group[0][2] == hi_b);
+            let m1 = (group[1][0] == hi_r) & (group[1][1] == hi_g) & (group[1][2] == hi_b);
+            let m2 = (group[2][0] == hi_r) & (group[2][1] == hi_g) & (group[2][2] == hi_b);
+            let m3 = (group[3][0] == hi_r) & (group[3][1] == hi_g) & (group[3][2] == hi_b);
+            if m0 & m1 & m2 & m3 {
+                for px in group.iter_mut() {
+                    px[0] = hi_out[0];
+                    px[1] = hi_out[1];
+                    px[2] = hi_out[2];
+                }
+                continue;
+            }
+        }
+        for px in group.iter_mut() {
+            apply_mixed_one(
+                px,
+                ctx,
+                cache,
+                &mut hi_key,
+                &mut hi_out,
+                &mut lo_key,
+                &mut lo_out,
+                &mut hi_u32,
+            );
+        }
+    }
+    for px in tail {
+        apply_mixed_one(
+            px,
+            ctx,
+            cache,
+            &mut hi_key,
+            &mut hi_out,
+            &mut lo_key,
+            &mut lo_out,
+            &mut hi_u32,
+        );
+    }
+
+    cache.hi_key = hi_key;
+    cache.hi_out = hi_out;
+    cache.lo_key = lo_key;
+    cache.lo_out = lo_out;
 }
 
 #[inline(always)]
@@ -2149,92 +2576,81 @@ fn apply_mixed_span<const CHANNELS: usize, const HAS_MASK: bool>(
     ctx: &MixedSpanCtx<'_>,
     cache: &mut MixedPixelCache,
 ) {
-    let mut hi_key = cache.hi_key;
-    let mut hi_out = cache.hi_out;
-    let mut lo_key = cache.lo_key;
-    let mut lo_out = cache.lo_out;
-
-    for (i, chunk) in chunks.iter_mut().enumerate() {
-        if CHANNELS == 4 && chunk[CHANNELS - 1] == 0 {
-            continue;
-        }
-        if HAS_MASK {
-            let x = x_offset + i;
-            if ((mask_row[x >> 6] >> (x & 63)) & 1) != 0 {
-                continue; // Protect 3x3 dilated high-chroma accent untouched
-            }
-        }
-
-        let (r, g, b) = (chunk[0], chunk[1], chunk[2]);
-        let key = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
-        if key == hi_key {
-            chunk[0] = hi_out.0;
-            chunk[1] = hi_out.1;
-            chunk[2] = hi_out.2;
-            continue;
-        }
-        if key == lo_key {
-            chunk[0] = lo_out.0;
-            chunk[1] = lo_out.1;
-            chunk[2] = lo_out.2;
-            continue;
-        }
-        if r == g && g == b {
-            let out = ctx.lut_y[r as usize];
-            chunk[0] = out;
-            chunk[1] = out;
-            chunk[2] = out;
-            continue;
-        }
-
-        let y_old = rec709_y(r, g, b) as i32;
-        let y_new = ctx.lut_y[y_old as usize] as i32;
-        let is_hi = y_old >= 120;
-
-        let mut lab = (0.0f32, 0.0f32, 0.0f32);
-        let retain_q8 = if ctx.do_cast && (if is_hi { ctx.c_env > 1e-4 } else { ctx.has_muddy_shadow }) {
-            lab = rgb_to_lab_with_tables(ctx.tables, r, g, b);
-            let w_cast = compute_cast_weight_with_unit(
-                lab.0, lab.1, lab.2, ctx.c_env, ctx.ua, ctx.ub, ctx.plan,
-            );
-            ((1.0 - w_cast) * 256.0).round() as i32
-        } else {
-            if is_hi && ctx.do_cast {
-                lab = rgb_to_lab_with_tables(ctx.tables, r, g, b);
-            }
-            256
-        };
-
-        let out = if retain_q8 <= 0 {
-            let o = y_new as u8;
-            (o, o, o)
-        } else {
-            let dr = ((r as i32 - y_old) * retain_q8 + 128) >> 8;
-            let dg = ((g as i32 - y_old) * retain_q8 + 128) >> 8;
-            let db = ((b as i32 - y_old) * retain_q8 + 128) >> 8;
-            apply_chroma_preserving_luma_shift(y_new, dr, dg, db)
-        };
-
-        if is_hi {
-            hi_key = key;
-            hi_out = out;
-            cache.hi_rgb = (r, g, b);
-            cache.hi_y_old = y_old;
-            cache.hi_y_new = y_new;
-            cache.hi_lab = lab;
-        } else {
-            lo_key = key;
-            lo_out = out;
-        }
-        chunk[0] = out.0;
-        chunk[1] = out.1;
-        chunk[2] = out.2;
+    if !HAS_MASK {
+        apply_mixed_span_unmasked(chunks, ctx, cache);
+        return;
     }
 
-    cache.hi_key = hi_key;
-    cache.hi_out = hi_out;
-    cache.lo_key = lo_key;
-    cache.lo_out = lo_out;
+    let len = chunks.len();
+    let mut pos = 0usize;
+    while pos < len {
+        let x = x_offset + pos;
+        let wi = x >> 6;
+        let bit_off = x & 63;
+        if bit_off != 0 || pos + 64 > len {
+            let step = (64 - bit_off).min(len - pos);
+            let mut word = (mask_row[wi] >> bit_off)
+                & if step == 64 { u64::MAX } else { (1u64 << step) - 1 };
+            if word == 0 {
+                apply_mixed_span_unmasked(&mut chunks[pos..pos + step], ctx, cache);
+            } else if word != (if step == 64 { u64::MAX } else { (1u64 << step) - 1 }) {
+                let mut cur = 0usize;
+                while cur < step {
+                    if (word & 1) == 0 {
+                        let z_run = word.trailing_zeros().min((step - cur) as u32) as usize;
+                        apply_mixed_span_unmasked(
+                            &mut chunks[pos + cur..pos + cur + z_run],
+                            ctx,
+                            cache,
+                        );
+                        cur += z_run;
+                        word >>= z_run;
+                    } else {
+                        let o_run = word.trailing_ones().min((step - cur) as u32) as usize;
+                        cur += o_run;
+                        word >>= o_run;
+                    }
+                }
+            }
+            pos += step;
+            continue;
+        }
+
+        // Aligned 64-pixel words: skip full masked words and batch consecutive zero words!
+        let mut w_end = wi;
+        let max_words = (len - pos) >> 6;
+        if mask_row[w_end] == 0 {
+            w_end += 1;
+            while (w_end - wi) < max_words && mask_row[w_end] == 0 {
+                w_end += 1;
+            }
+            let px_count = (w_end - wi) << 6;
+            apply_mixed_span_unmasked(&mut chunks[pos..pos + px_count], ctx, cache);
+            pos += px_count;
+        } else if mask_row[w_end] == u64::MAX {
+            w_end += 1;
+            while (w_end - wi) < max_words && mask_row[w_end] == u64::MAX {
+                w_end += 1;
+            }
+            pos += (w_end - wi) << 6;
+        } else {
+            let mut word = mask_row[w_end];
+            let mut cur = 0usize;
+            while cur < 64 {
+                if (word & 1) == 0 {
+                    let z_run = word.trailing_zeros().min((64 - cur) as u32) as usize;
+                    apply_mixed_span_unmasked(&mut chunks[pos + cur..pos + cur + z_run], ctx, cache);
+                    cur += z_run;
+                    word >>= z_run;
+                } else {
+                    let o_run = word.trailing_ones().min((64 - cur) as u32) as usize;
+                    cur += o_run;
+                    word >>= o_run;
+                }
+            }
+            pos += 64;
+        }
+    }
 }
 
 #[inline(always)]
@@ -2309,9 +2725,9 @@ fn apply_rgb_core<const CHANNELS: usize>(
         return;
     }
 
-    const STRIP_ROWS: usize = 48;
+    const STRIP_ROWS: usize = 192;
     let row_bytes = w * CHANNELS;
-    let use_parallel = w * h > 250_000;
+    let use_parallel = w * h >= 64_000;
 
     // Fast 1-pass Monochrome path (zero per-pixel LAB math, sequential on tile samples / coarse Rayon strips on full frames)
     if classification == PageClassification::Monochrome {
@@ -2383,7 +2799,13 @@ fn apply_rgb_core<const CHANNELS: usize>(
     // Single-pass fused 3x3 dilated accent mask: when running in parallel across STRIP_ROWS strips,
     // pre-scan ONLY the 2 boundary seam rows per strip (~4% of image) from pristine `raw` so each
     // strip dilates in a tiny L1d-resident 3-row rolling bitmask with ZERO full-frame extra pass!
-    let strip_rows = if use_parallel { STRIP_ROWS } else { h };
+    let strip_rows = if !use_parallel {
+        h
+    } else if w * h <= 300_000 {
+        h.div_ceil(4).clamp(32, 128)
+    } else {
+        STRIP_ROWS
+    };
     let num_strips = h.div_ceil(strip_rows);
     let num_seams = if do_accents && num_strips > 1 {
         num_strips - 1
@@ -2395,29 +2817,61 @@ fn apply_rgb_core<const CHANNELS: usize>(
     let mut seam_below = vec![0u64; num_seams * row_words];
     let mut seam_below_has = vec![0u8; num_seams];
 
-    for seam_idx in 0..num_seams {
-        let seam_y = (seam_idx + 1) * strip_rows;
-        let off = seam_idx * row_words;
-        let row_above = &raw[(seam_y - 1) * row_bytes..seam_y * row_bytes];
-        seam_above_has[seam_idx] = scan_accent_row::<CHANNELS>(
-            row_above,
-            &mut seam_above[off..off + row_words],
-            cast_active,
-            dom_u_a,
-            dom_u_b,
-            cast_cap,
-            tables,
-        );
-        let row_below = &raw[seam_y * row_bytes..(seam_y + 1) * row_bytes];
-        seam_below_has[seam_idx] = scan_accent_row::<CHANNELS>(
-            row_below,
-            &mut seam_below[off..off + row_words],
-            cast_active,
-            dom_u_a,
-            dom_u_b,
-            cast_cap,
-            tables,
-        );
+    if num_seams >= 4 {
+        seam_above
+            .par_chunks_mut(row_words)
+            .zip(seam_above_has.par_iter_mut())
+            .zip(seam_below.par_chunks_mut(row_words))
+            .zip(seam_below_has.par_iter_mut())
+            .enumerate()
+            .for_each(|(seam_idx, (((ab, ab_has), bl), bl_has))| {
+                let seam_y = (seam_idx + 1) * strip_rows;
+                let row_above = &raw[(seam_y - 1) * row_bytes..seam_y * row_bytes];
+                *ab_has = scan_accent_row::<CHANNELS>(
+                    row_above,
+                    ab,
+                    cast_active,
+                    dom_u_a,
+                    dom_u_b,
+                    cast_cap,
+                    tables,
+                );
+                let row_below = &raw[seam_y * row_bytes..(seam_y + 1) * row_bytes];
+                *bl_has = scan_accent_row::<CHANNELS>(
+                    row_below,
+                    bl,
+                    cast_active,
+                    dom_u_a,
+                    dom_u_b,
+                    cast_cap,
+                    tables,
+                );
+            });
+    } else {
+        for seam_idx in 0..num_seams {
+            let seam_y = (seam_idx + 1) * strip_rows;
+            let off = seam_idx * row_words;
+            let row_above = &raw[(seam_y - 1) * row_bytes..seam_y * row_bytes];
+            seam_above_has[seam_idx] = scan_accent_row::<CHANNELS>(
+                row_above,
+                &mut seam_above[off..off + row_words],
+                cast_active,
+                dom_u_a,
+                dom_u_b,
+                cast_cap,
+                tables,
+            );
+            let row_below = &raw[seam_y * row_bytes..(seam_y + 1) * row_bytes];
+            seam_below_has[seam_idx] = scan_accent_row::<CHANNELS>(
+                row_below,
+                &mut seam_below[off..off + row_words],
+                cast_active,
+                dom_u_a,
+                dom_u_b,
+                cast_cap,
+                tables,
+            );
+        }
     }
 
     let do_cast = plan.cast_strength > 0.0 && (plan.cast_field.active || plan.has_muddy_shadow_cast);
@@ -3033,17 +3487,20 @@ fn extract_luma_and_alpha<'a>(image: &'a DynamicImage) -> (Cow<'a, [u8]>, Option
             let n = raw.len() / 2;
             let mut y_buf = vec![0u8; n];
             let mut a_buf = vec![0u8; n];
+            let mut any_trans = false;
             for (i, px) in raw.as_chunks::<2>().0.iter().enumerate() {
                 y_buf[i] = px[0];
-                a_buf[i] = u8::from(px[1] >= 128);
+                let ok = px[1] >= 128;
+                any_trans |= !ok;
+                a_buf[i] = u8::from(ok);
             }
-            (Cow::Owned(y_buf), Some(a_buf))
+            (Cow::Owned(y_buf), if any_trans { Some(a_buf) } else { None })
         }
         DynamicImage::ImageRgb8(rgb) => {
             let raw = rgb.as_raw();
             let n = (rgb.width() * rgb.height()) as usize;
             let mut out = vec![0u8; n];
-            if n > 400_000 {
+            if n >= 64_000 {
                 out.par_chunks_mut(16384)
                     .zip(raw.par_chunks(16384 * 3))
                     .for_each(|(dst, src)| {
@@ -3063,11 +3520,39 @@ fn extract_luma_and_alpha<'a>(image: &'a DynamicImage) -> (Cow<'a, [u8]>, Option
             let n = (rgba.width() * rgba.height()) as usize;
             let mut y_buf = vec![0u8; n];
             let mut a_buf = vec![0u8; n];
-            for (i, px) in raw.as_chunks::<4>().0.iter().enumerate() {
-                y_buf[i] = rec709_y(px[0], px[1], px[2]);
-                a_buf[i] = u8::from(px[3] >= 128);
-            }
-            (Cow::Owned(y_buf), Some(a_buf))
+            let any_trans = if n >= 64_000 {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                let flag = AtomicBool::new(false);
+                y_buf
+                    .par_chunks_mut(16384)
+                    .zip(a_buf.par_chunks_mut(16384))
+                    .zip(raw.par_chunks(16384 * 4))
+                    .for_each(|((yd, ad), src)| {
+                        let mut local_trans = false;
+                        for ((y_out, a_out), px) in
+                            yd.iter_mut().zip(ad.iter_mut()).zip(src.as_chunks::<4>().0)
+                        {
+                            *y_out = rec709_y(px[0], px[1], px[2]);
+                            let ok = px[3] >= 128;
+                            local_trans |= !ok;
+                            *a_out = u8::from(ok);
+                        }
+                        if local_trans {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                    });
+                flag.load(Ordering::Relaxed)
+            } else {
+                let mut local_trans = false;
+                for (i, px) in raw.as_chunks::<4>().0.iter().enumerate() {
+                    y_buf[i] = rec709_y(px[0], px[1], px[2]);
+                    let ok = px[3] >= 128;
+                    local_trans |= !ok;
+                    a_buf[i] = u8::from(ok);
+                }
+                local_trans
+            };
+            (Cow::Owned(y_buf), if any_trans { Some(a_buf) } else { None })
         }
         _ => (Cow::Owned(image.to_luma8().into_raw()), None),
     }
@@ -3090,7 +3575,7 @@ fn extract_luma_only<'a>(image: &'a DynamicImage) -> Cow<'a, [u8]> {
             let raw = rgb.as_raw();
             let n = (rgb.width() * rgb.height()) as usize;
             let mut out = vec![0u8; n];
-            if n > 400_000 {
+            if n >= 64_000 {
                 out.par_chunks_mut(16384)
                     .zip(raw.par_chunks(16384 * 3))
                     .for_each(|(dst, src)| {
@@ -3109,7 +3594,7 @@ fn extract_luma_only<'a>(image: &'a DynamicImage) -> Cow<'a, [u8]> {
             let raw = rgba.as_raw();
             let n = (rgba.width() * rgba.height()) as usize;
             let mut out = vec![0u8; n];
-            if n > 400_000 {
+            if n >= 64_000 {
                 out.par_chunks_mut(16384)
                     .zip(raw.par_chunks(16384 * 4))
                     .for_each(|(dst, src)| {
@@ -3249,7 +3734,7 @@ fn compute_structure_ssim_from_luma(
         (row_sum, row_active)
     };
 
-    let (ssim_sum, active_blocks) = if w_usize * h_usize > 400_000 {
+    let (ssim_sum, active_blocks) = if w_usize * h_usize >= 64_000 {
         (0..blocks_y)
             .into_par_iter()
             .map(eval_block_row)
@@ -3554,12 +4039,11 @@ fn quality_tier_1_from_luma(
     lev_luma: &[u8],
     alpha_mask: Option<&[u8]>,
     plan: &CorrectionPlan,
-    config: &AutoLevelsConfig,
 ) -> TierResult {
     let mut metrics = HashMap::new();
     let min_mid = (plan.black_point as u16 + 12).min(200) as u8;
     let max_mid = plan.white_point.saturating_sub(12).max(55);
-    let check_midtone = config.quality_guards.tier1.check_tail_erosion && min_mid < max_mid;
+    let check_midtone = GUARD_TIER1_CHECK_TAIL_EROSION && min_mid < max_mid;
 
     let mut orig_hist = [0u32; 256];
     let mut lev_hist = [0u32; 256];
@@ -3625,7 +4109,7 @@ fn quality_tier_1_from_luma(
     let lev_p99 = histogram_percentile(&lev_hist, n, 99.0);
     let orig_range = (orig_p99 - orig_p01).max(0.0);
     let lev_range = (lev_p99 - lev_p01).max(0.0);
-    let min_dr = config.quality_guards.tier1.min_dynamic_range as f32;
+    let min_dr = GUARD_TIER1_MIN_DYNAMIC_RANGE;
     metrics.insert("orig_range".into(), orig_range as f64);
     metrics.insert("lev_range".into(), lev_range as f64);
 
@@ -3738,11 +4222,10 @@ pub fn quality_tier_1(
     original: &DynamicImage,
     leveled: &DynamicImage,
     plan: &CorrectionPlan,
-    config: &AutoLevelsConfig,
 ) -> TierResult {
     let (orig_luma, alpha_mask) = extract_luma_and_alpha(original);
     let lev_luma = extract_luma_only(leveled);
-    quality_tier_1_from_luma(&orig_luma, &lev_luma, alpha_mask.as_deref(), plan, config)
+    quality_tier_1_from_luma(&orig_luma, &lev_luma, alpha_mask.as_deref(), plan)
 }
 
 /// Tier 2 Quality Guard: Structure-only SSIM (`>= ssim_threshold`) + 2D prime-lattice CIELAB
@@ -3757,7 +4240,7 @@ fn quality_tier_2_internal(
     classification: PageClassification,
     plan: &CorrectionPlan,
     coords: Option<&TileCoords>,
-    config: &AutoLevelsConfig,
+    ssim_threshold: f32,
 ) -> TierResult {
     let mut metrics = HashMap::new();
     let (w, h) = original.dimensions();
@@ -3766,12 +4249,12 @@ fn quality_tier_2_internal(
     let ssim = compute_structure_ssim_from_luma(orig_luma, lev_luma, alpha_mask, w_usize, h_usize);
     metrics.insert("ssim".into(), ssim as f64);
 
-    if ssim < config.quality_guards.tier2.ssim_threshold {
+    if ssim < ssim_threshold {
         let mut res = TierResult::reject(
             2,
             format!(
                 "Structure SSIM {:.3} below threshold {:.2}",
-                ssim, config.quality_guards.tier2.ssim_threshold
+                ssim, ssim_threshold
             ),
         );
         res.metrics = metrics;
@@ -3795,6 +4278,10 @@ fn quality_tier_2_internal(
 
         let tables = &*FAST_LAB_TABLES;
         let sample_chroma = |orig_raw: &[u8], lev_raw: &[u8], channels: usize, out: &mut Vec<f32>| {
+            let mut last_orig_key = u32::MAX;
+            let mut last_orig_lab = (0.0f32, 0.0f32, 0.0f32);
+            let mut last_lev_key = u32::MAX;
+            let mut last_lev_ab = (0.0f32, 0.0f32);
             for y in (0..h_usize).step_by(step) {
                 let x_start = if step > 1 { ((y / step) * 3) % step } else { 0 };
                 let row_off = y * w_usize * channels;
@@ -3810,14 +4297,30 @@ fn quality_tier_2_internal(
                         out.push(0.0);
                         continue;
                     }
-                    let (l_orig, a_orig, b_orig) = rgb_to_lab_with_tables(tables, or, og, ob);
+                    let orig_key = (or as u32) | ((og as u32) << 8) | ((ob as u32) << 16);
+                    let (l_orig, a_orig, b_orig) = if orig_key == last_orig_key {
+                        last_orig_lab
+                    } else {
+                        let lab = rgb_to_lab_with_tables(tables, or, og, ob);
+                        last_orig_key = orig_key;
+                        last_orig_lab = lab;
+                        lab
+                    };
                     let ox = coords.map_or(x, |c| c.src_x[x]);
                     // Exact cast-only exemption mask: exempts ONLY pixels targeted by directional cast
                     // subtraction (never blindly exempts pastel blue sky, pale skin, cream skin, or blonde!)
                     if compute_cast_weight_at(ox, oy, full_w, full_h, l_orig, a_orig, b_orig, plan) >= 0.15 {
                         continue;
                     }
-                    let (_, a_lev, b_lev) = rgb_to_lab_with_tables(tables, lr, lg, lb);
+                    let lev_key = (lr as u32) | ((lg as u32) << 8) | ((lb as u32) << 16);
+                    let (a_lev, b_lev) = if lev_key == last_lev_key {
+                        last_lev_ab
+                    } else {
+                        let (_, a_l, b_l) = rgb_to_lab_with_tables(tables, lr, lg, lb);
+                        last_lev_key = lev_key;
+                        last_lev_ab = (a_l, b_l);
+                        last_lev_ab
+                    };
                     let delta_chroma = (a_orig - a_lev).hypot(b_orig - b_lev);
                     out.push(delta_chroma);
                 }
@@ -3848,24 +4351,24 @@ fn quality_tier_2_internal(
             metrics.insert("chroma_delta_p95".into(), p95_delta as f64);
             metrics.insert("chroma_delta_median".into(), median_delta as f64);
 
-            if p95_delta > config.quality_guards.tier2.chroma_delta_p95 {
+            if p95_delta > GUARD_TIER2_CHROMA_DELTA_P95 {
                 let mut res = TierResult::reject(
                     2,
                     format!(
                         "Color drift: p95 Chroma Delta={:.2} > {:.2}",
-                        p95_delta, config.quality_guards.tier2.chroma_delta_p95
+                        p95_delta, GUARD_TIER2_CHROMA_DELTA_P95
                     ),
                 );
                 res.metrics = metrics;
                 return res;
             }
 
-            if median_delta > config.quality_guards.tier2.chroma_delta_median {
+            if median_delta > GUARD_TIER2_CHROMA_DELTA_MEDIAN {
                 let mut res = TierResult::reject(
                     2,
                     format!(
                         "Color drift: median Chroma Delta={:.2} > {:.2}",
-                        median_delta, config.quality_guards.tier2.chroma_delta_median
+                        median_delta, GUARD_TIER2_CHROMA_DELTA_MEDIAN
                     ),
                 );
                 res.metrics = metrics;
@@ -3884,7 +4387,6 @@ pub fn quality_tier_2(
     leveled: &DynamicImage,
     classification: PageClassification,
     plan: &CorrectionPlan,
-    config: &AutoLevelsConfig,
 ) -> TierResult {
     let (orig_luma, alpha_mask) = extract_luma_and_alpha(original);
     let lev_luma = extract_luma_only(leveled);
@@ -3897,12 +4399,12 @@ pub fn quality_tier_2(
         classification,
         plan,
         None,
-        config,
+        GUARD_TIER2_SSIM_THRESHOLD,
     )
 }
 
 /// Tier 3 Quality Guard: Tile-seam-safe strided Sobel NCC + active 32x32 block Michelson contrast
-/// ratio (`p01` aligned with config, exempting intentional paper/ink boundary whitening blocks).
+/// ratio (`p01`, exempting intentional paper/ink boundary whitening blocks).
 #[allow(clippy::too_many_arguments)]
 fn quality_tier_3_from_luma(
     orig_luma: &[u8],
@@ -3912,7 +4414,6 @@ fn quality_tier_3_from_luma(
     h_usize: usize,
     plan: &CorrectionPlan,
     tile_size: Option<usize>,
-    config: &AutoLevelsConfig,
 ) -> TierResult {
     let mut metrics = HashMap::new();
 
@@ -3922,12 +4423,12 @@ fn quality_tier_3_from_luma(
         alpha_mask,
         w_usize,
         h_usize,
-        config.quality_guards.tier3.stride,
+        GUARD_TIER3_STRIDE,
         tile_size,
     );
     metrics.insert("gradient_ncc".into(), ncc as f64);
 
-    if ncc < config.quality_guards.tier3.gradient_ncc {
+    if ncc < GUARD_TIER3_GRADIENT_NCC {
         let mut res = TierResult::reject(
             3,
             format!("Gradient NCC {:.3} damaged fine linework/screentones", ncc),
@@ -3966,12 +4467,12 @@ fn quality_tier_3_from_luma(
         let p01_ratio = block_ratios[p01_idx];
         metrics.insert("contrast_ratio_p01".into(), p01_ratio as f64);
 
-        if p01_ratio < config.quality_guards.tier3.min_contrast_ratio {
+        if p01_ratio < GUARD_TIER3_MIN_CONTRAST_RATIO {
             let mut res = TierResult::reject(
                 3,
                 format!(
                     "Local contrast collapsed: p01 ratio {:.2} < {:.2}",
-                    p01_ratio, config.quality_guards.tier3.min_contrast_ratio
+                    p01_ratio, GUARD_TIER3_MIN_CONTRAST_RATIO
                 ),
             );
             res.metrics = metrics;
@@ -3988,7 +4489,6 @@ pub fn quality_tier_3(
     original: &DynamicImage,
     leveled: &DynamicImage,
     plan: &CorrectionPlan,
-    config: &AutoLevelsConfig,
 ) -> TierResult {
     let (w, h) = original.dimensions();
     let (orig_luma, alpha_mask) = extract_luma_and_alpha(original);
@@ -4001,7 +4501,6 @@ pub fn quality_tier_3(
         h as usize,
         plan,
         None,
-        config,
     )
 }
 
@@ -4014,7 +4513,7 @@ fn evaluate_guard_on_sample(
     classification: PageClassification,
     plan: &CorrectionPlan,
     coords: &TileCoords,
-    config: &AutoLevelsConfig,
+    ssim_threshold: f32,
     book_id: &str,
     page_str: &str,
 ) -> (Outcome, Vec<TierResult>, bool) {
@@ -4022,7 +4521,7 @@ fn evaluate_guard_on_sample(
     let cand_luma = extract_luma_only(guard_candidate);
     let mut tier_results = Vec::with_capacity(3);
 
-    let t1 = quality_tier_1_from_luma(orig_luma, &cand_luma, alpha_mask, plan, config);
+    let t1 = quality_tier_1_from_luma(orig_luma, &cand_luma, alpha_mask, plan);
     if t1.outcome == Outcome::Reject {
         warn!(
             "[QualityGuard] REJECT book_id={} page={} tier=1 reason=\"{}\" metrics={:?}",
@@ -4036,17 +4535,68 @@ fn evaluate_guard_on_sample(
     }
     tier_results.push(t1);
 
-    let t2 = quality_tier_2_internal(
-        guard_pristine,
-        guard_candidate,
-        orig_luma,
-        &cand_luma,
-        alpha_mask,
-        classification,
-        plan,
-        Some(coords),
-        config,
-    );
+    let (t2, t3) = if (sw as usize) * (sh as usize) >= 64_000 {
+        rayon::join(
+            || {
+                quality_tier_2_internal(
+                    guard_pristine,
+                    guard_candidate,
+                    orig_luma,
+                    &cand_luma,
+                    alpha_mask,
+                    classification,
+                    plan,
+                    Some(coords),
+                    ssim_threshold,
+                )
+            },
+            || {
+                quality_tier_3_from_luma(
+                    orig_luma,
+                    &cand_luma,
+                    alpha_mask,
+                    sw as usize,
+                    sh as usize,
+                    plan,
+                    coords.tile_size,
+                )
+            },
+        )
+    } else {
+        let t2 = quality_tier_2_internal(
+            guard_pristine,
+            guard_candidate,
+            orig_luma,
+            &cand_luma,
+            alpha_mask,
+            classification,
+            plan,
+            Some(coords),
+            ssim_threshold,
+        );
+        if t2.outcome == Outcome::Reject {
+            warn!(
+                "[QualityGuard] REJECT book_id={} page={} tier=2 reason=\"{}\" metrics={:?}",
+                book_id,
+                page_str,
+                t2.reason.as_deref().unwrap_or(""),
+                t2.metrics
+            );
+            tier_results.push(t2);
+            return (Outcome::Reject, tier_results, true);
+        }
+        let t3 = quality_tier_3_from_luma(
+            orig_luma,
+            &cand_luma,
+            alpha_mask,
+            sw as usize,
+            sh as usize,
+            plan,
+            coords.tile_size,
+        );
+        (t2, t3)
+    };
+
     if t2.outcome == Outcome::Reject {
         warn!(
             "[QualityGuard] REJECT book_id={} page={} tier=2 reason=\"{}\" metrics={:?}",
@@ -4060,16 +4610,6 @@ fn evaluate_guard_on_sample(
     }
     tier_results.push(t2);
 
-    let t3 = quality_tier_3_from_luma(
-        orig_luma,
-        &cand_luma,
-        alpha_mask,
-        sw as usize,
-        sh as usize,
-        plan,
-        coords.tile_size,
-        config,
-    );
     if t3.outcome == Outcome::Reject {
         warn!(
             "[QualityGuard] REJECT book_id={} page={} tier=3 reason=\"{}\" metrics={:?}",
@@ -4099,11 +4639,38 @@ pub fn level_and_verify(
 }
 
 pub fn level_and_verify_with_context(
+    image: DynamicImage,
+    book_id: Option<&str>,
+    page_number: Option<usize>,
+    book_profile: Option<&BookProfile>,
+    config: &AutoLevelsConfig,
+) -> (DynamicImage, LevelInfo, QualityVerdict) {
+    level_and_verify_impl(
+        image,
+        book_id,
+        page_number,
+        book_profile,
+        config,
+        GUARD_TIER2_SSIM_THRESHOLD,
+    )
+}
+
+#[doc(hidden)]
+pub fn level_and_verify_with_ssim_override(
+    image: DynamicImage,
+    config: &AutoLevelsConfig,
+    ssim_threshold: f32,
+) -> (DynamicImage, LevelInfo, QualityVerdict) {
+    level_and_verify_impl(image, None, None, None, config, ssim_threshold)
+}
+
+fn level_and_verify_impl(
     mut image: DynamicImage,
     book_id: Option<&str>,
     page_number: Option<usize>,
     book_profile: Option<&BookProfile>,
     config: &AutoLevelsConfig,
+    ssim_threshold: f32,
 ) -> (DynamicImage, LevelInfo, QualityVerdict) {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
@@ -4151,7 +4718,7 @@ pub fn level_and_verify_with_context(
     let is_monochrome = analysis.classification == PageClassification::Monochrome;
     let paper_cast_preserved = is_monochrome
         && !is_already_luma
-        && !config.correction.correct_paper_cast
+        && !config.correct_paper_cast
         && (analysis.has_paper_cast || analysis.has_muddy_shadow_cast);
 
     // Strict Full-Color Veto (Zero-Copy No-Op)
@@ -4239,7 +4806,7 @@ pub fn level_and_verify_with_context(
         analysis.classification,
         &plan,
         &tile_coords,
-        config,
+        ssim_threshold,
         b_id,
         &p_str,
     );
@@ -4294,7 +4861,7 @@ pub fn level_and_verify_with_context(
             analysis.classification,
             &attenuated,
             &tile_coords,
-            config,
+            ssim_threshold,
             b_id,
             &p_str,
         );
@@ -4632,8 +5199,10 @@ mod tests {
         assert!(pa.hypot(pb) <= 1.0);
 
         // 2. correct_paper_cast = false preserves paper tint & sets paper_cast_preserved = true
-        let mut preserve_cfg = AutoLevelsConfig::default();
-        preserve_cfg.correction.correct_paper_cast = false;
+        let preserve_cfg = AutoLevelsConfig {
+            correct_paper_cast: false,
+            ..Default::default()
+        };
         let (pres_img, pres_info, _) = level_and_verify(dyn_img, None, &preserve_cfg);
         assert!(pres_info.paper_cast_preserved);
         let pres_paper = pres_img.as_rgb8().unwrap().get_pixel(1, 0);
@@ -4904,9 +5473,8 @@ mod tests {
         let orig = DynamicImage::ImageRgb8(img);
         let orig_raw = orig.as_rgb8().unwrap().as_raw().clone();
 
-        let mut strict_cfg = AutoLevelsConfig::default();
-        strict_cfg.quality_guards.tier2.ssim_threshold = 1.01; // impossible threshold -> guaranteed reject!
-        let (out, info, verdict) = level_and_verify(orig, None, &strict_cfg);
+        let (out, info, verdict) =
+            level_and_verify_with_ssim_override(orig, &AutoLevelsConfig::default(), 1.01);
 
         assert!(!info.was_leveled);
         assert_eq!(verdict.outcome, Outcome::Reject);
@@ -5053,13 +5621,12 @@ mod tests {
 
     #[test]
     fn test_quality_guard_genuine_rejections_tier1_tier2_tier3() {
-        let config = AutoLevelsConfig::default();
         let (w, h) = (128u32, 128u32);
 
         // Tier 1: Inverted image must be rejected (zero tautology!)
         let orig_grad = DynamicImage::ImageLuma8(ImageBuffer::from_fn(w, h, |x, _| Luma([(x * 2).min(255) as u8])));
         let inv_grad = DynamicImage::ImageLuma8(ImageBuffer::from_fn(w, h, |x, _| Luma([255u8.saturating_sub((x * 2).min(255) as u8)])));
-        let t1 = quality_tier_1(&orig_grad, &inv_grad, &CorrectionPlan::default(), &config);
+        let t1 = quality_tier_1(&orig_grad, &inv_grad, &CorrectionPlan::default());
         assert_eq!(t1.outcome, Outcome::Reject, "Tier 1 must reject inverted luminance");
 
         // Tier 2: Bleaching pastel blue sky [220,235,245] to gray [234,234,234] must be rejected (never exempted!)
@@ -5081,7 +5648,7 @@ mod tests {
             },
             ..CorrectionPlan::default()
         };
-        let t2 = quality_tier_2(&sky_orig, &sky_bleached, PageClassification::Mixed, &cast_plan, &config);
+        let t2 = quality_tier_2(&sky_orig, &sky_bleached, PageClassification::Mixed, &cast_plan);
         assert_eq!(t2.outcome, Outcome::Reject, "Tier 2 must reject bleached pastel sky even when paper cast is active");
 
         // Tier 3: Crushed midtone checkerboard must reject, while speech-bubble-on-aged-paper block is exempted
@@ -5091,7 +5658,7 @@ mod tests {
         let checker_crushed = DynamicImage::ImageLuma8(ImageBuffer::from_fn(w, h, |x, y| {
             Luma([if (x + y).is_multiple_of(2) { 118 } else { 122 }])
         }));
-        let t3_fail = quality_tier_3(&checker_orig, &checker_crushed, &CorrectionPlan::default(), &config);
+        let t3_fail = quality_tier_3(&checker_orig, &checker_crushed, &CorrectionPlan::default());
         assert_eq!(t3_fail.outcome, Outcome::Reject, "Tier 3 must reject collapsed midtone contrast");
 
         let bubble_orig = DynamicImage::ImageLuma8(ImageBuffer::from_fn(w, h, |x, _| {
@@ -5104,7 +5671,7 @@ mod tests {
             white_point: 224,
             ..CorrectionPlan::default()
         };
-        let t3_pass = quality_tier_3(&bubble_orig, &bubble_whitened, &white_plan, &config);
+        let t3_pass = quality_tier_3(&bubble_orig, &bubble_whitened, &white_plan);
         assert_eq!(t3_pass.outcome, Outcome::Pass, "Tier 3 must exempt intentional aged-paper/speech-bubble whitening");
     }
 
@@ -5163,14 +5730,7 @@ mod tests {
         buf.put_pixel(0, 0, Luma([200u8]));
         buf.put_pixel(17, 0, Luma([255u8]));
 
-        let config = AutoLevelsConfig {
-            correction: crate::config::app_config::CorrectionConfig {
-                min_white_threshold: 140,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let analysis = analyze_page(&DynamicImage::ImageLuma8(buf), 0, &config);
+        let analysis = analyze_page_with_min_white(&DynamicImage::ImageLuma8(buf), 140);
         assert_eq!(
             analysis.white_ceiling, 255,
             "low-key Luma8 scene with isolated bright specks must remain vetoed"
@@ -5200,10 +5760,7 @@ mod tests {
             }
         });
         let config = AutoLevelsConfig {
-            correction: crate::config::app_config::CorrectionConfig {
-                correct_paper_cast: false,
-                ..Default::default()
-            },
+            correct_paper_cast: false,
             ..Default::default()
         };
         let dyn_img = DynamicImage::ImageRgb8(img);

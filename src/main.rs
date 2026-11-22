@@ -81,8 +81,9 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Configure Rayon only when explicitly overridden; otherwise use hardware-agnostic default.
-    if let Some(threads) = initial_config.rayon_threads {
+    // Configure Rayon only when explicitly overridden (> 0); 0 uses hardware-agnostic default.
+    if initial_config.rayon_threads > 0 {
+        let threads = initial_config.rayon_threads;
         if let Err(e) = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build_global()
@@ -163,10 +164,7 @@ async fn main() -> ExitCode {
             komga_client.clone(),
         ));
         let proxy_client = Arc::new(ProxyClient::new(reqwest_client, upstream_url_str));
-        let book_profile_manager = Arc::new(BookProfileManager::new(
-            komga_client.clone(),
-            &cfg.auto_levels.book_profile,
-        ));
+        let book_profile_manager = Arc::new(BookProfileManager::new(komga_client.clone()));
         let pipeline_semaphore = Arc::new(Semaphore::new(cfg.max_concurrent_pipelines.max(1)));
 
         let (reload_tx, mut reload_rx) = broadcast::channel::<()>(8);

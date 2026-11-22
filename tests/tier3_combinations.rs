@@ -565,29 +565,33 @@ async fn test_tier3_proxy_dynamic_connection_hop_x_forwarded_and_location_rewrit
 }
 
 #[tokio::test]
-async fn test_tier3_config_auth_validation_posix_env_and_serde_saphyr_roundtrip() {
+async fn test_tier3_config_validation_posix_env_and_serde_saphyr_roundtrip() {
     let komga = MockKomgaServer::start().await;
-    let mut cfg = create_cpu_upscale_config(&komga.base_url);
-    cfg.allow_config_updates = true;
-    cfg.config_api_token = Some("super-secret-token".to_string());
-    let kurp = TestKurpServer::start(cfg, Arc::new(UpscaleEngine::new_empty())).await;
+    let disabled_kurp = TestKurpServer::start(
+        create_cpu_upscale_config(&komga.base_url),
+        Arc::new(UpscaleEngine::new_empty()),
+    )
+    .await;
     let client = reqwest::Client::new();
 
-    // 1. /kurp/config enforces token auth when configured
-    let r_unauth = client
-        .get(format!("{}/kurp/config", kurp.base_url))
+    // 1. /kurp/config is unmounted (404) when allow_config_updates is false, and works when true
+    let r_disabled = client
+        .get(format!("{}/kurp/config", disabled_kurp.base_url))
         .send()
         .await
         .unwrap();
-    assert_eq!(r_unauth.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(r_disabled.status(), StatusCode::NOT_FOUND);
 
-    let r_bearer = client
+    let mut cfg = create_cpu_upscale_config(&komga.base_url);
+    cfg.allow_config_updates = true;
+    let kurp = TestKurpServer::start(cfg, Arc::new(UpscaleEngine::new_empty())).await;
+
+    let r_get = client
         .get(format!("{}/kurp/config", kurp.base_url))
-        .header(header::AUTHORIZATION, "Bearer super-secret-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(r_bearer.status(), StatusCode::OK);
+    assert_eq!(r_get.status(), StatusCode::OK);
 
     // 2. Invalid POST /kurp/config fails validate() with 400 BEFORE touching disk
     let mut bad_cfg = AppConfig::default();
@@ -595,7 +599,6 @@ async fn test_tier3_config_auth_validation_posix_env_and_serde_saphyr_roundtrip(
     bad_cfg.realcugan.scale = 4; // unsupported in Layer 2!
     let r_bad = client
         .post(format!("{}/kurp/config", kurp.base_url))
-        .header("X-Kurp-Token", "super-secret-token")
         .json(&bad_cfg)
         .send()
         .await
@@ -620,14 +623,16 @@ async fn test_tier3_config_auth_validation_posix_env_and_serde_saphyr_roundtrip(
 
     let mut env_map = HashMap::new();
     env_map.insert("KURP_CONF_DIR".to_string(), tmp_dir.to_string_lossy().to_string());
+    env_map.insert("KURP_RAYON_THREADS".to_string(), "4".to_string());
     env_map.insert("KURP_REALCUGAN__GPUID".to_string(), "-1".to_string());
-    env_map.insert("KURP_AUTO_LEVELS__BOOK_PROFILE__SAMPLE_PAGES".to_string(), "14".to_string());
+    env_map.insert("KURP_AUTO_LEVELS__CORRECT_PAPER_CAST".to_string(), "false".to_string());
 
     let loaded = AppConfig::from_dir_and_env(&tmp_dir, env_map).unwrap();
     assert_eq!(loaded.port, 3131);
+    assert_eq!(loaded.rayon_threads, 4);
     assert_eq!(loaded.realcugan.gpuid, -1);
     assert_eq!(loaded.realcugan.concurrent_jobs, 2);
-    assert_eq!(loaded.auto_levels.book_profile.sample_pages, 14);
+    assert!(!loaded.auto_levels.correct_paper_cast);
     assert!(loaded.validate().is_ok());
 
     let _ = fs::remove_dir_all(&tmp_dir);

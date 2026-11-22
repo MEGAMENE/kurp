@@ -203,8 +203,10 @@ fn test_tier1_m3_noisy_mono_and_m4_aged_paper_correct_paper_cast_toggle() {
     assert!(pa.hypot(pb) <= 1.0);
 
     // Disabled correct_paper_cast: false -> preserves tint & skips Luma8 folding
-    let mut preserve_cfg = AutoLevelsConfig::default();
-    preserve_cfg.correction.correct_paper_cast = false;
+    let preserve_cfg = AutoLevelsConfig {
+        correct_paper_cast: false,
+        ..Default::default()
+    };
     let (pres_img, pres_info, _) = level_and_verify(m4, None, &preserve_cfg);
     assert!(pres_info.paper_cast_preserved);
     assert!(!should_fold_luma(&pres_info, true));

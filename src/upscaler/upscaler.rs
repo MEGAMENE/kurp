@@ -187,13 +187,7 @@ fn build_loaded_upscaler(config: &AppConfig) -> Result<LoadedUpscaler, String> {
     let tta_level = RealCuganTtaLevel::try_from(rc.tta_level).map_err(|e| e.to_string())?;
     let concurrent_jobs = NonZeroU32::new(rc.concurrent_jobs)
         .ok_or_else(|| "realcugan.concurrent_jobs must be >= 1".to_string())?;
-    let num_threads = match rc.num_threads {
-        None => None,
-        Some(n) => Some(
-            NonZeroU32::new(n)
-                .ok_or_else(|| "realcugan.num_threads must be >= 1 when set".to_string())?,
-        ),
-    };
+    let num_threads = NonZeroU32::new(rc.num_threads);
 
     if rc.gpuid >= 0 && !RealCugan::should_use_cpu(rc.gpuid) {
         let gpu_count = RealCugan::get_gpu_count();
@@ -661,7 +655,7 @@ mod tests {
             realcugan: crate::config::app_config::RealCuganConfig {
                 gpuid: -1,
                 tile_size: 400,
-                num_threads: Some(2),
+                num_threads: 2,
                 models_path: models_dir,
                 ..crate::config::app_config::RealCuganConfig::default()
             },

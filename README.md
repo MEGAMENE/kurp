@@ -144,65 +144,42 @@ Kurp loads `<KURP_CONF_DIR>/config.yml` (defaulting to `./config.yml` in the wor
 ### Default `config.yml`
 
 ```yaml
-port: 3030
-upstream_url: "http://localhost:8080"
-allow_config_updates: false
-# config_api_token: "change-me-if-config-updates-enabled"
-upscale: true
-size_threshold_enabled: true
-size_threshold: 500
-size_threshold_png: 1000
-max_upscale_dimension: 4000
-jpeg_quality: 90
-max_concurrent_pipelines: 6
-# rayon_threads: 8
+port: 3030 # listen port (1..65535)
+upstream_url: "http://localhost:8080" # upstream Komga URL (for example http://localhost:25600)
+allow_config_updates: false # exposes GET and POST /kurp/config endpoints that allow runtime config updates (true/false)
+
+upscale: true # enable upscaling and auto-leveling pipeline (true/false; false proxies all pages untouched)
+upscale_tag: # if set (e.g. "upscale"), only process Komga books or series with this tag; blank processes all books
+size_threshold_enabled: true # enable input file size check before upscaling (true/false)
+size_threshold: 500 # in KiB; will not upscale if non-PNG image size exceeds this value (>=0)
+size_threshold_png: 1000 # in KiB; will not upscale if PNG image size exceeds this value (>=0)
+max_upscale_dimension: 4000 # in px; will not upscale if source width or height exceeds this value (0=disabled)
+
+# output image format after upscaling ("WebP", "Jpeg", "Png", or "Original")
+# WebP encodes losslessly via libwebp (falling back to PNG above 16383px); Original keeps the source format (AVIF converts to WebP)
 return_format: WebP
-# upscale_tag: "upscale"
+jpeg_quality: 90 # JPEG quality when return_format (or ?convert=jpeg) outputs Jpeg (1..100)
+
+max_concurrent_pipelines: 6 # maximum number of pages decoded, leveled, upscaled, and encoded concurrently (>=1)
+rayon_threads: 0 # CPU threads for auto-levels parallel processing (>=1, 0=auto using all logical cores)
 
 realcugan:
-  gpuid: 0
-  scale: 2
-  noise: -1
-  model: Se
-  tile_size: 0
-  sync_gap: 2
-  tta_level: 1
-  use_fp16_arithmetic: false
-  # num_threads: 4
-  concurrent_jobs: 1
-  models_path: "./models"
+  gpuid: 0 # Vulkan GPU device to use (-1=CPU; single GPU is usually 0; unsupported GPUs auto-route to CPU)
+  model: Se # Real-CUGAN model family (Se, Pro, Nose)
+  scale: 2 # upscale ratio (2/3/4; Se supports 2/3/4, Pro supports 2/3, Nose supports 2)
+  noise: -1 # denoise level (-1=conservative, 0=none, 1/2/3=denoise1x..3x; 1/2 only on Se 2x, Nose supports 0 only, Pro supports -1/0/3)
+  tile_size: 0 # tile size in pixels (>=32, 0=auto based on GPU VRAM)
+  sync_gap: 2 # Vulkan sync gap mode (0=none, 1=accurate, 2=rough, 3=very rough)
+  tta_level: 1 # Test-Time Augmentation passes (1=disabled/fastest, 2/4/8=higher quality and proportionally slower)
+  use_fp16_arithmetic: false # enable FP16 shader math (true/false; keep false to prevent black-tile artifacts on large pages)
+  concurrent_jobs: 1 # max concurrent Real-CUGAN inference jobs (>=1; keep 1-2 on consumer GPUs to avoid VRAM OOM)
+  num_threads: 0 # CPU thread count for NCNN/CPU upscaling (>=1, 0=auto)
+  models_path: "./models" # path to directory containing models-se, models-pro, and models-nose
 
 auto_levels:
-  enabled: true
-  output_grayscale_for_monochrome: true
-  book_profile:
-    cache_size: 100
-    cache_ttl_seconds: 3600
-    sample_pages: 12
-    parallel_page_fetches: 8
-    timeout_seconds: 45
-  detection:
-    black_clip_percent: 0.1
-    white_clip_percent: 0.1
-    surge_ratio_threshold: 2.8
-    protect_sepia_artwork: true
-  correction:
-    max_black_shift: 85
-    min_white_threshold: 200
-    correct_paper_cast: true
-    gamma: 1.0
-  quality_guards:
-    tier1:
-      check_tail_erosion: true
-      min_dynamic_range: 64
-    tier2:
-      ssim_threshold: 0.92
-      chroma_delta_p95: 2.5
-      chroma_delta_median: 1.5
-    tier3:
-      gradient_ncc: 0.90
-      min_contrast_ratio: 0.50
-      stride: 4
+  enabled: true # enable CIELAB page restoration and auto-leveling before upscaling (true/false)
+  correct_paper_cast: true # neutralize aged or tinted paper casts and muddy shadows (true/false; false keeps original paper tint)
+  output_grayscale_for_monochrome: true # fold verified monochrome pages to 1-channel Luma8 after upscaling (true/false; cuts file size 50-70%)
 ```
 
 ### POSIX Environment Variable Overrides (`__` Hierarchy Separator)
@@ -212,7 +189,7 @@ All configuration fields can be overridden with `KURP_`-prefixed POSIX environme
 - `KURP_CONF_DIR=/path/to/config/dir` — Directory where Kurp reads and writes `config.yml`.
 - Top-level fields: `KURP_<FIELD_NAME>` (e.g. `KURP_PORT=3030`, `KURP_UPSTREAM_URL=http://komga:25600`, `KURP_UPSCALE_TAG=upscale`).
 - Nested `realcugan.*` fields: `KURP_REALCUGAN__<FIELD_NAME>` (e.g. `KURP_REALCUGAN__GPUID=0`, `KURP_REALCUGAN__MODELS_PATH=/app/models`).
-- Nested `auto_levels.*` fields: `KURP_AUTO_LEVELS__<SECTION>__<FIELD_NAME>` (e.g. `KURP_AUTO_LEVELS__ENABLED=true`, `KURP_AUTO_LEVELS__BOOK_PROFILE__SAMPLE_PAGES=12`, `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER2__SSIM_THRESHOLD=0.92`).
+- Nested `auto_levels.*` fields: `KURP_AUTO_LEVELS__<FIELD_NAME>` (e.g. `KURP_AUTO_LEVELS__ENABLED=true`, `KURP_AUTO_LEVELS__CORRECT_PAPER_CAST=true`, `KURP_AUTO_LEVELS__OUTPUT_GRAYSCALE_FOR_MONOCHROME=true`).
 
 ### Complete Options Table
 
@@ -221,63 +198,42 @@ All configuration fields can be overridden with `KURP_`-prefixed POSIX environme
 | YAML Key | Env Var | Default | Valid Range / Values | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `port` | `KURP_PORT` | `3030` | `1..=65535` | TCP port on `0.0.0.0` where Kurp listens. |
-| `upstream_url` | `KURP_UPSTREAM_URL` | `"http://localhost:8080"` | Valid `http://` or `https://` URL | Base URL of your upstream Komga instance. |
+| `upstream_url` | `KURP_UPSTREAM_URL` | `"http://localhost:8080"` | Valid `http://` or `https://` URL | Base URL of your upstream Komga instance (e.g. `"http://localhost:25600"`). |
+| `allow_config_updates` | `KURP_ALLOW_CONFIG_UPDATES` | `false` | `true`, `false` | Exposes `GET /kurp/config` and `POST /kurp/config` for runtime configuration inspection and hot-reload. |
 | `upscale` | `KURP_UPSCALE` | `true` | `true`, `false` | Master toggle for Kurp's page restoration and upscaling pipeline. When `false`, page requests bypass directly to Komga via raw proxy passthrough. |
-| `return_format` | `KURP_RETURN_FORMAT` | `WebP` | `WebP`, `Png`, `Jpeg`, `Original` | Output image format when no client `?convert=` query or `Accept: image/webp` override applies. `WebP` uses lossless `libwebp` (with automatic PNG fallback above `16383 px`). `Original` preserves the source format (converting AVIF inputs to lossless WebP). |
+| `upscale_tag` | `KURP_UPSCALE_TAG` | empty / `null` | Any non-empty string, or empty | When set (e.g. `"upscale"`), only books or series carrying that tag in Komga are processed; empty/unset processes all eligible books. |
 | `size_threshold_enabled` | `KURP_SIZE_THRESHOLD_ENABLED` | `true` | `true`, `false` | When `true`, pages whose upstream file size already exceeds `size_threshold` (or `size_threshold_png` for PNGs) bypass Kurp processing and return the upstream response directly. |
 | `size_threshold` | `KURP_SIZE_THRESHOLD` | `500` | `>= 0` (KiB) | Maximum file size in KiB for non-PNG images to enter the restoration/upscaling pipeline when `size_threshold_enabled: true`. |
 | `size_threshold_png` | `KURP_SIZE_THRESHOLD_PNG` | `1000` | `>= 0` (KiB) | Maximum file size in KiB for PNG images to enter the restoration/upscaling pipeline when `size_threshold_enabled: true`. |
 | `max_upscale_dimension` | `KURP_MAX_UPSCALE_DIMENSION` | `4000` | `>= 0` (px, `0` disables) | When `> 0`, pages whose source `width > max_upscale_dimension` or `height > max_upscale_dimension` bypass Kurp processing and return the upstream response directly. |
+| `return_format` | `KURP_RETURN_FORMAT` | `WebP` | `WebP`, `Png`, `Jpeg`, `Original` | Output image format when no client `?convert=` query or `Accept: image/webp` override applies. `WebP` uses lossless `libwebp` (with automatic PNG fallback above `16383 px`). `Original` preserves the source format (converting AVIF inputs to lossless WebP). |
 | `jpeg_quality` | `KURP_JPEG_QUALITY` | `90` | `1..=100` | JPEG encoder quality used when the resolved output format is `Jpeg`. |
 | `max_concurrent_pipelines` | `KURP_MAX_CONCURRENT_PIPELINES` | `6` | `>= 1` | Maximum in-flight page decode/restore/upscale/encode pipelines allowed concurrently (prevents OOM under burst page loads). |
-| `rayon_threads` | `KURP_RAYON_THREADS` | unset (all logical cores) | `>= 1` | Optional thread count for the global Rayon CPU pool used by `auto_levels`. |
-| `upscale_tag` | `KURP_UPSCALE_TAG` | unset | Any non-empty string | When set (e.g. `"upscale"`), only books or series carrying that tag in Komga are processed; untagged books bypass straight to Komga. When unset, all eligible pages are processed. |
-| `allow_config_updates` | `KURP_ALLOW_CONFIG_UPDATES` | `false` | `true`, `false` | Exposes `GET /kurp/config` and `POST /kurp/config` for runtime configuration inspection and hot-reload. |
-| `config_api_token` | `KURP_CONFIG_API_TOKEN` | unset | Non-empty string | Optional shared secret protecting `/kurp/config`. When set, requests to `/kurp/config` must supply `Authorization: Bearer <token>` or `X-Kurp-Token: <token>`. |
+| `rayon_threads` | `KURP_RAYON_THREADS` | `0` (`auto`) | `>= 0` (`0` = all logical cores) | Optional thread count for the global Rayon CPU pool used by `auto_levels` (`0` uses automatic hardware detection). |
 
 #### `realcugan` Section
 
 | YAML Key | Env Var | Default | Valid Range / Values | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `realcugan.gpuid` | `KURP_REALCUGAN__GPUID` | `0` | `>= -1` | Vulkan device index (`0` = primary GPU, `-1` = CPU inference via NCNN). |
+| `realcugan.gpuid` | `KURP_REALCUGAN__GPUID` | `0` | `>= -1` | Vulkan device index (`0` = primary GPU, `-1` = CPU inference via NCNN; unavailable/software GPUs auto-route to CPU). |
+| `realcugan.model` | `KURP_REALCUGAN__MODEL` | `Se` | `Se`, `Pro`, `Nose` | Real-CUGAN model family (`models-se`, `models-pro`, `models-nose`). |
 | `realcugan.scale` | `KURP_REALCUGAN__SCALE` | `2` | `2`, `3`, `4` | Upscaling factor (`Nose` supports `2` only; `Pro` supports `2`, `3`; `Se` supports `2`, `3`, `4`). |
 | `realcugan.noise` | `KURP_REALCUGAN__NOISE` | `-1` | `-1`, `0`, `1`, `2`, `3` | Denoise strength (`-1` = conservative/no denoise; `Nose` supports `0` only; `Pro` supports `-1`, `0`, `3`; `Se` supports `-1`, `0`, `1`, `2`, `3`, with `3x`/`4x` supporting `-1`, `0`, `3`). |
-| `realcugan.model` | `KURP_REALCUGAN__MODEL` | `Se` | `Se`, `Pro`, `Nose` | Real-CUGAN model family (`models-se`, `models-pro`, `models-nose`). |
-| `realcugan.tile_size` | `KURP_REALCUGAN__TILE_SIZE` | `0` | `0` or `>= 32` | Tile size in pixels for GPU inference (`0` = automatic tiling based on GPU VRAM). |
+| `realcugan.tile_size` | `KURP_REALCUGAN__TILE_SIZE` | `0` (`auto`) | `0` or `>= 32` | Tile size in pixels for GPU inference (`0` = automatic tiling based on GPU VRAM). |
 | `realcugan.sync_gap` | `KURP_REALCUGAN__SYNC_GAP` | `2` | `0`, `1`, `2`, `3` | Vulkan queue synchronization interval (`0` = no sync, `1` = accurate, `2` = rough, `3` = very rough). |
 | `realcugan.tta_level` | `KURP_REALCUGAN__TTA_LEVEL` | `1` | `1`, `2`, `4`, `8` | Test-Time Augmentation passes (`1` = disabled/fastest, `8` = 8x slower highest quality). |
 | `realcugan.use_fp16_arithmetic` | `KURP_REALCUGAN__USE_FP16_ARITHMETIC` | `false` | `true`, `false` | Enables FP16 storage/packed/arithmetic inside NCNN. Defaults to `false` (FP32) to prevent black-tile artifacts on large pages; enable only if verified stable on your GPU. |
-| `realcugan.num_threads` | `KURP_REALCUGAN__NUM_THREADS` | unset | `>= 1` | CPU thread count for NCNN when `gpuid: -1` or for CPU stages. |
 | `realcugan.concurrent_jobs` | `KURP_REALCUGAN__CONCURRENT_JOBS` | `1` | `>= 1` | Maximum concurrent GPU inference calls dispatched to `RealCugan`. Keep at `1` or `2` on consumer GPUs to avoid VRAM exhaustion. |
-| `realcugan.models_path` | `KURP_REALCUGAN__MODELS_PATH` | `"./models"` (or `<KURP_CONF_DIR>/models`) | Directory path | Path to the parent directory containing `models-se`, `models-pro`, and `models-nose`. |
+| `realcugan.num_threads` | `KURP_REALCUGAN__NUM_THREADS` | `0` (`auto`) | `>= 0` (`0` = automatic) | CPU thread count for NCNN when `gpuid: -1` or for CPU stages (`0` lets Layer 2 pick automatically). |
+| `realcugan.models_path` | `KURP_REALCUGAN__MODELS_PATH` | `"./models"` | Directory path | Path to the parent directory containing `models-se`, `models-pro`, and `models-nose` (defaults to `<KURP_CONF_DIR>/models` if omitted). |
 
 #### `auto_levels` Section
 
 | YAML Key | Env Var | Default | Valid Range / Values | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `auto_levels.enabled` | `KURP_AUTO_LEVELS__ENABLED` | `true` | `true`, `false` | Master toggle for the CIELAB page restoration & auto-leveling pipeline. |
+| `auto_levels.enabled` | `KURP_AUTO_LEVELS__ENABLED` | `true` | `true`, `false` | Master toggle for the CIELAB page restoration & auto-leveling pipeline (all detection, spline, sepia/high-key/low-key vetoes, and 3-tier quality guard thresholds are calibrated internally). |
+| `auto_levels.correct_paper_cast` | `KURP_AUTO_LEVELS__CORRECT_PAPER_CAST` | `true` | `true`, `false` | Neutralizes aged paper color casts (yellow, blue, green, pink) and muddy shadow ink. When `false`, applies luminance-only stretching while preserving original warm/tinted paper (`paper_cast_preserved = true`). |
 | `auto_levels.output_grayscale_for_monochrome` | `KURP_AUTO_LEVELS__OUTPUT_GRAYSCALE_FOR_MONOCHROME` | `true` | `true`, `false` | Folds verified monochrome pages to 1-channel `Luma8` after upscaling (cutting lossless WebP/PNG size by 50–70%). |
-| `auto_levels.book_profile.cache_size` | `KURP_AUTO_LEVELS__BOOK_PROFILE__CACHE_SIZE` | `100` | `>= 1` | Maximum number of books cached in the in-memory `BookProfile` LRU cache. |
-| `auto_levels.book_profile.cache_ttl_seconds` | `KURP_AUTO_LEVELS__BOOK_PROFILE__CACHE_TTL_SECONDS` | `3600` | `>= 1` | Time-to-live in seconds for cached `BookProfile` entries. |
-| `auto_levels.book_profile.sample_pages` | `KURP_AUTO_LEVELS__BOOK_PROFILE__SAMPLE_PAGES` | `12` | `>= 1` | Number of evenly-spaced pages sampled across a book to establish the volume's median black-floor outlier guard. |
-| `auto_levels.book_profile.parallel_page_fetches` | `KURP_AUTO_LEVELS__BOOK_PROFILE__PARALLEL_PAGE_FETCHES` | `8` | `>= 1` | Global concurrency cap on background upstream page fetches during `BookProfile` sampling. |
-| `auto_levels.book_profile.timeout_seconds` | `KURP_AUTO_LEVELS__BOOK_PROFILE__TIMEOUT_SECONDS` | `45` | `>= 1` | Timeout in seconds before a `BookProfile` sampling task is cancelled (`JoinSet` aborts remaining fetches cleanly). |
-| `auto_levels.detection.black_clip_percent` | `KURP_AUTO_LEVELS__DETECTION__BLACK_CLIP_PERCENT` | `0.1` | `0.0..=25.0` | Lower luminance histogram clip percentile. |
-| `auto_levels.detection.white_clip_percent` | `KURP_AUTO_LEVELS__DETECTION__WHITE_CLIP_PERCENT` | `0.1` | `0.0..=25.0` | Upper luminance histogram clip percentile. |
-| `auto_levels.detection.surge_ratio_threshold` | `KURP_AUTO_LEVELS__DETECTION__SURGE_RATIO_THRESHOLD` | `2.8` | `> 0.0` | Histogram density surge ratio used for elevated shadow ink shelf detection. |
-| `auto_levels.detection.protect_sepia_artwork` | `KURP_AUTO_LEVELS__DETECTION__PROTECT_SEPIA_ARTWORK` | `true` | `true`, `false` | Enables the D65 CIELAB dual-zone sepia guard ($b^*_{\text{paper}} \ge 6.0, b^*_{\text{shadow}} \ge 5.0, a^*_{\text{shadow}} \ge 0.5, \Delta b^*_{\text{grid}} < 12.0$) to prevent bleaching intentional sepia art. |
-| `auto_levels.correction.max_black_shift` | `KURP_AUTO_LEVELS__CORRECTION__MAX_BLACK_SHIFT` | `85` | `0..=120` | Maximum shadow luminance level (`[2..=85]`) that may be anchored to black ink. |
-| `auto_levels.correction.min_white_threshold` | `KURP_AUTO_LEVELS__CORRECTION__MIN_WHITE_THRESHOLD` | `200` | `128..=255` | Minimum highlight luminance level eligible to be stretched to paper white. |
-| `auto_levels.correction.correct_paper_cast` | `KURP_AUTO_LEVELS__CORRECTION__CORRECT_PAPER_CAST` | `true` | `true`, `false` | Neutralizes aged paper color casts (yellow, blue, green, pink) and muddy shadow ink. When `false`, applies luminance-only stretching while preserving original paper tint (`paper_cast_preserved = true`). |
-| `auto_levels.correction.gamma` | `KURP_AUTO_LEVELS__CORRECTION__GAMMA` | `1.0` | `0.2..=5.0` | Midtone gamma shaping parameter for the Fritsch-Carlson spline midpoint knot $P_2$. |
-| `auto_levels.quality_guards.tier1.check_tail_erosion` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER1__CHECK_TAIL_EROSION` | `true` | `true`, `false` | Enables the Tier 1 midtone-crush (`<= 0.25`) check alongside the clamped positive-slope affine residual check (`MSE <= 220.0` / `PSNR >= 22.0 dB`). |
-| `auto_levels.quality_guards.tier1.min_dynamic_range` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER1__MIN_DYNAMIC_RANGE` | `64` | `0..=255` | Minimum output dynamic range ($p_{99} - p_1$) required by Tier 1 on non-narrow-input pages. |
-| `auto_levels.quality_guards.tier2.ssim_threshold` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER2__SSIM_THRESHOLD` | `0.92` | `0.0..=1.0` | Minimum structure-only SSIM required across active $8 \times 8$ blocks in Tier 2. |
-| `auto_levels.quality_guards.tier2.chroma_delta_p95` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER2__CHROMA_DELTA_P95` | `2.5` | `> 0.0` | Maximum 95th-percentile CIELAB $\Delta E_{\text{chroma}}$ drift allowed on non-cast pixels in Tier 2. |
-| `auto_levels.quality_guards.tier2.chroma_delta_median` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER2__CHROMA_DELTA_MEDIAN` | `1.5` | `> 0.0` | Maximum median CIELAB $\Delta E_{\text{chroma}}$ drift allowed on non-cast pixels in Tier 2. |
-| `auto_levels.quality_guards.tier3.gradient_ncc` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER3__GRADIENT_NCC` | `0.90` | `0.0..=1.0` | Minimum strided Sobel gradient Normalized Cross-Correlation required in Tier 3. |
-| `auto_levels.quality_guards.tier3.min_contrast_ratio` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER3__MIN_CONTRAST_RATIO` | `0.50` | `0.0..=1.0` | Minimum 1st-percentile ($p_{01}$) $32 \times 32$ block Michelson contrast retention ratio in Tier 3. |
-| `auto_levels.quality_guards.tier3.stride` | `KURP_AUTO_LEVELS__QUALITY_GUARDS__TIER3__STRIDE` | `4` | `>= 1` | Pixel sampling stride for the Tier 3 tile-seam-safe Sobel gradient check. |
 
 ---
 
@@ -297,10 +253,6 @@ If you only want specific series or books processed:
 When `allow_config_updates: true` is set in `config.yml`, Kurp mounts:
 - `GET /kurp/config` — Returns the active `AppConfig` as JSON.
 - `POST /kurp/config` — Validates a JSON `AppConfig` payload, atomically swaps the in-memory `ArcSwap<AppConfig>` (rebuilding the `RealCugan` engine if `upscale` or `realcugan.*` parameters changed), persists the updated configuration to `<KURP_CONF_DIR>/config.yml`, and automatically restarts the HTTP listener if `port` changed.
-
-When `config_api_token` is configured, all requests to `/kurp/config` must include either:
-- `Authorization: Bearer <config_api_token>`
-- `X-Kurp-Token: <config_api_token>`
 
 ---
 

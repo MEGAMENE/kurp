@@ -601,6 +601,14 @@ pub struct TestKurpServer {
 
 impl TestKurpServer {
     pub async fn start(config: AppConfig, upscaler: Arc<UpscaleEngine>) -> Self {
+        Self::start_with_profile_limits(config, upscaler, None).await
+    }
+
+    pub async fn start_with_profile_limits(
+        config: AppConfig,
+        upscaler: Arc<UpscaleEngine>,
+        profile_limits: Option<(usize, usize, u64)>,
+    ) -> Self {
         let reqwest_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
@@ -612,10 +620,17 @@ impl TestKurpServer {
         let proxy_client = Arc::new(ProxyClient::new(reqwest_client, upstream));
         let upscale_tag_checker =
             Arc::new(UpscaleTagChecker::new(config.upscale_tag.clone(), komga_client.clone()));
-        let book_profile_manager = Arc::new(BookProfileManager::new(
-            komga_client.clone(),
-            &config.auto_levels.book_profile,
-        ));
+        let book_profile_manager = Arc::new(match profile_limits {
+            Some((sample_pages, parallel_fetches, timeout_secs)) => BookProfileManager::with_limits(
+                komga_client.clone(),
+                100,
+                3600,
+                sample_pages,
+                parallel_fetches,
+                timeout_secs,
+            ),
+            None => BookProfileManager::new(komga_client.clone()),
+        });
         let pipeline_semaphore = Arc::new(Semaphore::new(config.max_concurrent_pipelines.max(1)));
         let (reload_tx, _) = broadcast::channel::<()>(4);
 
@@ -680,7 +695,7 @@ pub fn create_cpu_upscale_config(upstream_url: &str) -> AppConfig {
     };
     cfg.realcugan.gpuid = -1;
     cfg.realcugan.tile_size = 400;
-    cfg.realcugan.num_threads = Some(2);
+    cfg.realcugan.num_threads = 2;
     cfg.realcugan.models_path = models_dir;
     cfg
 }

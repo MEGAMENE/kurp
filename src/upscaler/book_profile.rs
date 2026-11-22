@@ -8,12 +8,18 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::clients::komga_client::{ForwardAuthHeaders, KomgaClient};
-use crate::config::app_config::{AutoLevelsConfig, BookProfileConfig};
+use crate::config::app_config::AutoLevelsConfig;
 use crate::upscaler::auto_levels::{PageClassification, analyze_page};
 use crate::upscaler::avif::{decode_image_with_metadata, probe_image_dimensions};
 
 /// Safety ceiling on page dimensions decoded during lightweight book profiling.
 const PROFILE_MAX_DECODE_DIMENSION: u32 = 16384;
+
+pub const DEFAULT_BOOK_PROFILE_CACHE_SIZE: usize = 100;
+pub const DEFAULT_BOOK_PROFILE_CACHE_TTL_SECS: u64 = 3600;
+pub const DEFAULT_BOOK_PROFILE_SAMPLE_PAGES: usize = 12;
+pub const DEFAULT_BOOK_PROFILE_PARALLEL_FETCHES: usize = 8;
+pub const DEFAULT_BOOK_PROFILE_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClassificationGroupStats {
@@ -173,10 +179,28 @@ pub struct BookProfileManager {
 }
 
 impl BookProfileManager {
-    pub fn new(komga_client: Arc<KomgaClient>, config: &BookProfileConfig) -> Self {
+    pub fn new(komga_client: Arc<KomgaClient>) -> Self {
+        Self::with_limits(
+            komga_client,
+            DEFAULT_BOOK_PROFILE_CACHE_SIZE,
+            DEFAULT_BOOK_PROFILE_CACHE_TTL_SECS,
+            DEFAULT_BOOK_PROFILE_SAMPLE_PAGES,
+            DEFAULT_BOOK_PROFILE_PARALLEL_FETCHES,
+            DEFAULT_BOOK_PROFILE_TIMEOUT_SECS,
+        )
+    }
+
+    pub fn with_limits(
+        komga_client: Arc<KomgaClient>,
+        cache_size: usize,
+        cache_ttl_seconds: u64,
+        sample_pages: usize,
+        parallel_page_fetches: usize,
+        timeout_seconds: u64,
+    ) -> Self {
         let profile_cache = Cache::builder()
-            .max_capacity(config.cache_size.max(1) as u64)
-            .time_to_idle(Duration::from_secs(config.cache_ttl_seconds.max(60)))
+            .max_capacity(cache_size.max(1) as u64)
+            .time_to_idle(Duration::from_secs(cache_ttl_seconds.max(60)))
             .build();
 
         let negative_cache = Cache::builder()
@@ -188,13 +212,13 @@ impl BookProfileManager {
             profile_cache,
             negative_cache,
             komga_client,
-            fetch_semaphore: Arc::new(Semaphore::new(config.parallel_page_fetches.max(1))),
-            sample_pages: config.sample_pages.max(1),
-            timeout_seconds: config.timeout_seconds.max(1),
+            fetch_semaphore: Arc::new(Semaphore::new(parallel_page_fetches.max(1))),
+            sample_pages: sample_pages.max(1),
+            timeout_seconds: timeout_seconds.max(1),
         }
     }
 
-    /// Synchronously resolves or builds a sampled `BookProfile` (sampling `config.sample_pages`
+    /// Synchronously resolves or builds a sampled `BookProfile` (sampling `sample_pages`
     /// evenly-spaced pages with `JoinSet` cancellation on timeout/drop and a shared global
     /// fetch semaphore). Auth errors (`401`/`403`) and empty page lists are never poisoned into
     /// shared caches across users.

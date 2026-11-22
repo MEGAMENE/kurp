@@ -1,59 +1,36 @@
-port: 3030
-upstream_url: "http://localhost:8080"
-allow_config_updates: false
-# config_api_token: "change-me-if-config-updates-enabled"
-upscale: true
-size_threshold_enabled: true
-size_threshold: 500
-size_threshold_png: 1000
-max_upscale_dimension: 4000
-jpeg_quality: 90
-max_concurrent_pipelines: 6
-# rayon_threads: 8
+port: 3030 # listen port (1..65535)
+upstream_url: "http://localhost:8080" # upstream Komga URL (for example http://localhost:25600)
+allow_config_updates: false # exposes GET and POST /kurp/config endpoints that allow runtime config updates (true/false)
+
+upscale: true # enable upscaling and auto-leveling pipeline (true/false; false proxies all pages untouched)
+upscale_tag: # if set (e.g. "upscale"), only process Komga books or series with this tag; blank processes all books
+size_threshold_enabled: true # enable input file size check before upscaling (true/false)
+size_threshold: 500 # in KiB; will not upscale if non-PNG image size exceeds this value (>=0)
+size_threshold_png: 1000 # in KiB; will not upscale if PNG image size exceeds this value (>=0)
+max_upscale_dimension: 4000 # in px; will not upscale if source width or height exceeds this value (0=disabled)
+
+# output image format after upscaling ("WebP", "Jpeg", "Png", or "Original")
+# WebP encodes losslessly via libwebp (falling back to PNG above 16383px); Original keeps the source format (AVIF converts to WebP)
 return_format: WebP
-# upscale_tag: "upscale"
+jpeg_quality: 90 # JPEG quality when return_format (or ?convert=jpeg) outputs Jpeg (1..100)
+
+max_concurrent_pipelines: 6 # maximum number of pages decoded, leveled, upscaled, and encoded concurrently (>=1)
+rayon_threads: 0 # CPU threads for auto-levels parallel processing (>=1, 0=auto using all logical cores)
 
 realcugan:
-  gpuid: 0
-  scale: 2
-  noise: -1
-  model: Se
-  tile_size: 0
-  sync_gap: 2
-  tta_level: 1
-  use_fp16_arithmetic: false
-  # num_threads: 4
-  concurrent_jobs: 1
-  models_path: "./models"
+  gpuid: 0 # Vulkan GPU device to use (-1=CPU; single GPU is usually 0; unsupported GPUs auto-route to CPU)
+  model: Se # Real-CUGAN model family (Se, Pro, Nose)
+  scale: 2 # upscale ratio (2/3/4; Se supports 2/3/4, Pro supports 2/3, Nose supports 2)
+  noise: -1 # denoise level (-1=conservative, 0=none, 1/2/3=denoise1x..3x; 1/2 only on Se 2x, Nose supports 0 only, Pro supports -1/0/3)
+  tile_size: 0 # tile size in pixels (>=32, 0=auto based on GPU VRAM)
+  sync_gap: 2 # Vulkan sync gap mode (0=none, 1=accurate, 2=rough, 3=very rough)
+  tta_level: 1 # Test-Time Augmentation passes (1=disabled/fastest, 2/4/8=higher quality and proportionally slower)
+  use_fp16_arithmetic: false # enable FP16 shader math (true/false; keep false to prevent black-tile artifacts on large pages)
+  concurrent_jobs: 1 # max concurrent Real-CUGAN inference jobs (>=1; keep 1-2 on consumer GPUs to avoid VRAM OOM)
+  num_threads: 0 # CPU thread count for NCNN/CPU upscaling (>=1, 0=auto)
+  models_path: "./models" # path to directory containing models-se, models-pro, and models-nose
 
 auto_levels:
-  enabled: true
-  output_grayscale_for_monochrome: true
-  book_profile:
-    cache_size: 100
-    cache_ttl_seconds: 3600
-    sample_pages: 12
-    parallel_page_fetches: 8
-    timeout_seconds: 45
-  detection:
-    black_clip_percent: 0.1
-    white_clip_percent: 0.1
-    surge_ratio_threshold: 2.8
-    protect_sepia_artwork: true
-  correction:
-    max_black_shift: 85
-    min_white_threshold: 200
-    correct_paper_cast: true
-    gamma: 1.0
-  quality_guards:
-    tier1:
-      check_tail_erosion: true
-      min_dynamic_range: 64
-    tier2:
-      ssim_threshold: 0.92
-      chroma_delta_p95: 2.5
-      chroma_delta_median: 1.5
-    tier3:
-      gradient_ncc: 0.90
-      min_contrast_ratio: 0.50
-      stride: 4
+  enabled: true # enable CIELAB page restoration and auto-leveling before upscaling (true/false)
+  correct_paper_cast: true # neutralize aged or tinted paper casts and muddy shadows (true/false; false keeps original paper tint)
+  output_grayscale_for_monochrome: true # fold verified monochrome pages to 1-channel Luma8 after upscaling (true/false; cuts file size 50-70%)

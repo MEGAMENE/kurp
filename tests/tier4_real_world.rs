@@ -79,11 +79,13 @@ async fn test_tier4_book_profile_12_of_200_even_sampling_and_outlier_guard() {
     let page_bytes = encode_to_png_bytes(&generate_m4_aged_paper_page(400, 400));
     komga.set_default_book_pages("vol-200", 200, MockPageEntry::png(page_bytes));
 
-    let mut cfg = create_cpu_upscale_config(&komga.base_url);
-    cfg.auto_levels.book_profile.sample_pages = 12;
-    cfg.auto_levels.book_profile.parallel_page_fetches = 4;
-
-    let kurp = TestKurpServer::start(cfg.clone(), Arc::new(UpscaleEngine::new_empty())).await;
+    let cfg = create_cpu_upscale_config(&komga.base_url);
+    let kurp = TestKurpServer::start_with_profile_limits(
+        cfg.clone(),
+        Arc::new(UpscaleEngine::new_empty()),
+        Some((12, 4, 45)),
+    )
+    .await;
     let auth = ForwardAuthHeaders::default();
 
     let profile = kurp
@@ -132,11 +134,13 @@ async fn test_tier4_book_profile_joinset_timeout_cancellation_and_empty_pages_no
     komga.set_default_book_pages("slow-vol", 20, MockPageEntry::png(page_bytes));
     komga.set_page_delay(Duration::from_secs(5));
 
-    let mut cfg = create_cpu_upscale_config(&komga.base_url);
-    cfg.auto_levels.book_profile.timeout_seconds = 1;
-    cfg.auto_levels.book_profile.sample_pages = 10;
-
-    let kurp = TestKurpServer::start(cfg.clone(), Arc::new(UpscaleEngine::new_empty())).await;
+    let cfg = create_cpu_upscale_config(&komga.base_url);
+    let kurp = TestKurpServer::start_with_profile_limits(
+        cfg.clone(),
+        Arc::new(UpscaleEngine::new_empty()),
+        Some((10, 8, 1)),
+    )
+    .await;
     let auth = ForwardAuthHeaders::default();
 
     // Timeout must abort all in-flight JoinSet tasks promptly (~1s, never 5s!)
@@ -246,11 +250,10 @@ async fn test_tier4_parallel_page1_body_drain_and_pipeline_backpressure() {
 
     let mut cfg = create_cpu_upscale_config(&komga.base_url);
     cfg.max_concurrent_pipelines = 2;
-    cfg.auto_levels.book_profile.sample_pages = 6;
-    cfg.auto_levels.book_profile.parallel_page_fetches = 3;
 
     let upscaler = Arc::new(UpscaleEngine::init(&cfg).await.expect("CPU upscaler init"));
-    let kurp = TestKurpServer::start(cfg, upscaler.clone()).await;
+    let kurp =
+        TestKurpServer::start_with_profile_limits(cfg, upscaler.clone(), Some((6, 3, 45))).await;
     let client = reqwest::Client::new();
 
     // Concurrent requests across all 6 pages share BookProfile coalescing + bounded pipeline semaphore
