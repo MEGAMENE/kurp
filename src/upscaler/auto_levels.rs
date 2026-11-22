@@ -1277,6 +1277,7 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
     let min_cell_samples = ((acc.sampled_pixels / 16) / 25).clamp(5, 25) as u32;
     let mut cell_a = [paper_a; 16];
     let mut cell_b = [paper_b; 16];
+    let mut cell_valid = [false; 16];
     let mut valid_cell_count = 0usize;
 
     let mut min_a = f32::MAX;
@@ -1323,6 +1324,7 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
 
             cell_a[c_idx] = med_a;
             cell_b[c_idx] = med_b;
+            cell_valid[c_idx] = true;
             valid_cell_count += 1;
 
             min_a = min_a.min(med_a);
@@ -1363,7 +1365,57 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
     };
     let border_minus_core_c = (max_border_c - core_ref_c).max(0.0);
 
-    let has_localized_margin_cast = delta_grid >= 12.0 && border_minus_core_c >= 10.0;
+    // Require true perimeter margin geometry with consistent hue alignment (cos >= 0.70):
+    // >= 3 cast corners OR opposite mid-edge pairs ((top & bottom) or (left & right)).
+    // Prevents a single pastel sky/panel along one edge from impersonating localized margin
+    // paper yellowing and stripping a color panel to Monochrome!
+    let mut cast_corners = 0usize;
+    let mut has_top_mid_cast = false;
+    let mut has_bottom_mid_cast = false;
+    let mut has_left_mid_cast = false;
+    let mut has_right_mid_cast = false;
+    if max_border_c > 1e-4 && border_minus_core_c >= 10.0 {
+        for c_idx in 0..16 {
+            if !cell_valid[c_idx] {
+                continue;
+            }
+            let r = c_idx / 4;
+            let c = c_idx % 4;
+            let is_border = r == 0 || r == 3 || c == 0 || c == 3;
+            if !is_border {
+                continue;
+            }
+            let ma = cell_a[c_idx];
+            let mb = cell_b[c_idx];
+            let c_cell = ma.hypot(mb);
+            if c_cell < core_ref_c + 10.0 {
+                continue;
+            }
+            let cos_align =
+                (ma * max_border_ab.0 + mb * max_border_ab.1) / (c_cell * max_border_c);
+            if cos_align < 0.70 {
+                continue;
+            }
+            let is_corner = (r == 0 || r == 3) && (c == 0 || c == 3);
+            if is_corner {
+                cast_corners += 1;
+            } else if r == 0 {
+                has_top_mid_cast = true;
+            } else if r == 3 {
+                has_bottom_mid_cast = true;
+            } else if c == 0 {
+                has_left_mid_cast = true;
+            } else {
+                has_right_mid_cast = true;
+            }
+        }
+    }
+    let has_perimeter_margin = cast_corners >= 3
+        || (has_top_mid_cast && has_bottom_mid_cast)
+        || (has_left_mid_cast && has_right_mid_cast);
+
+    let has_localized_margin_cast =
+        delta_grid >= 12.0 && border_minus_core_c >= 10.0 && has_perimeter_margin;
     let has_global_cast = paper_c > 3.5;
 
     let c_max = paper_c.max(max_valid_cell_c);
@@ -1398,51 +1450,96 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
         && delta_b_grid < 12.0;
 
     // 4. Residual Chroma Classification (R_res & R_accent)
+    let p95_y = histogram_percentile(&acc.hist_y, hist_total, 95.0);
+    let bright_paper_mass = acc.hist_y[200..=255]
+        .iter()
+        .map(|&c| c as u64)
+        .sum::<u64>() as f64
+        / hist_total as f64;
+
     let chromatic_midtone_mass = acc.chromatic_midtone_count as f32 / acc.sampled_pixels as f32;
     let allow_cast_exclusion = !is_intentional_sepia
         && (has_global_cast || has_localized_margin_cast)
         && chromatic_midtone_mass <= 0.05
         && dom_c > 1e-4;
-
-    let (res_colored_count, res_accent_count) = if allow_cast_exclusion {
-        let mut colored = 0usize;
-        let mut accents = 0usize;
-        for s in &acc.chromatic_samples {
-            let c_par = s.a * dom_u_a + s.b * dom_u_b;
-            let c_perp = (s.a * dom_u_b - s.b * dom_u_a).abs();
-            // (a) Paper-cast ray (covers global cast, corner cells, and edge strips along cast axis)
-            if s.l >= 65.0 && c_par >= 0.0 && c_par <= c_max * 1.15 && c_perp <= 5.0 {
-                continue;
-            }
-            // (b) Low-chroma muddy shadow ink (e.g. M2 [27, 18, 6])
-            let c_sq = s.a * s.a + s.b * s.b;
-            if s.l < 45.0 && c_sq <= 100.0 && s.a.abs() <= 4.5 && s.b > 0.0 {
-                continue;
-            }
-            colored += 1;
-            let c_res = if s.l >= 65.0 && c_par > 0.0 {
-                let sub = c_par.min(c_max);
-                (s.a - sub * dom_u_a).hypot(s.b - sub * dom_u_b)
-            } else {
-                c_sq.sqrt()
-            };
-            if c_res >= 15.0 {
-                accents += 1;
-            }
-        }
-        (colored, accents)
-    } else {
-        (acc.raw_colored_count, acc.raw_accent_count)
+    let is_cast_muddy_shadow = |s: &ChromaticSample| -> bool {
+        let c_sq = s.a * s.a + s.b * s.b;
+        s.l < 45.0 && c_sq <= 100.0 && s.a.abs() <= 4.5 && s.b > 0.0
     };
+    // On neutral/white paper (no verified paper cast), only treat true dark warm shadows
+    // (L* < 22.0, sRGB Y <= 50) as muddy ink — never brown/olive midtones (Y = 51..106) —
+    // and require real white paper (>= 30% in Y >= 200), non-low-key p95 >= 130, and
+    // <= 5% non-muddy saturated pixels (C* >= 12 across ALL L*, catching dark blues & pastels).
+    let is_neutral_muddy_shadow = |s: &ChromaticSample| -> bool {
+        let c_sq = s.a * s.a + s.b * s.b;
+        s.l < 22.0 && c_sq <= 100.0 && s.a.abs() <= 4.5 && s.b > 0.0
+    };
+    let allow_muddy_shadow_exclusion = !is_intentional_sepia
+        && !allow_cast_exclusion
+        && p95_y >= 130.0
+        && paper_l_peak >= 65.0
+        && bright_paper_mass >= 0.30
+        && chromatic_midtone_mass <= 0.05
+        && !acc.chromatic_samples.is_empty()
+        && {
+            let mut muddy_count = 0usize;
+            let mut non_muddy_sat_count = 0usize;
+            for s in &acc.chromatic_samples {
+                if is_neutral_muddy_shadow(s) {
+                    muddy_count += 1;
+                } else if (s.a * s.a + s.b * s.b) >= 144.0 {
+                    non_muddy_sat_count += 1;
+                }
+            }
+            (muddy_count as f32 / acc.chromatic_samples.len() as f32) >= 0.60
+                && (non_muddy_sat_count as f32 / acc.sampled_pixels as f32) <= 0.05
+        };
+
+    let (res_colored_count, res_accent_count) =
+        if allow_cast_exclusion || allow_muddy_shadow_exclusion {
+            let mut colored = 0usize;
+            let mut accents = 0usize;
+            for s in &acc.chromatic_samples {
+                let c_par = s.a * dom_u_a + s.b * dom_u_b;
+                // (a) Paper-cast ray (covers global cast, corner cells, and edge strips along cast axis)
+                if allow_cast_exclusion && s.l >= 65.0 {
+                    let c_perp = (s.a * dom_u_b - s.b * dom_u_a).abs();
+                    if c_par >= 0.0 && c_par <= c_max * 1.15 && c_perp <= 5.0 {
+                        continue;
+                    }
+                }
+                // (b) Low-chroma muddy shadow ink (stricter L* < 22 on neutral paper)
+                if (allow_cast_exclusion && is_cast_muddy_shadow(s))
+                    || (allow_muddy_shadow_exclusion && is_neutral_muddy_shadow(s))
+                {
+                    continue;
+                }
+                colored += 1;
+                let c_res = if allow_cast_exclusion && s.l >= 65.0 && c_par > 0.0 {
+                    let sub = c_par.min(c_max);
+                    (s.a - sub * dom_u_a).hypot(s.b - sub * dom_u_b)
+                } else {
+                    s.a.hypot(s.b)
+                };
+                if c_res >= 15.0 {
+                    accents += 1;
+                }
+            }
+            (colored, accents)
+        } else {
+            (acc.raw_colored_count, acc.raw_accent_count)
+        };
 
     let r_res = res_colored_count as f32 / acc.sampled_pixels as f32;
     let r_accent = res_accent_count as f32 / acc.sampled_pixels as f32;
 
+    // Never allow neutral-paper muddy-shadow exclusion to downgrade a page to Monochrome
+    // (which would trigger post-upscale Luma8 grayscale folding even when was_leveled == false!).
     let classification = if is_already_luma {
         PageClassification::Monochrome
     } else if r_res > 0.15 || is_intentional_sepia {
         PageClassification::Color
-    } else if r_res <= 0.015 && r_accent < 0.0005 {
+    } else if r_res <= 0.015 && r_accent < 0.0005 && !allow_muddy_shadow_exclusion {
         PageClassification::Monochrome
     } else {
         PageClassification::Mixed
@@ -1521,7 +1618,6 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
 
     // 5. Unified Atmospheric Vetoes (High-Key & Low-Key)
     let p1_y = histogram_percentile(&acc.hist_y, hist_total, 1.0);
-    let p95_y = histogram_percentile(&acc.hist_y, hist_total, 95.0);
     let p99_y = histogram_percentile(&acc.hist_y, hist_total, 99.0);
     let low_key_veto = p95_y < 130.0 || paper_l_peak < 65.0;
 
@@ -1532,6 +1628,7 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
     let mut defects = Vec::new();
 
     if !high_key_veto
+        && !low_key_veto
         && let Some(d) = detect_elevated_black_floor(&acc.hist_y, classification)
     {
         if let DefectType::ElevatedBlackFloor {
@@ -1629,16 +1726,15 @@ fn populate_luma_paper_peak(
 // ============================================================================
 
 /// Detects a compact bimodal washed-out black ink shelf in `[8..=35]` (e.g. lifted scan/rip
-/// black floors at `Y = 15..28`) even when anti-aliased digital typesetting (`Y = 0..10`)
-/// pulls `shadow_p2` below the actual ink peak.
+/// black floors at `Y = 15..28`) specifically when a digital black spike (`0.0005 < m_zero < 0.035`)
+/// has anti-aliased text fringes (`Y = 3..10`) that pull `shadow_p2` below the actual ink peak.
 fn detect_compact_ink_shelf(
     hist: &[u32; 256],
     h_smooth: &[f32; 256],
     hist_total: u64,
-    m_zero: f64,
     hi: f32,
 ) -> Option<u8> {
-    let start_trough = if m_zero > 0.0005 { 5 } else { 2 };
+    const START_TROUGH: usize = 5; // Kernel radius 2 excludes the 0..=2 digital black spike
     let search_valley_hi = (hi.floor() as usize).min(140);
 
     // Scan from low to high for the FIRST validated compact ink peak in [8..=35] so an
@@ -1674,29 +1770,39 @@ fn detect_compact_ink_shelf(
             continue;
         }
 
-        // Sharp pre-peak trough (surge >= 4.0x above trough) to veto continuous dark ramps (T1a)
-        if peak_idx <= start_trough {
-            continue;
-        }
-        let mut min_before = f32::MAX;
-        let mut trough_idx = start_trough;
-        for (j, &val) in h_smooth.iter().enumerate().take(peak_idx).skip(start_trough) {
+        // Descend LEFT from `peak_idx` to find the immediate pre-peak trough, stopping as soon as
+        // the curve climbs back up or flattens into a dark-art plateau (prevents zero-bin pinning
+        // or flat-plateau sliding from blinding the dark-ink guard to dark artwork below peak_idx).
+        let mut min_before = h_peak;
+        let mut trough_idx = peak_idx;
+        let flat_eps = 0.0005 * hist_total as f32;
+        for j in (START_TROUGH..peak_idx).rev() {
+            let val = h_smooth[j];
             if val < min_before {
                 min_before = val;
                 trough_idx = j;
+            } else if min_before < 0.25 * h_peak {
+                break;
+            }
+            if min_before < 0.25 * h_peak
+                && j > START_TROUGH
+                && h_smooth[j - 1] >= min_before * 0.85 - flat_eps
+            {
+                break;
             }
         }
-        if min_before >= 0.25 * h_peak {
+        // Require sharp pre-peak trough (surge >= 4.0x above trough) to veto continuous dark ramps (T1a)
+        if trough_idx == peak_idx || min_before >= 0.25 * h_peak {
             continue;
         }
 
-        // Protect authentic darker ink below the trough (e.g. real dark ink at Y=4 + gray tone at Y=25)
-        let non_zero_below_trough: u64 = hist[3..=trough_idx].iter().map(|&c| c as u64).sum();
-        if (non_zero_below_trough as f64 / hist_total as f64) >= 0.035 {
-            continue;
-        }
+        // Unified dark-ink cap across ALL pixels below the immediate pre-peak trough (eliminates
+        // split-cap loopholes between 0..=2 and 3..=trough_idx and blocks crushing earlier dark art)
         let below_trough_count: u64 = hist[0..=trough_idx].iter().map(|&c| c as u64).sum();
         let below_trough_mass = below_trough_count as f64 / hist_total as f64;
+        if below_trough_mass >= 0.035 {
+            continue;
+        }
         if below_trough_mass >= 0.002
             && shelf_mass < (below_trough_count as f64 * 1.25).round() as u64
         {
@@ -1709,29 +1815,29 @@ fn detect_compact_ink_shelf(
             continue;
         }
         let mut min_after = f32::MAX;
-        let mut valley_idx = start_valley;
-        for (j, &val) in h_smooth
+        for &val in h_smooth
             .iter()
-            .enumerate()
             .take(search_valley_hi + 1)
             .skip(start_valley)
         {
             if val < min_after {
                 min_after = val;
-                valley_idx = j;
             }
         }
         if min_after < 0.35 * h_peak {
-            return Some(peak_idx.min(valley_idx) as u8);
+            // Anchor at the left half-max foot of the shelf peak so narrow 1-bin spikes land right at
+            // peak_idx - 1 (mapping peak -> Y' <= 3) while wider Gaussian scans retain left-tail shadow detail.
+            let left_foot = (left_fwhm + 1).max(trough_idx + 1).min(peak_idx);
+            return Some(left_foot as u8);
         }
     }
 
     None
 }
 
-/// Unified shadow detector over `[2..=85]` with strict `m_zero < 0.035` cap, compact ink shelf
-/// detection in `[8..=35]` (immune to anti-aliased typeset text tails), no `p1 < 3` dead zone,
-/// shadow-band `eff_black` primary candidate, dual pre/post-peak valley validation, and ratio-normalized counts.
+/// Unified shadow detector over `[2..=85]` with strict `m_zero < 0.035` cap, low-key veto (`p95 >= 130`),
+/// compact ink shelf detection in `[8..=35]` (for `0.0005 < m_zero < 0.035` AA text tails), no `p1 < 3`
+/// dead zone, shadow-band `eff_black` primary candidate, dual pre/post-peak valley validation, and ratio-normalized counts.
 pub fn detect_elevated_black_floor(
     hist: &[u32; 256],
     classification: PageClassification,
@@ -1741,6 +1847,12 @@ pub fn detect_elevated_black_floor(
     }
     let hist_total: u64 = hist.iter().map(|&c| c as u64).sum();
     if hist_total == 0 {
+        return None;
+    }
+
+    // Low-Key Scene Veto: do not crush night splashes / dark low-key scenes
+    let p95 = histogram_percentile(hist, hist_total, 95.0);
+    if p95 < 130.0 {
         return None;
     }
 
@@ -1760,20 +1872,18 @@ pub fn detect_elevated_black_floor(
     let p1 = histogram_percentile(hist, hist_total, 1.0);
     let p99 = histogram_percentile(hist, hist_total, 99.0);
     let hi = find_effective_white(hist, p99);
-    let h_smooth = smooth_histogram_binomial_5(hist);
-
-    // 1. Compact bimodal ink shelf in [8..=35] (handles real-world lifted blacks alongside AA text)
-    if let Some(shelf_floor) =
-        detect_compact_ink_shelf(hist, &h_smooth, hist_total, m_zero, hi)
-    {
-        return Some(DefectType::ElevatedBlackFloor {
-            floor_value: shelf_floor,
-            is_bimodal: true,
-        });
-    }
 
     let (validated_lo, is_bimodal) = if m_zero > 0.0005 {
-        // Digital black spike present (0.05% < m_zero < 3.5%): no p1 < 3 branch split!
+        // 1. Compact bimodal ink shelf in [8..=35] (handles real-world lifted blacks alongside AA text)
+        let h_smooth = smooth_histogram_binomial_5(hist);
+        if let Some(shelf_floor) = detect_compact_ink_shelf(hist, &h_smooth, hist_total, hi) {
+            return Some(DefectType::ElevatedBlackFloor {
+                floor_value: shelf_floor,
+                is_bimodal: true,
+            });
+        }
+
+        // 2. Digital black spike present (0.05% < m_zero < 3.5%): no p1 < 3 branch split!
         let (nz_total, nz_p3) = nonzero_histogram_percentile(hist, 3.0);
         if (nz_total as f64 / hist_total as f64) < 0.02 || nz_p3 <= 8.0 {
             return None;
@@ -2025,10 +2135,17 @@ fn compute_cast_weight_with_unit(
     }
 
     let mut w_shadow = 0.0f32;
-    if plan.has_muddy_shadow_cast && l_star < 50.0 && b_star > 0.0 {
+    let sh_l_max = if plan.cast_field.active { 58.0 } else { 38.0 };
+    if plan.has_muddy_shadow_cast && l_star < sh_l_max && b_star > 0.0 {
         let c_sq = a_star * a_star + b_star * b_star;
         if c_sq < 132.25 && a_star.abs() < 5.5 {
-            let w_sh_l = 1.0 - smoothstep_inv(35.0, 1.0 / 15.0, l_star);
+            let w_sh_l = if plan.cast_field.active {
+                // Smoothly bridges into w_paper [55..70] with zero L* in [50, 55) dead zone
+                1.0 - smoothstep_inv(35.0, 1.0 / 23.0, l_star)
+            } else {
+                // On neutral/white-paper Mixed pages, align full weight with L* < 22 and C1-taper to 38
+                1.0 - smoothstep_inv(22.0, 1.0 / 16.0, l_star)
+            };
             let w_sh_c = if c_sq <= 72.25 {
                 1.0
             } else {
@@ -5999,6 +6116,427 @@ mod tests {
             ),
             "Must lock onto first ink peak Y=12, not jump to taller Y=30 tone (got {:?})",
             det_dual
+        );
+    }
+
+    #[test]
+    fn test_white_paper_dominant_muddy_shadow_ink_classifies_mixed_not_color() {
+        let _guard = TEST_RAYON_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let config = AutoLevelsConfig::default();
+
+        // 1. White paper ([252, 252, 250], C* < 3.5 -> no global paper cast) +
+        // 22.8% warm/muddy lifted dark border/background ([27, 17, 7], Y=17, L*=5.9, C*=6.7) +
+        // 0.35% colored title/credit badge ([215, 35, 35], C* >= 20).
+        // Must NOT trigger the Full-Color Veto! Must classify Mixed, level black_floor ~ 17,
+        // neutralize muddy shadow tint, preserve colored logo untouched, and pass Quality Guard.
+        let (w, h) = (720u32, 1024u32);
+        let img = ImageBuffer::from_fn(w, h, |x, y| {
+            if (20..65).contains(&y) && (80..140).contains(&x) {
+                Rgb([215u8, 35u8, 35u8]) // ~0.35% red title logo
+            } else if y >= 790 || (y >= 420 && !(40..680).contains(&x)) {
+                Rgb([27u8, 17u8, 7u8]) // ~25% warm/muddy lifted dark frame
+            } else if (200..400).contains(&y) && (x + y) % 5 == 0 {
+                Rgb([135u8, 135u8, 135u8]) // neutral halftone screentones
+            } else {
+                Rgb([252u8, 252u8, 250u8]) // clean neutral white paper
+            }
+        });
+
+        let (leveled, info, verdict) =
+            level_and_verify(DynamicImage::ImageRgb8(img), None, &config);
+        assert_eq!(
+            info.classification,
+            PageClassification::Mixed,
+            "White paper + dominant muddy shadow manga page with small logo must classify Mixed"
+        );
+        assert!(info.was_leveled && verdict.outcome == Outcome::Pass);
+        assert!(!verdict.attenuation_attempted);
+        assert!(
+            (15..=19).contains(&info.black_point),
+            "Expected black_point near 17, got {}",
+            info.black_point
+        );
+
+        let rgb = leveled.to_rgb8();
+        let border_px = rgb.get_pixel(20, 880).0;
+        let (_, bd_a, bd_b) = rgb_to_lab_fast(border_px[0], border_px[1], border_px[2]);
+        assert!(
+            border_px[0] <= 4 && border_px[1] <= 4 && border_px[2] <= 4,
+            "Muddy lifted dark frame [27,17,7] must restore to <= 4, got {:?}",
+            border_px
+        );
+        assert!(
+            bd_a.hypot(bd_b) <= 2.0,
+            "Muddy shadow chroma must neutralize (C*={:.2}, pixel={:?})",
+            bd_a.hypot(bd_b),
+            border_px
+        );
+        let logo_px = rgb.get_pixel(110, 42).0;
+        assert_eq!(logo_px, [215, 35, 35], "Red logo accent must stay bit-exact");
+
+        // 2. Moody dark full-color illustration ([20, 35, 95] deep blue darks covering 25%)
+        // MUST still veto unconditionally as PageClassification::Color!
+        let dark_color = ImageBuffer::from_fn(w, h, |_, y| {
+            if y >= 760 {
+                Rgb([20u8, 35u8, 95u8])
+            } else {
+                Rgb([252u8, 252u8, 250u8])
+            }
+        });
+        let (_out_color, color_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(dark_color), None, &config);
+        assert_eq!(color_info.classification, PageClassification::Color);
+        assert!(!color_info.was_leveled);
+    }
+
+    #[test]
+    fn test_compact_ink_shelf_adversarial_counterexamples() {
+        let _guard = TEST_RAYON_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let total = 100_000u32;
+
+        // 1.1a: m_zero == 0, 10% dark ink at Y=7 + 15% dark-gray fill at Y=25.
+        // Must NOT jump over Y=7 ink to crush Y=25 tone (floor_value <= 8).
+        let mut hist_1_1a = [0u32; 256];
+        hist_1_1a[7] = 10_000;
+        hist_1_1a[25] = 15_000;
+        hist_1_1a[255] = total - 25_000;
+        if let Some(DefectType::ElevatedBlackFloor { floor_value, .. }) =
+            detect_elevated_black_floor(&hist_1_1a, PageClassification::Monochrome)
+        {
+            assert!(
+                floor_value <= 8,
+                "1.1a: must not jump over 10% dark ink at Y=7 to Y=25 (got {})",
+                floor_value
+            );
+        }
+
+        // 1.1b: m_zero = 0.6% (Y=0) + 22% broad charcoal shading + 0.1% at Y=26 + 5% coat at Y=30.
+        // (i) Authentic charcoal starting at Y=3..=24 must veto completely (None).
+        let mut hist_1_1b_auth = [0u32; 256];
+        hist_1_1b_auth[0] = 600;
+        for bin in &mut hist_1_1b_auth[3..=24] {
+            *bin = 1_000; // 22 * 1000 = 22,000 (22% continuous dark charcoal)
+        }
+        hist_1_1b_auth[26] = 100;
+        hist_1_1b_auth[30] = 5_000;
+        hist_1_1b_auth[255] = total - hist_1_1b_auth.iter().sum::<u32>();
+        assert!(
+            detect_elevated_black_floor(&hist_1_1b_auth, PageClassification::Monochrome).is_none(),
+            "1.1b(i): broad authentic charcoal shading Y=3..24 before Y=30 coat must veto"
+        );
+
+        // (ii) Lifted broad charcoal Y=10..=24 + 0.1% at Y=26 + 5% coat at Y=30:
+        // compact shelf detector MUST veto Y=30, and unified detector must NEVER jump to Y=30!
+        let mut hist_1_1b_lifted = [0u32; 256];
+        hist_1_1b_lifted[0] = 600;
+        for bin in &mut hist_1_1b_lifted[10..=24] {
+            *bin = 1_467; // 15 * 1467 = 22,005 (~22%)
+        }
+        hist_1_1b_lifted[26] = 100;
+        hist_1_1b_lifted[30] = 5_000;
+        hist_1_1b_lifted[255] = total - hist_1_1b_lifted.iter().sum::<u32>();
+        let smooth_1_1b = smooth_histogram_binomial_5(&hist_1_1b_lifted);
+        assert!(
+            detect_compact_ink_shelf(&hist_1_1b_lifted, &smooth_1_1b, total as u64, 255.0)
+                .is_none(),
+            "1.1b(ii): compact ink shelf must NOT jump over Y=10..24 charcoal mound to Y=30"
+        );
+        if let Some(DefectType::ElevatedBlackFloor { floor_value, .. }) =
+            detect_elevated_black_floor(&hist_1_1b_lifted, PageClassification::Monochrome)
+        {
+            assert!(
+                floor_value <= 12,
+                "1.1b(ii): must stay at the Y=10 charcoal foot, never jump to Y=30 (got {})",
+                floor_value
+            );
+        }
+
+        // 1.1c: Flat dark-art plateau before Y=30 coat (must not slide trough_idx into an earlier zero bin).
+        // (i) Authentic flat dark plateau Y=3..=27 (3.75% total) + 0.6% Y=0 + 6% Y=30 coat -> strict veto.
+        let mut hist_1_1c_auth = [0u32; 256];
+        hist_1_1c_auth[0] = 600;
+        for bin in &mut hist_1_1c_auth[3..=27] {
+            *bin = 150; // 25 * 150 = 3,750 (3.75% flat plateau)
+        }
+        hist_1_1c_auth[30] = 6_000;
+        hist_1_1c_auth[255] = total - hist_1_1c_auth.iter().sum::<u32>();
+        assert!(
+            detect_elevated_black_floor(&hist_1_1c_auth, PageClassification::Monochrome).is_none(),
+            "1.1c(i): authentic flat 3.75% dark plateau Y=3..27 before Y=30 coat must veto"
+        );
+
+        // (ii) Lifted flat plateau Y=10..=27 (3.6% total) with zero bins at Y=6..=9 + 0.6% Y=0 + 6% Y=30:
+        // compact shelf detector MUST veto Y=30 (no sliding across flat plateau to Y=8 zero bin!).
+        let mut hist_1_1c_lifted = [0u32; 256];
+        hist_1_1c_lifted[0] = 600;
+        for bin in &mut hist_1_1c_lifted[10..=27] {
+            *bin = 200; // 18 * 200 = 3,600 (3.6% flat plateau)
+        }
+        hist_1_1c_lifted[30] = 6_000;
+        hist_1_1c_lifted[255] = total - hist_1_1c_lifted.iter().sum::<u32>();
+        let smooth_1_1c = smooth_histogram_binomial_5(&hist_1_1c_lifted);
+        assert!(
+            detect_compact_ink_shelf(&hist_1_1c_lifted, &smooth_1_1c, total as u64, 255.0)
+                .is_none(),
+            "1.1c(ii): compact ink shelf must NOT slide across flat 3.6% plateau Y=10..27 to Y=30"
+        );
+        if let Some(DefectType::ElevatedBlackFloor { floor_value, .. }) =
+            detect_elevated_black_floor(&hist_1_1c_lifted, PageClassification::Monochrome)
+        {
+            assert!(
+                floor_value <= 12,
+                "1.1c(ii): must stay at Y=10 plateau foot, never jump to Y=30 (got {})",
+                floor_value
+            );
+        }
+
+        // 1.2: m_zero == 0, 2.5% charcoal ink at Y=4 + 10% dark-gray fill at Y=25.
+        // Must NOT jump over Y=4 charcoal ink to crush Y=25.
+        let mut hist_1_2 = [0u32; 256];
+        hist_1_2[4] = 2_500;
+        hist_1_2[25] = 10_000;
+        hist_1_2[255] = total - 12_500;
+        if let Some(DefectType::ElevatedBlackFloor { floor_value, .. }) =
+            detect_elevated_black_floor(&hist_1_2, PageClassification::Monochrome)
+        {
+            assert!(
+                floor_value <= 5,
+                "1.2: must not jump over 2.5% charcoal ink at Y=4 to Y=25 (got {})",
+                floor_value
+            );
+        }
+
+        // 1.4: Split dark-ink loophole: 2.5% at Y=0 + 2.5% at Y=4 (5.0% total) + 8% dark-gray fill at Y=28.
+        // Unified hist[0..=trough_idx] < 3.5% cap must veto.
+        let mut hist_1_4 = [0u32; 256];
+        hist_1_4[0] = 2_500;
+        hist_1_4[4] = 2_500;
+        hist_1_4[28] = 8_000;
+        hist_1_4[255] = total - 13_000;
+        assert!(
+            detect_elevated_black_floor(&hist_1_4, PageClassification::Monochrome).is_none(),
+            "1.4: split 2.5% Y=0 + 2.5% Y=4 dark ink must veto Y=28 fill"
+        );
+
+        // 1.5: Wide Gaussian washed ink (sigma = 2.5 centered at Y=22, 15% total) + 0.6% Y=0 text.
+        // Must anchor at left half-max foot (< 22) rather than raw peak center 22 so left-tail
+        // shadow detail in Y=19..22 is preserved instead of flattened to <= 2.
+        let mut hist_1_5 = [0u32; 256];
+        hist_1_5[0] = 600;
+        let mut gauss_sum = 0.0f64;
+        let mut weights = [0.0f64; 256];
+        for (y, w) in weights.iter_mut().enumerate().take(36).skip(12) {
+            let d = (y as f64 - 22.0) / 2.5;
+            *w = (-0.5 * d * d).exp();
+            gauss_sum += *w;
+        }
+        for (y, &w) in weights.iter().enumerate().take(36).skip(12) {
+            hist_1_5[y] = ((w / gauss_sum) * 15_000.0).round() as u32;
+        }
+        hist_1_5[255] = total - hist_1_5.iter().sum::<u32>();
+        let det_1_5 = detect_elevated_black_floor(&hist_1_5, PageClassification::Monochrome)
+            .expect("1.5: wide Gaussian washed ink shelf at Y=22 must be detected");
+        assert!(
+            matches!(
+                det_1_5,
+                DefectType::ElevatedBlackFloor {
+                    floor_value: 18..=20,
+                    is_bimodal: true,
+                }
+            ),
+            "1.5: wide Gaussian washed ink at Y=22 must anchor at left foot (18..=20), got {:?}",
+            det_1_5
+        );
+
+        // 1.7: Low-key night splash (p95 < 130): 15% compact dark sky at Y=18 + 1.5% white stars +
+        // 83.5% dark gradient Y=40..90. Both detector and full pipeline must veto bit-exact.
+        let mut hist_1_7 = [0u32; 256];
+        hist_1_7[0] = 600;
+        hist_1_7[18] = 15_000;
+        hist_1_7[255] = 1_500;
+        let rem = total - hist_1_7[0] - hist_1_7[18] - hist_1_7[255];
+        for (i, bin) in hist_1_7[40..=89].iter_mut().enumerate() {
+            *bin = rem / 50 + u32::from(i < (rem % 50) as usize);
+        }
+        assert!(
+            detect_elevated_black_floor(&hist_1_7, PageClassification::Monochrome).is_none(),
+            "1.7: low-key night splash (p95 < 130) must veto black-floor shift"
+        );
+
+        let night_img = ImageBuffer::from_fn(480u32, 640u32, |x, y| {
+            let v = if y < 10 && x < 288 {
+                0u8 // ~0.9% dark border
+            } else if y < 106 {
+                18u8 // ~15% compact dark night sky
+            } else if y < 116 && x < 460 {
+                255u8 // ~1.5% pure-white stars
+            } else {
+                (40 + ((x + y) % 50)) as u8 // 83% dark clouds Y=40..89 -> p95 < 130
+            };
+            Rgb([v, v, v])
+        });
+        let orig_bytes = night_img.as_raw().clone();
+        let (out_night, info_night, _) =
+            level_and_verify(DynamicImage::ImageRgb8(night_img), None, &AutoLevelsConfig::default());
+        assert!(!info_night.was_leveled, "1.7: low-key night splash must not be leveled");
+        assert_eq!(out_night.to_rgb8().as_raw(), &orig_bytes, "1.7: must remain bit-exact");
+    }
+
+    #[test]
+    fn test_neutral_muddy_shadow_adversarial_counterexamples() {
+        let _guard = TEST_RAYON_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let config = AutoLevelsConfig::default();
+        let (w, h) = (600u32, 800u32);
+
+        // 2.1a: White paper + 30% warm earth/tan mid-darks RGB [80, 70, 57] (Y=71, L*=30.3, C*=9.5).
+        // Strictly outside neutral-paper L* < 22.0 shadow limit -> MUST veto as Color bit-exact!
+        let earth_img = ImageBuffer::from_fn(w, h, |_, y| {
+            if y >= 560 {
+                Rgb([80u8, 70u8, 57u8]) // 30% warm earth/tan mid-darks
+            } else {
+                Rgb([252u8, 252u8, 252u8])
+            }
+        });
+        let earth_raw = earth_img.as_raw().clone();
+        let (earth_out, earth_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(earth_img), None, &config);
+        assert_eq!(
+            earth_info.classification,
+            PageClassification::Color,
+            "2.1a: 30% warm earth/tan mid-darks (L*=30.3) must veto as Color"
+        );
+        assert!(!earth_info.was_leveled);
+        assert_eq!(earth_out.to_rgb8().as_raw(), &earth_raw);
+
+        // 2.1b: Digital white paper [255,255,255] + 4% authentic black [0,0,0] + 25% intentional
+        // warm-brown ink [35,24,14] (Y=26, L*=9.3, C*=9.0), ZERO colored logos. Must veto leveling
+        // bit-exact AND must NEVER classify Monochrome (so upscaler.rs never folds to Luma8!).
+        let warm_ink_img = ImageBuffer::from_fn(w, h, |_, y| {
+            if y < 32 {
+                Rgb([0u8, 0u8, 0u8]) // 4% authentic black ink
+            } else if y >= 600 {
+                Rgb([35u8, 24u8, 14u8]) // 25% intentional warm-brown ink
+            } else {
+                Rgb([255u8, 255u8, 255u8]) // optimal digital white paper
+            }
+        });
+        let warm_ink_raw = warm_ink_img.as_raw().clone();
+        let (warm_ink_out, warm_ink_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(warm_ink_img), None, &config);
+        assert!(!warm_ink_info.was_leveled, "2.1b: 4% authentic black must veto leveling");
+        assert_ne!(
+            warm_ink_info.classification,
+            PageClassification::Monochrome,
+            "2.1b: neutral-paper muddy shadow rescue must never classify Monochrome"
+        );
+        assert!(!warm_ink_info.is_monochrome);
+        assert!(
+            !crate::upscaler::upscaler::should_fold_luma(&warm_ink_info, true),
+            "2.1b: upscaler must NOT fold un-leveled warm-brown ink to 1-channel Luma8"
+        );
+        assert_eq!(warm_ink_out.to_rgb8().as_raw(), &warm_ink_raw);
+
+        // 2.2a: White paper (64%) + 22% warm shadows [27,17,7] + 14% deep navy [20,35,95] (L*=16.5 < 25).
+        // Must classify Color and veto bit-exact via non-muddy C* >= 12 guard across ALL L*!
+        let navy_img = ImageBuffer::from_fn(w, h, |_, y| {
+            if y >= 624 {
+                Rgb([27u8, 17u8, 7u8]) // 22% warm shadows
+            } else if y >= 512 {
+                Rgb([20u8, 35u8, 95u8]) // 14% deep navy (L* < 25, C* >= 30)
+            } else {
+                Rgb([252u8, 252u8, 252u8])
+            }
+        });
+        let navy_raw = navy_img.as_raw().clone();
+        let (navy_out, navy_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(navy_img), None, &config);
+        assert_eq!(
+            navy_info.classification,
+            PageClassification::Color,
+            "2.2a: 14% deep navy + 22% warm shadows must veto as Color"
+        );
+        assert!(!navy_info.was_leveled);
+        assert_eq!(navy_out.to_rgb8().as_raw(), &navy_raw);
+
+        // 2.2b: White paper (64%) + 22% warm shadows [27,17,7] + 14% pastel sky [180,220,250] (L*=86 > 70).
+        // Must classify Color and veto bit-exact via non-muddy C* >= 12 guard across ALL L*!
+        let pastel_img = ImageBuffer::from_fn(w, h, |_, y| {
+            if y >= 624 {
+                Rgb([27u8, 17u8, 7u8]) // 22% warm shadows
+            } else if y >= 512 {
+                Rgb([180u8, 220u8, 250u8]) // 14% bright pastel blue (L* > 70, C* ~ 17.7)
+            } else {
+                Rgb([252u8, 252u8, 252u8])
+            }
+        });
+        let pastel_raw = pastel_img.as_raw().clone();
+        let (pastel_out, pastel_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(pastel_img), None, &config);
+        assert_eq!(
+            pastel_info.classification,
+            PageClassification::Color,
+            "2.2b: 14% pastel sky + 22% warm shadows must veto as Color"
+        );
+        assert!(!pastel_info.was_leveled);
+        assert_eq!(pastel_out.to_rgb8().as_raw(), &pastel_raw);
+
+        // 2.3: Low-key warm night splash (98.5% warm darks [27,17,7]..[55,42,28] + 1.5% white stars).
+        // Must NOT trigger neutral-paper muddy shadow rescue -> must classify Color and veto bit-exact!
+        let warm_night_img = ImageBuffer::from_fn(w, h, |x, y| {
+            if y < 12 {
+                Rgb([255u8, 255u8, 255u8]) // 1.5% pure-white stars
+            } else {
+                let t = ((x + y) % 28) as u8;
+                Rgb([27 + t, 17 + (t * 25 / 28), 7 + (t * 21 / 28)])
+            }
+        });
+        let warm_night_raw = warm_night_img.as_raw().clone();
+        let (warm_night_out, warm_night_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(warm_night_img), None, &config);
+        assert_eq!(
+            warm_night_info.classification,
+            PageClassification::Color,
+            "2.3: low-key warm night splash with 1.5% white stars must veto as Color"
+        );
+        assert!(!warm_night_info.was_leveled);
+        assert_eq!(warm_night_out.to_rgb8().as_raw(), &warm_night_raw);
+
+        // 2.4: Aged-paper Mixed gradient continuity across L* in [50, 55) (no yellow dead-zone ring),
+        // while neutral-paper Mixed stays strictly zero above L* = 38.
+        let aged_plan = CorrectionPlan {
+            cast_strength: 1.0,
+            has_muddy_shadow_cast: true,
+            cast_field: PaperCastField {
+                active: true,
+                dom_u_a: 0.0,
+                dom_u_b: 1.0,
+                c_max: 14.0,
+                ..PaperCastField::default()
+            },
+            ..CorrectionPlan::default()
+        };
+        for l_mid in [50.0f32, 52.5, 54.9, 55.5] {
+            let w_aged =
+                compute_cast_weight_with_unit(l_mid, 0.0, 7.5, 14.0, 0.0, 1.0, &aged_plan);
+            assert!(
+                w_aged > 0.0,
+                "2.4: aged-paper Mixed gradient must remain active at L*={l_mid} (got {w_aged})"
+            );
+        }
+
+        let neutral_plan = CorrectionPlan {
+            cast_strength: 1.0,
+            has_muddy_shadow_cast: true,
+            cast_field: PaperCastField {
+                active: false,
+                ..PaperCastField::default()
+            },
+            ..CorrectionPlan::default()
+        };
+        assert_eq!(
+            compute_cast_weight_with_unit(39.0, 0.0, 7.5, 0.0, 0.0, 1.0, &neutral_plan),
+            0.0,
+            "2.4: neutral-paper Mixed shadow cast weight must be strictly 0 above L*=38"
         );
     }
 }
