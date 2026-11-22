@@ -1628,7 +1628,109 @@ fn populate_luma_paper_peak(
 // Unified Defect Detectors (Shadow Floor & Highlight Ceiling)
 // ============================================================================
 
-/// Unified shadow detector over `[2..=85]` with strict `m_zero < 0.035` cap, no `p1 < 3` dead zone,
+/// Detects a compact bimodal washed-out black ink shelf in `[8..=35]` (e.g. lifted scan/rip
+/// black floors at `Y = 15..28`) even when anti-aliased digital typesetting (`Y = 0..10`)
+/// pulls `shadow_p2` below the actual ink peak.
+fn detect_compact_ink_shelf(
+    hist: &[u32; 256],
+    h_smooth: &[f32; 256],
+    hist_total: u64,
+    m_zero: f64,
+    hi: f32,
+) -> Option<u8> {
+    let start_trough = if m_zero > 0.0005 { 5 } else { 2 };
+    let search_valley_hi = (hi.floor() as usize).min(140);
+
+    // Scan from low to high for the FIRST validated compact ink peak in [8..=35] so an
+    // earlier washed ink floor (e.g. Y=12) is never skipped in favor of a taller dark-gray tone (Y=30).
+    for peak_idx in 8..=35 {
+        let h_peak = h_smooth[peak_idx];
+        if h_peak < h_smooth[peak_idx - 1] || h_peak < h_smooth[peak_idx + 1] {
+            continue;
+        }
+        if h_peak < 0.003 * hist_total as f32 {
+            continue;
+        }
+
+        let p_lo = peak_idx.saturating_sub(2);
+        let p_hi = (peak_idx + 2).min(255);
+        let shelf_mass: u64 = hist[p_lo..=p_hi].iter().map(|&c| c as u64).sum();
+        if (shelf_mass as f64 / hist_total as f64) < 0.010 {
+            continue;
+        }
+
+        // Compact FWHM guard on smoothed histogram: rejects broad charcoal/shaded dark bands
+        let half_max = h_peak * 0.5;
+        let mut left_fwhm = peak_idx;
+        while left_fwhm > 0 && h_smooth[left_fwhm] >= half_max {
+            left_fwhm -= 1;
+        }
+        let mut right_fwhm = peak_idx;
+        while right_fwhm < 255 && h_smooth[right_fwhm] >= half_max {
+            right_fwhm += 1;
+        }
+        let fwhm = right_fwhm.saturating_sub(left_fwhm + 1).max(1);
+        if fwhm > 8 {
+            continue;
+        }
+
+        // Sharp pre-peak trough (surge >= 4.0x above trough) to veto continuous dark ramps (T1a)
+        if peak_idx <= start_trough {
+            continue;
+        }
+        let mut min_before = f32::MAX;
+        let mut trough_idx = start_trough;
+        for (j, &val) in h_smooth.iter().enumerate().take(peak_idx).skip(start_trough) {
+            if val < min_before {
+                min_before = val;
+                trough_idx = j;
+            }
+        }
+        if min_before >= 0.25 * h_peak {
+            continue;
+        }
+
+        // Protect authentic darker ink below the trough (e.g. real dark ink at Y=4 + gray tone at Y=25)
+        let non_zero_below_trough: u64 = hist[3..=trough_idx].iter().map(|&c| c as u64).sum();
+        if (non_zero_below_trough as f64 / hist_total as f64) >= 0.035 {
+            continue;
+        }
+        let below_trough_count: u64 = hist[0..=trough_idx].iter().map(|&c| c as u64).sum();
+        let below_trough_mass = below_trough_count as f64 / hist_total as f64;
+        if below_trough_mass >= 0.002
+            && shelf_mass < (below_trough_count as f64 * 1.25).round() as u64
+        {
+            continue;
+        }
+
+        // Post-peak bimodal valley validation (GEMINI.md §2.2)
+        let start_valley = (peak_idx + 1).min(search_valley_hi);
+        if start_valley >= search_valley_hi {
+            continue;
+        }
+        let mut min_after = f32::MAX;
+        let mut valley_idx = start_valley;
+        for (j, &val) in h_smooth
+            .iter()
+            .enumerate()
+            .take(search_valley_hi + 1)
+            .skip(start_valley)
+        {
+            if val < min_after {
+                min_after = val;
+                valley_idx = j;
+            }
+        }
+        if min_after < 0.35 * h_peak {
+            return Some(peak_idx.min(valley_idx) as u8);
+        }
+    }
+
+    None
+}
+
+/// Unified shadow detector over `[2..=85]` with strict `m_zero < 0.035` cap, compact ink shelf
+/// detection in `[8..=35]` (immune to anti-aliased typeset text tails), no `p1 < 3` dead zone,
 /// shadow-band `eff_black` primary candidate, dual pre/post-peak valley validation, and ratio-normalized counts.
 pub fn detect_elevated_black_floor(
     hist: &[u32; 256],
@@ -1658,6 +1760,17 @@ pub fn detect_elevated_black_floor(
     let p1 = histogram_percentile(hist, hist_total, 1.0);
     let p99 = histogram_percentile(hist, hist_total, 99.0);
     let hi = find_effective_white(hist, p99);
+    let h_smooth = smooth_histogram_binomial_5(hist);
+
+    // 1. Compact bimodal ink shelf in [8..=35] (handles real-world lifted blacks alongside AA text)
+    if let Some(shelf_floor) =
+        detect_compact_ink_shelf(hist, &h_smooth, hist_total, m_zero, hi)
+    {
+        return Some(DefectType::ElevatedBlackFloor {
+            floor_value: shelf_floor,
+            is_bimodal: true,
+        });
+    }
 
     let (validated_lo, is_bimodal) = if m_zero > 0.0005 {
         // Digital black spike present (0.05% < m_zero < 3.5%): no p1 < 3 branch split!
@@ -5780,6 +5893,112 @@ mod tests {
         assert!(
             matches!(folded, DynamicImage::ImageLuma8(_)),
             "neutral monochrome RGB page must fold to Luma8 even when correct_paper_cast == false"
+        );
+    }
+
+    #[test]
+    fn test_antialiased_typeset_text_compact_ink_shelf_and_dark_ink_guards() {
+        let _guard = TEST_RAYON_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let total = 100_000u32;
+
+        // 1. Real-world Page 32 archetype: crisp digital typeset text (0.6% Y=0..2) +
+        // anti-aliased text fringe (0.7% across Y=3..9 that drags shadow_p2 below 8!) +
+        // compact washed-out black ink floor peaking at Y=21 (14% mass) + midtones + Y=255 paper.
+        let mut hist_p32 = [0u32; 256];
+        hist_p32[0] = 400;
+        hist_p32[1] = 100;
+        hist_p32[2] = 100;
+        for bin in 3..=9 {
+            hist_p32[bin] = 100; // 0.7% AA fringe -> pulls shadow_p2 down to bin 7 (< 8)!
+        }
+        hist_p32[20] = 1_200;
+        hist_p32[21] = 11_500;
+        hist_p32[22] = 1_200;
+        for bin in 70..=150 {
+            hist_p32[bin] = 120; // midtone screentones
+        }
+        hist_p32[255] = total - hist_p32.iter().sum::<u32>();
+        let det = detect_elevated_black_floor(&hist_p32, PageClassification::Monochrome)
+            .expect("Compact Y=21 washed-out ink shelf with AA text fringe must be detected");
+        assert!(
+            matches!(
+                det,
+                DefectType::ElevatedBlackFloor {
+                    floor_value: 20..=22,
+                    is_bimodal: true
+                }
+            ),
+            "Expected floor_value in 20..=22, got {:?}",
+            det
+        );
+
+        // 2. End-to-end 2D image verification (ensures Quality Guard passes without attenuation)
+        let (w, h) = (720u32, 1024u32);
+        let img = ImageBuffer::from_fn(w, h, |x, y| {
+            let v = if y < 60 && x < 260 && (x % 4 == 0) {
+                0u8 // crisp digital black text (~0.6%)
+            } else if y < 60 && x < 260 && (x % 4 == 1) {
+                (3 + ((x + y) % 7)) as u8 // anti-aliased fringe in Y=3..9 (~0.6%)
+            } else if (300..520).contains(&y) && (20..520).contains(&x) {
+                21u8 // large washed-out black panel background (~15%)
+            } else if (600..820).contains(&y) && (x + y) % 3 == 0 {
+                130u8 // screentone midtones
+            } else {
+                255u8
+            };
+            Rgb([v, v, v])
+        });
+        let config = AutoLevelsConfig::default();
+        let (leveled, info, verdict) = level_and_verify(DynamicImage::ImageRgb8(img), None, &config);
+        assert!(info.was_leveled && verdict.outcome == Outcome::Pass);
+        assert!(!verdict.attenuation_attempted);
+        assert!(
+            (20..=22).contains(&info.black_point),
+            "Expected black_point in 20..=22 on Page-32 archetype, got {}",
+            info.black_point
+        );
+        let bg_px = leveled.to_rgb8().get_pixel(150, 400).0;
+        assert!(
+            bg_px[0] <= 4 && bg_px[1] <= 4 && bg_px[2] <= 4,
+            "Washed-out Y=21 panel background must restore to near-black (<=4), got {:?}",
+            bg_px
+        );
+
+        // 3. Adversarial trap: 4.0% authentic dark ink at Y=4 + 15% dark-gray fill at Y=25
+        // Must NOT jump over authentic dark ink at Y=4 to crush Y=25!
+        let mut hist_dark_ink = [0u32; 256];
+        hist_dark_ink[4] = 4_000;
+        hist_dark_ink[25] = 15_000;
+        hist_dark_ink[255] = total - hist_dark_ink[4] - hist_dark_ink[25];
+        if let Some(DefectType::ElevatedBlackFloor { floor_value, .. }) =
+            detect_elevated_black_floor(&hist_dark_ink, PageClassification::Monochrome)
+        {
+            assert!(
+                floor_value <= 6,
+                "Must not jump over 4% dark ink at Y=4 to crush Y=25 tone (got {})",
+                floor_value
+            );
+        }
+
+        // 4. Dual-peak shadow trap: 10% washed ink at Y=12 + 12% dark-gray tone at Y=30
+        // Must lock onto the first ink peak (Y=12), never skip to the taller Y=30 tone!
+        let mut hist_dual = [0u32; 256];
+        hist_dual[0] = 500;
+        hist_dual[12] = 10_000;
+        hist_dual[30] = 12_000;
+        hist_dual[255] = total - hist_dual[0] - hist_dual[12] - hist_dual[30];
+        let det_dual = detect_elevated_black_floor(&hist_dual, PageClassification::Monochrome)
+            .expect("First washed ink peak at Y=12 must be detected");
+        assert!(
+            matches!(
+                det_dual,
+                DefectType::ElevatedBlackFloor {
+                    floor_value: 11..=13,
+                    ..
+                }
+            ),
+            "Must lock onto first ink peak Y=12, not jump to taller Y=30 tone (got {:?})",
+            det_dual
         );
     }
 }
