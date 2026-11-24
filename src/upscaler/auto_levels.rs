@@ -419,7 +419,7 @@ fn is_rgb_slice_grayscale<const CHANNELS: usize>(raw: &[u8], w: usize, h: usize)
     } else if total_px >= 1_500_000 {
         11usize
     } else if total_px >= 250_000 {
-        4usize
+        5usize
     } else {
         1usize
     };
@@ -514,6 +514,24 @@ pub fn nonzero_histogram_percentile(hist: &[u32; 256], pct: f64) -> (u64, f32) {
     (nz_total, 255.0)
 }
 
+/// Computes the 2% cumulative density bin in the shadow band `hist[3..120]` if shadow mass >= 0.8%.
+#[inline]
+fn shadow_band_p2(hist_y: &[u32; 256], hist_total: u64) -> Option<f32> {
+    let shadow_total: u64 = hist_y[3..120].iter().map(|&c| c as u64).sum();
+    if (shadow_total as f64 / hist_total as f64) < 0.008 {
+        return None;
+    }
+    let target = ((shadow_total as f64) * 0.02).ceil().max(1.0) as u64;
+    let mut acc = 0u64;
+    for (offset, &count) in hist_y[3..120].iter().enumerate() {
+        acc += count as u64;
+        if acc >= target {
+            return Some((offset + 3) as f32);
+        }
+    }
+    Some(3.0)
+}
+
 /// Computes the 2% cumulative density bin in the shadow band `hist[3..120]` when a digital
 /// typesetting black spike (`0.0005 < m_zero < 0.035`) is present.
 pub fn find_effective_black(hist_y: &[u32; 256], p1: f32) -> f32 {
@@ -522,23 +540,12 @@ pub fn find_effective_black(hist_y: &[u32; 256], p1: f32) -> f32 {
         return p1;
     }
     let zero_mass = (hist_y[0] as u64 + hist_y[1] as u64 + hist_y[2] as u64) as f64 / total as f64;
-    if zero_mass > 0.0005 && zero_mass < 0.035 {
-        let shadow_total: u64 = hist_y[3..120].iter().map(|&c| c as u64).sum();
-        if (shadow_total as f64 / total as f64) >= 0.008 {
-            let target = ((shadow_total as f64) * 0.02).ceil().max(1.0) as u64;
-            let mut acc = 0u64;
-            let mut idx = 3usize;
-            for (offset, &count) in hist_y[3..120].iter().enumerate() {
-                acc += count as u64;
-                if acc >= target {
-                    idx = offset + 3;
-                    break;
-                }
-            }
-            if (idx as f32) > p1 + 4.0 {
-                return idx as f32;
-            }
-        }
+    if zero_mass > 0.0005
+        && zero_mass < 0.035
+        && let Some(p2) = shadow_band_p2(hist_y, total)
+        && p2 > p1 + 4.0
+    {
+        return p2;
     }
     p1
 }
@@ -622,9 +629,143 @@ pub fn smooth_histogram_binomial_5(hist_y: &[u32; 256]) -> [f32; 256] {
     h_smooth
 }
 
+struct ValidatedShadowPeak {
+    left_foot: usize,
+    valley_idx: usize,
+}
+
+/// Unified pre-peak valley, detached dark-ink, attached FWHM-skirt, and post-peak valley
+/// validation shared by `detect_compact_ink_shelf` (`pre_trough_ratio = 0.25`, `compact = true`)
+/// and `validate_black_floor` (`pre_trough_ratio = 0.35`, `compact = false`) whenever a digital
+/// black spike (`0.0005 < m_zero < 0.035`) is present.
+fn validate_spike_separated_peak(
+    hist: &[u32; 256],
+    h_smooth: &[f32; 256],
+    hist_total: u64,
+    peak_idx: usize,
+    hi: f32,
+    pre_trough_ratio: f32,
+    compact: bool,
+) -> Option<ValidatedShadowPeak> {
+    const START_TROUGH: usize = 5; // Kernel radius 2 excludes the 0..=2 digital black spike
+    if peak_idx < 8 {
+        return None;
+    }
+    let h_peak = h_smooth[peak_idx];
+
+    // 1. FWHM boundaries around peak_idx on the 5-tap smoothed histogram
+    let half_max = h_peak * 0.5;
+    let mut left_fwhm = peak_idx;
+    while left_fwhm > 0 && h_smooth[left_fwhm] >= half_max {
+        left_fwhm -= 1;
+    }
+    let mut right_fwhm = peak_idx;
+    while right_fwhm < 255 && h_smooth[right_fwhm] >= half_max {
+        right_fwhm += 1;
+    }
+    let fwhm = right_fwhm.saturating_sub(left_fwhm + 1).max(1);
+    if compact && fwhm > 8 {
+        return None;
+    }
+
+    // 2. Descend LEFT from peak_idx to the immediate local valley minimum (stopping on climb or
+    // flat plateau once below pre_trough_ratio, without any absolute flat_eps freeze that breaks
+    // monotonically decaying JPEG DCT Gibbs ringing skirts).
+    let mut min_before = h_peak;
+    let mut trough_idx = peak_idx;
+    for j in (START_TROUGH..peak_idx).rev() {
+        let val = h_smooth[j];
+        if val < min_before {
+            min_before = val;
+            trough_idx = j;
+        } else if min_before < pre_trough_ratio * h_peak {
+            break;
+        }
+    }
+    if trough_idx == peak_idx || min_before >= pre_trough_ratio * h_peak {
+        return None;
+    }
+
+    // 3. Peak core mass & left half-max foot (strictly disjoint from hist[0..=trough_idx])
+    let left_foot = (left_fwhm + 1).max(trough_idx + 1).min(peak_idx);
+    let (core_lo, core_hi) = if compact {
+        (
+            peak_idx.saturating_sub(2).max(trough_idx + 1),
+            (peak_idx + 2).min(255),
+        )
+    } else {
+        (
+            (left_fwhm + 1)
+                .min(peak_idx.saturating_sub(2))
+                .max(trough_idx + 1),
+            right_fwhm
+                .saturating_sub(1)
+                .max((peak_idx + 2).min(255))
+                .min(255),
+        )
+    };
+    let peak_core_mass: u64 = hist[core_lo..=core_hi].iter().map(|&c| c as u64).sum();
+    if compact && (peak_core_mass as f64 / hist_total as f64) < 0.010 {
+        return None;
+    }
+
+    // 4. Detached pre-valley dark-ink caps (eliminates 0..=2 / 3..=trough split-cap loopholes and
+    // blocks jumping over detached authentic dark ink in Y = 3..=trough_idx).
+    let below_trough_count: u64 = hist[0..=trough_idx].iter().map(|&c| c as u64).sum();
+    let below_trough_mass = below_trough_count as f64 / hist_total as f64;
+    if below_trough_mass >= 0.035 {
+        return None;
+    }
+    let detached_nz_count: u64 = hist[3..=trough_idx].iter().map(|&c| c as u64).sum();
+    if (detached_nz_count as f64 / hist_total as f64) >= 0.015 {
+        return None;
+    }
+    if below_trough_mass >= 0.002
+        && peak_core_mass < (below_trough_count as f64 * 1.25).round() as u64
+    {
+        return None;
+    }
+
+    // 5. Attached pre-foot skirt dominance: JPEG DCT Gibbs undershoot occurs along the 1-3px edge
+    // of a washed panel (bounded as <= 35% of the peak's core mass), whereas broad/sloped/flat
+    // dark-charcoal artwork below the peak exceeds this ratio and is strictly vetoed.
+    let pre_foot_skirt: u64 = hist[3..left_foot].iter().map(|&c| c as u64).sum();
+    if pre_foot_skirt > (peak_core_mass as f64 * 0.35).round() as u64 {
+        return None;
+    }
+
+    // 6. Post-peak bimodal valley validation (GEMINI.md §2.2)
+    let search_valley_hi = (hi.floor() as usize).min(140);
+    let start_valley = (peak_idx + 1).min(search_valley_hi);
+    if start_valley >= search_valley_hi {
+        return None;
+    }
+    let mut min_after = f32::MAX;
+    let mut valley_idx = start_valley;
+    for (j, &val) in h_smooth
+        .iter()
+        .enumerate()
+        .take(search_valley_hi + 1)
+        .skip(start_valley)
+    {
+        if val < min_after {
+            min_after = val;
+            valley_idx = j;
+        }
+    }
+    if min_after < 0.35 * h_peak {
+        Some(ValidatedShadowPeak {
+            left_foot,
+            valley_idx,
+        })
+    } else {
+        None
+    }
+}
+
 /// Validates a candidate black floor in `[2.0, 85.0]` against High-Key scenes, digital black
-/// spikes, and flat midtone ramps using BOTH pre-peak trough (when `m_zero > 0.0005`) and
-/// post-peak bimodal valley validation across the full `[2..=85]` range.
+/// spikes, and flat midtone ramps using BOTH pre-peak trough + FWHM-skirt validation (when
+/// `m_zero > 0.0005`) and post-peak bimodal valley validation across the full `[2..=85]` range.
 pub fn validate_black_floor(hist_y: &[u32; 256], cand_lo: f32, hi: f32) -> f32 {
     let hist_total: u64 = hist_y.iter().map(|&c| c as u64).sum();
     if hist_total == 0 || !cand_lo.is_finite() || cand_lo < 2.0 || cand_lo > 85.0 {
@@ -660,32 +801,21 @@ pub fn validate_black_floor(hist_y: &[u32; 256], cand_lo: f32, hi: f32) -> f32 {
             peak_idx = j;
         }
     }
-    if h_peak < 0.001 * hist_total as f32 {
+    // If argmax landed on a rising flank at the search boundary, climb to the actual local peak
+    // (within the shadow band <= 85) so FWHM and skirt checks evaluate the real peak.
+    while peak_idx < 85 && h_smooth[peak_idx + 1] > h_peak {
+        peak_idx += 1;
+        h_peak = h_smooth[peak_idx];
+    }
+    if h_smooth[peak_idx + 1] > h_peak || h_peak < 0.001 * hist_total as f32 {
         return 0.0;
     }
 
-    // Pre-peak separation trough + ink-vs-spike mass guard whenever a digital black spike exists
     if m_zero > 0.0005 {
-        if peak_idx < 8 {
-            return 0.0;
-        }
-        let mut min_before = f32::MAX;
-        for &val in h_smooth.iter().take(peak_idx).skip(5) {
-            if val < min_before {
-                min_before = val;
-            }
-        }
-        if min_before >= 0.35 * h_peak {
-            return 0.0;
-        }
-        if m_zero >= 0.002 {
-            let p_lo = peak_idx.saturating_sub(2);
-            let p_hi = (peak_idx + 2).min(255);
-            let peak_mass: u64 = hist_y[p_lo..=p_hi].iter().map(|&c| c as u64).sum();
-            if peak_mass < (zero_count as f64 * 1.25).round() as u64 {
-                return 0.0;
-            }
-        }
+        return validate_spike_separated_peak(
+            hist_y, &h_smooth, hist_total, peak_idx, hi, 0.35, false,
+        )
+        .map_or(0.0, |v| cand_lo.min(v.valley_idx as f32));
     }
 
     // Post-peak bimodal valley validation (guards ALL cand_lo in [2..=85], including <= 35)
@@ -1039,7 +1169,7 @@ fn sample_rgb_slice<const CHANNELS: usize>(raw: &[u8], w: usize, h: usize, acc: 
     } else if total_px >= 1_500_000 {
         11usize
     } else if total_px >= 250_000 {
-        4usize
+        5usize
     } else {
         1usize
     };
@@ -1154,7 +1284,7 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
             } else if total_px >= 1_500_000 {
                 11usize
             } else if total_px >= 250_000 {
-                4usize
+                5usize
             } else {
                 1usize
             };
@@ -1187,7 +1317,7 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
             } else if total_px >= 1_500_000 {
                 11usize
             } else if total_px >= 250_000 {
-                4usize
+                5usize
             } else {
                 1usize
             };
@@ -1290,6 +1420,8 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
     let mut min_border_c = f32::MAX;
     let mut max_border_ab = (paper_a, paper_b);
     let mut core_c_sum = 0.0f32;
+    let mut core_a_sum = 0.0f32;
+    let mut core_b_sum = 0.0f32;
     let mut valid_core_count = 0usize;
 
     if !is_already_luma {
@@ -1348,7 +1480,25 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
                 }
             } else {
                 core_c_sum += c_cell;
+                core_a_sum += med_a;
+                core_b_sum += med_b;
                 valid_core_count += 1;
+            }
+        }
+    }
+
+    // Populate invalid interior core cells (e.g. obscured by dark panels or L* >= 99 speech bubbles)
+    // from valid interior core cells rather than global border-skewed paper averages.
+    if valid_core_count > 0 {
+        let core_mean_a = core_a_sum / valid_core_count as f32;
+        let core_mean_b = core_b_sum / valid_core_count as f32;
+        for r in 1..=2 {
+            for c in 1..=2 {
+                let idx = r * 4 + c;
+                if !cell_valid[idx] {
+                    cell_a[idx] = core_mean_a;
+                    cell_b[idx] = core_mean_b;
+                }
             }
         }
     }
@@ -1459,6 +1609,8 @@ fn analyze_page_with_min_white(image: &DynamicImage, min_white_threshold: u8) ->
 
     let chromatic_midtone_mass = acc.chromatic_midtone_count as f32 / acc.sampled_pixels as f32;
     let allow_cast_exclusion = !is_intentional_sepia
+        && p95_y >= 130.0
+        && paper_l_peak >= 65.0
         && (has_global_cast || has_localized_margin_cast)
         && chromatic_midtone_mass <= 0.05
         && dom_c > 1e-4;
@@ -1734,9 +1886,6 @@ fn detect_compact_ink_shelf(
     hist_total: u64,
     hi: f32,
 ) -> Option<u8> {
-    const START_TROUGH: usize = 5; // Kernel radius 2 excludes the 0..=2 digital black spike
-    let search_valley_hi = (hi.floor() as usize).min(140);
-
     // Scan from low to high for the FIRST validated compact ink peak in [8..=35] so an
     // earlier washed ink floor (e.g. Y=12) is never skipped in favor of a taller dark-gray tone (Y=30).
     for peak_idx in 8..=35 {
@@ -1747,88 +1896,10 @@ fn detect_compact_ink_shelf(
         if h_peak < 0.003 * hist_total as f32 {
             continue;
         }
-
-        let p_lo = peak_idx.saturating_sub(2);
-        let p_hi = (peak_idx + 2).min(255);
-        let shelf_mass: u64 = hist[p_lo..=p_hi].iter().map(|&c| c as u64).sum();
-        if (shelf_mass as f64 / hist_total as f64) < 0.010 {
-            continue;
-        }
-
-        // Compact FWHM guard on smoothed histogram: rejects broad charcoal/shaded dark bands
-        let half_max = h_peak * 0.5;
-        let mut left_fwhm = peak_idx;
-        while left_fwhm > 0 && h_smooth[left_fwhm] >= half_max {
-            left_fwhm -= 1;
-        }
-        let mut right_fwhm = peak_idx;
-        while right_fwhm < 255 && h_smooth[right_fwhm] >= half_max {
-            right_fwhm += 1;
-        }
-        let fwhm = right_fwhm.saturating_sub(left_fwhm + 1).max(1);
-        if fwhm > 8 {
-            continue;
-        }
-
-        // Descend LEFT from `peak_idx` to find the immediate pre-peak trough, stopping as soon as
-        // the curve climbs back up or flattens into a dark-art plateau (prevents zero-bin pinning
-        // or flat-plateau sliding from blinding the dark-ink guard to dark artwork below peak_idx).
-        let mut min_before = h_peak;
-        let mut trough_idx = peak_idx;
-        let flat_eps = 0.0005 * hist_total as f32;
-        for j in (START_TROUGH..peak_idx).rev() {
-            let val = h_smooth[j];
-            if val < min_before {
-                min_before = val;
-                trough_idx = j;
-            } else if min_before < 0.25 * h_peak {
-                break;
-            }
-            if min_before < 0.25 * h_peak
-                && j > START_TROUGH
-                && h_smooth[j - 1] >= min_before * 0.85 - flat_eps
-            {
-                break;
-            }
-        }
-        // Require sharp pre-peak trough (surge >= 4.0x above trough) to veto continuous dark ramps (T1a)
-        if trough_idx == peak_idx || min_before >= 0.25 * h_peak {
-            continue;
-        }
-
-        // Unified dark-ink cap across ALL pixels below the immediate pre-peak trough (eliminates
-        // split-cap loopholes between 0..=2 and 3..=trough_idx and blocks crushing earlier dark art)
-        let below_trough_count: u64 = hist[0..=trough_idx].iter().map(|&c| c as u64).sum();
-        let below_trough_mass = below_trough_count as f64 / hist_total as f64;
-        if below_trough_mass >= 0.035 {
-            continue;
-        }
-        if below_trough_mass >= 0.002
-            && shelf_mass < (below_trough_count as f64 * 1.25).round() as u64
+        if let Some(v) =
+            validate_spike_separated_peak(hist, h_smooth, hist_total, peak_idx, hi, 0.25, true)
         {
-            continue;
-        }
-
-        // Post-peak bimodal valley validation (GEMINI.md §2.2)
-        let start_valley = (peak_idx + 1).min(search_valley_hi);
-        if start_valley >= search_valley_hi {
-            continue;
-        }
-        let mut min_after = f32::MAX;
-        for &val in h_smooth
-            .iter()
-            .take(search_valley_hi + 1)
-            .skip(start_valley)
-        {
-            if val < min_after {
-                min_after = val;
-            }
-        }
-        if min_after < 0.35 * h_peak {
-            // Anchor at the left half-max foot of the shelf peak so narrow 1-bin spikes land right at
-            // peak_idx - 1 (mapping peak -> Y' <= 3) while wider Gaussian scans retain left-tail shadow detail.
-            let left_foot = (left_fwhm + 1).max(trough_idx + 1).min(peak_idx);
-            return Some(left_foot as u8);
+            return Some(v.left_foot as u8);
         }
     }
 
@@ -1837,7 +1908,8 @@ fn detect_compact_ink_shelf(
 
 /// Unified shadow detector over `[2..=85]` with strict `m_zero < 0.035` cap, low-key veto (`p95 >= 130`),
 /// compact ink shelf detection in `[8..=35]` (for `0.0005 < m_zero < 0.035` AA text tails), no `p1 < 3`
-/// dead zone, shadow-band `eff_black` primary candidate, dual pre/post-peak valley validation, and ratio-normalized counts.
+/// dead zone, shadow-band `shadow_band_p2` primary candidate, unified pre/post-peak valley + FWHM-skirt
+/// validation, and ratio-normalized counts.
 pub fn detect_elevated_black_floor(
     hist: &[u32; 256],
     classification: PageClassification,
@@ -1888,27 +1960,9 @@ pub fn detect_elevated_black_floor(
         if (nz_total as f64 / hist_total as f64) < 0.02 || nz_p3 <= 8.0 {
             return None;
         }
-        let shadow_total: u64 = hist[3..120].iter().map(|&c| c as u64).sum();
-        if (shadow_total as f64 / hist_total as f64) < 0.008 {
-            return None;
-        }
-        let target = ((shadow_total as f64) * 0.02).ceil().max(1.0) as u64;
-        let mut acc = 0u64;
-        let mut shadow_p2 = 3.0f32;
-        for (offset, &count) in hist[3..120].iter().enumerate() {
-            acc += count as u64;
-            if acc >= target {
-                shadow_p2 = (offset + 3) as f32;
-                break;
-            }
-        }
         // Use shadow-band CDF as primary candidate so sparse ink (1-2%) never overshoots into midtones
-        let eff_black = find_effective_black(hist, p1);
-        let cand_lo = if eff_black > p1 + 4.0 {
-            nz_p3.min(eff_black)
-        } else {
-            nz_p3.min(shadow_p2)
-        };
+        let shadow_p2 = shadow_band_p2(hist, hist_total)?;
+        let cand_lo = nz_p3.min(shadow_p2);
         if cand_lo < 8.0 {
             return None;
         }
@@ -2230,9 +2284,9 @@ fn eval_accent_px<const CHANNELS: usize>(
         return false;
     }
     let (r, g, b) = (px[0], px[1], px[2]);
-    // Mathematical sRGB bound: rgb_diff < 30 can never reach CIELAB C* >= 20.0 (subsumes r==g==b)
+    // Exact sRGB bound across all 256^3 colors: C* >= 20.0 requires rgb_diff >= 24 (use < 22 with margin; subsumes r==g==b)
     let rgb_diff = r.max(g).max(b) - r.min(g).min(b);
-    if rgb_diff < 30 {
+    if rgb_diff < 22 {
         return false;
     }
     let key = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
@@ -2277,7 +2331,7 @@ fn scan_accent_16<const CHANNELS: usize>(
     let mut any_cand = 0u8;
     for px in b16 {
         let d = px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2]);
-        any_cand |= (d >= 30) as u8;
+        any_cand |= (d >= 22) as u8;
     }
     if any_cand == 0 {
         return 0;
@@ -2548,7 +2602,7 @@ impl MixedPixelCache {
         let (r, g, b) = self.hi_rgb;
         let y_old = self.hi_y_old;
         let y_new = self.hi_y_new;
-        let retain_q8 = if ctx.do_cast && ctx.c_env > 1e-4 {
+        let retain_q8 = if ctx.do_cast && (ctx.c_env > 1e-4 || ctx.has_muddy_shadow) {
             let (l_star, a_star, b_star) = self.hi_lab;
             let w_cast = compute_cast_weight_with_unit(
                 l_star, a_star, b_star, ctx.c_env, ctx.ua, ctx.ub, ctx.plan,
@@ -2602,7 +2656,13 @@ fn apply_mixed_pixel_slow<const CHANNELS: usize>(
     let is_hi = y_old >= 120;
 
     let mut lab = (0.0f32, 0.0f32, 0.0f32);
-    let retain_q8 = if ctx.do_cast && (if is_hi { ctx.c_env > 1e-4 } else { ctx.has_muddy_shadow }) {
+    let retain_q8 = if ctx.do_cast
+        && (if is_hi {
+            ctx.c_env > 1e-4 || ctx.has_muddy_shadow
+        } else {
+            ctx.has_muddy_shadow
+        })
+    {
         lab = rgb_to_lab_with_tables(ctx.tables, r, g, b);
         let w_cast = compute_cast_weight_with_unit(
             lab.0, lab.1, lab.2, ctx.c_env, ctx.ua, ctx.ub, ctx.plan,
@@ -2655,7 +2715,7 @@ fn apply_mixed_one<const CHANNELS: usize>(
 ) {
     if CHANNELS == 4 {
         let raw32 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        if raw32 == *hi_u32 {
+        if *hi_key != u32::MAX && raw32 == *hi_u32 {
             chunk[0] = hi_out[0];
             chunk[1] = hi_out[1];
             chunk[2] = hi_out[2];
@@ -2735,7 +2795,7 @@ fn apply_mixed_span_unmasked<const CHANNELS: usize>(
 
     let (groups, tail) = chunks.as_chunks_mut::<4>();
     for group in groups {
-        if CHANNELS == 4 {
+        if CHANNELS == 4 && hi_key != u32::MAX {
             let p0 = u32::from_le_bytes([group[0][0], group[0][1], group[0][2], group[0][3]]);
             let p1 = u32::from_le_bytes([group[1][0], group[1][1], group[1][2], group[1][3]]);
             let p2 = u32::from_le_bytes([group[2][0], group[2][1], group[2][2], group[2][3]]);
@@ -4417,7 +4477,6 @@ fn quality_tier_1_from_luma(
     metrics.insert("psnr".into(), psnr);
 
     const MAX_AFFINE_RESIDUAL_MSE: f64 = 220.0;
-    const MIN_AFFINE_RESIDUAL_PSNR: f64 = 22.0;
 
     if mse > MAX_AFFINE_RESIDUAL_MSE {
         let mut res = TierResult::reject(
@@ -4425,18 +4484,6 @@ fn quality_tier_1_from_luma(
             format!(
                 "Residual distortion MSE {:.1} exceeded ceiling {:.1}",
                 mse, MAX_AFFINE_RESIDUAL_MSE
-            ),
-        );
-        res.metrics = metrics;
-        return res;
-    }
-
-    if psnr < MIN_AFFINE_RESIDUAL_PSNR {
-        let mut res = TierResult::reject(
-            1,
-            format!(
-                "Residual PSNR {:.1}dB below minimum {:.1}dB",
-                psnr, MIN_AFFINE_RESIDUAL_PSNR
             ),
         );
         res.metrics = metrics;
@@ -4946,10 +4993,12 @@ fn level_and_verify_impl(
 
     let analysis = analyze_page(&image, page_number.unwrap_or(0), config);
     let is_monochrome = analysis.classification == PageClassification::Monochrome;
-    let paper_cast_preserved = is_monochrome
+    // Any un-leveled RGB Monochrome page with a detected tint/cast must preserve its RGB channels
+    // post-upscale (never silently folded to 1-channel Luma8 after a veto or Quality Guard rollback).
+    let has_unleveled_cast = is_monochrome
         && !is_already_luma
-        && !config.correct_paper_cast
         && (analysis.has_paper_cast || analysis.has_muddy_shadow_cast);
+    let paper_cast_preserved = has_unleveled_cast && !config.correct_paper_cast;
 
     // Strict Full-Color Veto (Zero-Copy No-Op)
     if analysis.classification == PageClassification::Color {
@@ -5004,7 +5053,7 @@ fn level_and_verify_impl(
             LevelInfo {
                 was_leveled: false,
                 is_monochrome,
-                paper_cast_preserved,
+                paper_cast_preserved: has_unleveled_cast,
                 classification: analysis.classification,
                 black_point: 0,
                 white_point: 255,
@@ -5059,7 +5108,7 @@ fn level_and_verify_impl(
             LevelInfo {
                 was_leveled: false,
                 is_monochrome,
-                paper_cast_preserved,
+                paper_cast_preserved: has_unleveled_cast,
                 classification: analysis.classification,
                 black_point: 0,
                 white_point: 255,
@@ -5071,9 +5120,42 @@ fn level_and_verify_impl(
         // 50% Attenuation Retry on the lightweight tile sample (attenuates black, white, gamma, AND cast!)
         let mut attenuated = plan.clone();
         attenuated.black_point = (plan.black_point as f32 * 0.5).round() as u8;
+        if attenuated.black_point <= 1 {
+            attenuated.black_point = 0;
+        }
         attenuated.white_point = 255 - ((255.0 - plan.white_point as f32) * 0.5).round() as u8;
-        attenuated.cast_strength = plan.cast_strength * 0.5;
+        if attenuated.white_point >= 254 {
+            attenuated.white_point = 255;
+        }
         attenuated.gamma = 1.0 + (plan.gamma - 1.0) * 0.5;
+        let atten_tonal_active = attenuated.black_point > 0
+            || attenuated.white_point < 255
+            || (attenuated.gamma - 1.0).abs() >= 1e-3;
+        if analysis.classification == PageClassification::Monochrome {
+            if !atten_tonal_active && !analysis.has_paper_cast && !analysis.has_muddy_shadow_cast {
+                attenuated.cast_strength = 0.0;
+            }
+        } else {
+            attenuated.cast_strength = plan.cast_strength * 0.5;
+        }
+
+        // Guard against mild plans collapsing into an identity no-op after 50% attenuation
+        if !atten_tonal_active && attenuated.cast_strength <= 0.0 {
+            let verdict = QualityVerdict::reject(tiers1, false);
+            return (
+                image,
+                LevelInfo {
+                    was_leveled: false,
+                    is_monochrome,
+                    paper_cast_preserved: has_unleveled_cast,
+                    classification: analysis.classification,
+                    black_point: 0,
+                    white_point: 255,
+                    quality_verdict: Some(verdict.clone()),
+                },
+                verdict,
+            );
+        }
 
         let mut guard_retry = guard_pristine.clone();
         apply_correction_internal(
@@ -5114,7 +5196,7 @@ fn level_and_verify_impl(
                 LevelInfo {
                     was_leveled: false,
                     is_monochrome,
-                    paper_cast_preserved,
+                    paper_cast_preserved: has_unleveled_cast,
                     classification: analysis.classification,
                     black_point: 0,
                     white_point: 255,
@@ -6537,6 +6619,178 @@ mod tests {
             compute_cast_weight_with_unit(39.0, 0.0, 7.5, 0.0, 0.0, 1.0, &neutral_plan),
             0.0,
             "2.4: neutral-paper Mixed shadow cast weight must be strictly 0 above L*=38"
+        );
+    }
+
+    #[test]
+    fn test_coherence_audit_invariants() {
+        let _guard = TEST_RAYON_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let config = AutoLevelsConfig::default();
+
+        // 1. Rgba8 transparent-black [0, 0, 0, 0] pixels at the start of a Mixed strip must never
+        //    match an uninitialized MixedPixelCache sentinel and become opaque black [0, 0, 0, 255].
+        let rgba_img = ImageBuffer::from_fn(480u32, 480u32, |x, y| {
+            if y < 64 {
+                Rgba([0u8, 0u8, 0u8, 0u8]) // leading transparent strip
+            } else if (80..120).contains(&y) && (80..120).contains(&x) {
+                Rgba([215u8, 30u8, 30u8, 255u8]) // small high-chroma accent -> Mixed
+            } else if y >= 380 {
+                Rgba([25u8, 25u8, 25u8, 255u8]) // lifted neutral shadow floor
+            } else {
+                Rgba([250u8, 250u8, 250u8, 255u8]) // neutral bright background
+            }
+        });
+        let (rgba_out, rgba_info, rgba_verdict) =
+            level_and_verify(DynamicImage::ImageRgba8(rgba_img), None, &config);
+        assert_eq!(rgba_info.classification, PageClassification::Mixed);
+        assert!(rgba_info.was_leveled && rgba_verdict.outcome == Outcome::Pass);
+        let out_rgba = rgba_out.to_rgba8();
+        for x in [0u32, 1, 2, 3, 120, 479] {
+            assert_eq!(
+                out_rgba.get_pixel(x, 0).0,
+                [0, 0, 0, 0],
+                "Transparent black pixel at ({x}, 0) must keep alpha=0 unchanged"
+            );
+        }
+
+        // 2. Unified shadow validation:
+        //    (a) Compressed exponential ringing skirt attached to a compact washed-black shelf
+        //        must restore the shelf floor cleanly (~19..=21).
+        let total = 100_000u32;
+        let mut hist_ringed = [0u32; 256];
+        hist_ringed[0] = 550;
+        for (idx, bin) in hist_ringed.iter_mut().enumerate().take(19).skip(6) {
+            let d = (18 - idx) as f64;
+            *bin = (590.0 * 0.86f64.powf(d)).round() as u32; // ~3.3% exponential edge skirt
+        }
+        hist_ringed[19] = 825;
+        hist_ringed[20] = 1_125;
+        hist_ringed[21] = 11_560;
+        hist_ringed[22] = 1_175;
+        hist_ringed[23] = 670;
+        hist_ringed[255] = total - hist_ringed.iter().sum::<u32>();
+        let det_ringed = detect_elevated_black_floor(&hist_ringed, PageClassification::Monochrome)
+            .expect("Compact washed-black shelf with compression skirt must be detected");
+        assert!(
+            matches!(
+                det_ringed,
+                DefectType::ElevatedBlackFloor {
+                    floor_value: 19..=21,
+                    is_bimodal: true,
+                }
+            ),
+            "Expected floor_value in 19..=21, got {:?}",
+            det_ringed
+        );
+
+        //    (b) Continuous exponential dark shading before a dark-gray band must veto in BOTH
+        //        compact-shelf detection AND Path-2 fallback (never crushing dark shading).
+        let mut hist_sloped = [0u32; 256];
+        hist_sloped[0] = 1_500;
+        for (idx, bin) in hist_sloped.iter_mut().enumerate().take(29).skip(5) {
+            let d = (28 - idx) as f64;
+            *bin = (850.0 * 0.87f64.powf(d)).round() as u32; // ~6.3% continuous dark shading
+        }
+        hist_sloped[29] = 2_000;
+        hist_sloped[30] = 7_500;
+        hist_sloped[31] = 2_500;
+        hist_sloped[255] = total - hist_sloped.iter().sum::<u32>();
+        assert!(
+            detect_elevated_black_floor(&hist_sloped, PageClassification::Monochrome).is_none(),
+            "Continuous dark shading before dark-gray band must veto across both shadow paths"
+        );
+
+        //    (c) Detached dark ink at Y=4 alongside a small Y=0 spike must block jumping to Y=25.
+        let mut hist_detached = [0u32; 256];
+        hist_detached[0] = 600;
+        hist_detached[4] = 2_500;
+        hist_detached[25] = 10_000;
+        hist_detached[255] = total - hist_detached.iter().sum::<u32>();
+        assert!(
+            detect_elevated_black_floor(&hist_detached, PageClassification::Monochrome).is_none(),
+            "Detached 2.5% dark ink at Y=4 must veto jumping to Y=25"
+        );
+
+        //    (d) Split pre-valley dark mass (3.0% at Y=0 + 0.8% at Y=5 = 3.8% >= 3.5%) must veto
+        //        in validate_black_floor as well.
+        let mut hist_split = [0u32; 256];
+        hist_split[0] = 3_000;
+        hist_split[5] = 800;
+        hist_split[45] = 45_000;
+        hist_split[255] = total - hist_split.iter().sum::<u32>();
+        assert_eq!(
+            validate_black_floor(&hist_split, 45.0, 255.0),
+            0.0,
+            "Split 3.8% pre-valley dark mass must veto in validate_black_floor"
+        );
+
+        // 3. Un-leveled tinted RGB scenes must never be folded to 1-channel Luma8 post-upscale:
+        //    (a) Low-key dark olive scene with small warm bright highlights
+        let low_key_tinted = ImageBuffer::from_fn(480u32, 480u32, |_, y| {
+            if y < 8 {
+                Rgb([250u8, 242u8, 220u8]) // ~1.6% warm highlights
+            } else {
+                Rgb([32u8, 30u8, 16u8]) // low-key dark olive field (a* < 0)
+            }
+        });
+        let (_, lk_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(low_key_tinted), None, &config);
+        assert!(!lk_info.was_leveled);
+        assert!(
+            !crate::upscaler::upscaler::should_fold_luma(&lk_info, true),
+            "Low-key tinted RGB scene must never fold to 1-channel Luma8"
+        );
+
+        //    (b) Uniform tinted blank page (dynamic_range < 10)
+        let tinted_blank = ImageBuffer::from_pixel(480u32, 480u32, Rgb([245u8, 232u8, 185u8]));
+        let (_, tb_info, _) =
+            level_and_verify(DynamicImage::ImageRgb8(tinted_blank), None, &config);
+        assert!(!tb_info.was_leveled);
+        assert!(
+            !crate::upscaler::upscaler::should_fold_luma(&tb_info, true),
+            "Vetoed uniform tinted RGB page must preserve its tint and skip Luma8 folding"
+        );
+
+        // 4. Dark saturated accents with rgb_diff in 22..29 (e.g. [48, 23, 48], C* >= 20.0)
+        //    must pass the accent mask pre-filter.
+        let tables = &*FAST_LAB_TABLES;
+        let (mut k0, mut a0, mut k1, mut a1) = (u32::MAX, false, u32::MAX, false);
+        assert!(
+            eval_accent_px(
+                &[48u8, 23u8, 48u8],
+                &mut k0,
+                &mut a0,
+                &mut k1,
+                &mut a1,
+                false,
+                0.0,
+                0.0,
+                0.0,
+                tables,
+            ),
+            "Dark saturated accent [48, 23, 48] (rgb_diff=25, C*>=20) must be protected"
+        );
+
+        // 5. Mild plan (white_point=253) whose 50% attenuation collapses to identity (254 -> 255)
+        //    must reject cleanly (was_leveled == false) rather than passing an identity retry.
+        let mild_img = ImageBuffer::from_fn(480u32, 480u32, |x, y| {
+            let v = if y < 96 {
+                0u8 // 20% pure black -> black_point=0
+            } else if y < 240 {
+                (60 + ((x * 7 + y * 13) % 120)) as u8 // 30% textured midtones
+            } else {
+                253u8 // 50% slightly dull paper -> white_point=253
+            };
+            Rgb([v, v, v])
+        });
+        let (_, mild_info, mild_verdict) = level_and_verify_with_ssim_override(
+            DynamicImage::ImageRgb8(mild_img),
+            &config,
+            1.0001, // force Tier-2 SSIM failure on first pass
+        );
+        assert!(
+            !mild_info.was_leveled && mild_verdict.outcome == Outcome::Reject,
+            "Attenuated no-op (white_point 253 -> 255) must reject rather than passing identity LUT"
         );
     }
 }
